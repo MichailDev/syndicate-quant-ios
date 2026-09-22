@@ -1,0 +1,54 @@
+name: Build SYNDICATE QUANT iOS (Windows-only workflow)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-build.yml'
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Xcode version
+        run: xcodebuild -version
+      - name: Validate project
+        run: xcodebuild -project ios/SyndicateQuant/SyndicateQuant.xcodeproj -scheme SyndicateQuant -sdk iphoneos -configuration Release -showBuildSettings >/tmp/build-settings.txt
+      - name: Build unsigned app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/SyndicateQuant/SyndicateQuant.xcodeproj \
+            -scheme SyndicateQuant \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/SyndicateQuant.app"
+          test -d "$APP"
+          rm -rf ipa
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          cd ipa
+          zip -qry ../SYNDICATE_QUANT_iOS_UNSIGNED.ipa Payload
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: syndicate-quant-ios-unsigned
+          path: SYNDICATE_QUANT_iOS_UNSIGNED.ipa
+          if-no-files-found: error
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syndicate-quant-ios-build-log
+          path: /tmp/build-settings.txt
+          if-no-files-found: warn
