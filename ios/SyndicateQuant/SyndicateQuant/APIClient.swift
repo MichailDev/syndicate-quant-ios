@@ -1,11 +1,14 @@
 import Foundation
 
 final class SStatsClient {
-    private let settings: AppSettings
+    private let baseURL: String
+    private let apiKey: String
     private let session: URLSession
 
+    @MainActor
     init(settings: AppSettings) {
-        self.settings = settings
+        self.baseURL = settings.baseURL
+        self.apiKey = settings.apiKey
         self.session = URLSession(configuration: .ephemeral)
     }
 
@@ -133,11 +136,11 @@ final class SStatsClient {
     }
 
     private func get(_ path: String, query: [String: String], attempt: Int = 0) async throws -> JSONValue {
-        guard var c = URLComponents(string: settings.baseURL + path) else {
+        guard var c = URLComponents(string: baseURL + path) else {
             throw APIError.invalidURL
         }
         var items = query.map { URLQueryItem(name: $0.key, value: $0.value) }
-        items.append(URLQueryItem(name: "apikey", value: settings.apiKey))
+        items.append(URLQueryItem(name: "apikey", value: apiKey))
         c.queryItems = items
 
         guard let url = c.url else { throw APIError.invalidURL }
