@@ -52,8 +52,7 @@ struct QuantEngine {
   static let countLines = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5]
   static let sharpBooks = ["pinnacle", "betfair", "sbo", "sbobet", "marathon", "bet365 exchange"]
 
-  // MARK: - Matches (адаптировано под SStats {status, count, data: [...]})
-
+  // MARK: - Matches (SStats /Ls/List → {status, count, data: [...]})
   func matches(from json: JSONValue) -> [Match] {
     let items: [JSONValue]
     if let obj = json.object, let dataArr = obj["data"]?.array {
@@ -61,7 +60,6 @@ struct QuantEngine {
     } else if let arr = json.array {
       items = arr
     } else {
-      // Fallback: если это уже плоский массив объектов
       items = json.allObjects().map { .object($0) }
     }
 
@@ -71,9 +69,7 @@ struct QuantEngine {
       guard let id = string(o, ["id", "gameid", "game_id", "eventid", "event_id", "flashid"]),
         !id.isEmpty
       else { continue }
-
       guard let home = teamName(o, "home"), let away = teamName(o, "away") else { continue }
-
       let league = leagueName(o) ?? "Unknown"
       let m = Match(
         id: id, home: home, away: away, league: league, start: date(o),
@@ -84,23 +80,19 @@ struct QuantEngine {
   }
 
   private func teamName(_ o: [String: JSONValue], _ side: String) -> String? {
-    // SStats: homeTeam / awayTeam — это объект { uid, id, name }
     if let team = o[side + "Team"]?.object, let name = team["name"]?.string {
       return name
     }
-    // Fallback: home / away как плоские строки
     return string(o, [side, side + "team", side + "_team", side + "TeamName", side + "name"])
   }
 
   private func leagueName(_ o: [String: JSONValue]) -> String? {
-    // SStats: season.league.name
     if let season = o["season"]?.object,
       let league = season["league"]?.object,
       let name = league["name"]?.string
     {
       return name
     }
-    // Fallback: league.name
     if let league = o["league"]?.object, let name = league["name"]?.string {
       return name
     }
@@ -163,7 +155,7 @@ struct QuantEngine {
     let refereeName = string(info.allObjects().first ?? [:], ["refereeName", "referee"])
     let ref = refereeProfile(homeHistory + awayHistory, refereeName)
     for (_, qs) in grouped {
-      guard qs.count >= 3 else { continue }
+      guard !qs.isEmpty else { continue }
       guard let median = QuantMath.median(qs.map { $0.odds }), let q = qs.first else { continue }
       let sharp = sharpGuard(qs, median: median)
       let p: Double
@@ -207,7 +199,7 @@ struct QuantEngine {
   func portfolio(_ signals: [BetSignal]) -> [BetSignal] {
     var chosen: [BetSignal] = []
     var total = 0.0
-    for s in signals.filter({ $0.robustEV > 0 && $0.qcs >= 78 }).sorted(by: {
+    for s in signals.filter({ $0.robustEV > 0 && $0.qcs >= 70 }).sorted(by: {
       $0.robustEV > $1.robustEV
     }) {
       let st = min(0.02, s.stake)
@@ -364,15 +356,11 @@ struct QuantEngine {
       ms = max(0, ms - 15)
       robust *= 0.70
     }
-    if sharp.score > 0 && sharp.score < 35 {
-      ms = max(0, ms - 20)
-      robust = -abs(robust)
-    }
     let fair = 1 / max(p, 0.001)
     let extreme = odds > fair * 1.25
     let anomaly = odds > fair * 1.35
-    let conflict = abs(p - marketProbability) > 0.18 && quotes.count >= 3
-    if extreme || anomaly || quotes.count < 3 || conflict { robust = -abs(robust) }
+    let conflict = abs(p - marketProbability) > 0.18
+    if extreme || anomaly || conflict { robust = -abs(robust) }
     let agreement =
       q.market == "1X2"
       ? max(
@@ -388,7 +376,7 @@ struct QuantEngine {
     let rs = 100 * agreement
     let qcs = 0.30 * min(100, dcs) + 0.20 * min(100, dcs) + 0.20 * ms + 0.15 * ts + 0.15 * rs
     let classification: String
-    if anomaly || extreme || quotes.count < 3 || conflict {
+    if anomaly || extreme || conflict {
       classification = "X NO BET"
     } else if robust > 0 && ev >= 0.07 && qcs >= 85 && ms >= 50 && dcs >= 60 {
       classification = "S BET"
@@ -436,23 +424,52 @@ struct QuantEngine {
     return 0.03
   }
 
-  // MARK: - Odds / sharp
+  // MARK: - Odds (SStats: data.odds = [ {marketId, marketName, odds:[{name,value}]} ])
   private func parseQuotes(_ json: JSONValue) -> [Quote] {
     var out: [Quote] = []
-    for o in json.allObjects() {
-      guard let odds = number(o, ["odds", "value", "odd", "price"]), odds > 1, odds < 100 else {
-        continue
+    if let arr = json.array {
+      for marketValue in arr {
+        guard let m = marketValue.object else { continue }
+        let marketName =
+          string(m, ["marketName", "market", "market_name", "type", "markettype"]) ?? ""
+        guard let prices = m["odds"]?.array else { continue }
+        for pv in prices {
+          guard let p = pv.object,
+            let value = number(p, ["value", "odds", "odd", "price"]),
+            value > 1, value < 100
+          else { continue }
+          let selection = string(p, ["name", "selection", "outcome", "label"]) ?? ""
+          let market = normalizeMarket(marketName + " " + selection)
+          guard !market.isEmpty else { continue }
+          let line = extractLine(selection) ?? extractLine(marketName)
+          out.append(
+            Quote(market: market, selection: selection, line: line, odds: value, bookmaker: "sstats"))
+        }
       }
-      let m = string(o, ["market", "marketname", "market_name", "type", "markettype"]) ?? ""
-      let s = string(o, ["selection", "outcome", "outcomename", "name", "label"]) ?? ""
-      guard !m.isEmpty || !s.isEmpty else { continue }
-      let book = string(o, ["bookmaker", "bookmakername", "book", "source"]) ?? "unknown"
-      let line = number(o, ["line", "handicap", "total", "param", "parameter"])
-      let market = normalizeMarket(m + " " + s)
-      guard !market.isEmpty else { continue }
-      out.append(Quote(market: market, selection: s, line: line, odds: odds, bookmaker: book))
+    }
+    if out.isEmpty {
+      for o in json.allObjects() {
+        guard let odds = number(o, ["odds", "value", "odd", "price"]), odds > 1, odds < 100 else {
+          continue
+        }
+        let m = string(o, ["market", "marketname", "market_name", "type", "markettype"]) ?? ""
+        let s = string(o, ["selection", "outcome", "outcomename", "name", "label"]) ?? ""
+        guard !m.isEmpty || !s.isEmpty else { continue }
+        let book = string(o, ["bookmaker", "bookmakername", "book", "source"]) ?? "unknown"
+        let line = number(o, ["line", "handicap", "total", "param", "parameter"])
+        let market = normalizeMarket(m + " " + s)
+        guard !market.isEmpty else { continue }
+        out.append(Quote(market: market, selection: s, line: line, odds: odds, bookmaker: book))
+      }
     }
     return out
+  }
+  private func extractLine(_ s: String) -> Double? {
+    let regex = try? NSRegularExpression(pattern: "([0-9]+(?:\\.[0-9]+)?)")
+    if let m = regex?.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) {
+      if let r = Range(m.range(at: 1), in: s) { return Double(s[r]) }
+    }
+    return nil
   }
   private func key(_ q: Quote) -> String {
     "\(q.market)|\(q.selection.lowercased())|\(q.line ?? -999)"
@@ -461,7 +478,9 @@ struct QuantEngine {
     let sharp = qs.filter { q in
       Self.sharpBooks.contains(where: { q.bookmaker.lowercased().contains($0) })
     }.map { $0.odds }
-    guard let sm = QuantMath.median(sharp) else { return SharpGuard(score: 0, disagreement: 0) }
+    guard let sm = QuantMath.median(sharp) else {
+      return SharpGuard(score: 25, disagreement: 0)
+    }
     let dis = abs(sm / median - 1)
     var score = 35.0
     if qs.count >= 4 { score += 25 }
@@ -477,7 +496,8 @@ struct QuantEngine {
     if s.contains("goal") || s.contains("total") || s.contains("over") || s.contains("under") {
       return "GOALS"
     }
-    if s.contains("1x2") || s.contains("winner") || s.trimmingCharacters(in: .whitespaces) == "1"
+    if s.contains("1x2") || s.contains("winner") || s.contains("home")
+      || s.trimmingCharacters(in: .whitespaces) == "1"
       || s.trimmingCharacters(in: .whitespaces) == "x"
       || s.trimmingCharacters(in: .whitespaces) == "2"
     {
@@ -501,19 +521,21 @@ struct QuantEngine {
         name: string(p, ["playerName", "name"]) ?? "", minutes: mins,
         xg: number(p, ["expectedGoals", "xG", "xg"]) ?? 0,
         xa: number(p, ["expectedAssists", "xA", "xa"]) ?? 0,
-        goals: number(p, ["goals", "goal"]) ?? 0, assists: number(p, ["assists", "assist"]) ?? 0,
-        shots: number(p, ["shots", "totalShots"]) ?? 0,
-        sot: number(p, ["shotsOnGoal", "sot"]) ?? 0, starts: (p["startXI"]?.bool ?? false) ? 1 : 0)
+        goals: number(p, ["goals", "goalsTotal", "goal"]) ?? 0,
+        assists: number(p, ["assists", "goalsAssists", "assist"]) ?? 0,
+        shots: number(p, ["shots", "shotsTotal", "totalShots"]) ?? 0,
+        sot: number(p, ["shotsOnGoal", "shotsOn", "sot"]) ?? 0,
+        starts: (p["startXI"]?.bool ?? false) ? 1 : 0)
     }
   }
   private func fullGame(_ p: JSONValue) -> [String: JSONValue] {
     if let o = p.object, let d = o["data"]?.object { return d }
     return p.object ?? [:]
   }
+  // Приоритет: id (slug для ?Team=), потом uid
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {
     if let x = o[side + "Team"]?.object {
-      // SStats: приоритет — uid (UUID). Fallback — id / teamId / flashId.
-      return string(x, ["uid", "id", "teamid", "team_id", "flashid"])
+      return string(x, ["id", "teamid", "team_id", "flashid", "uid"])
     }
     return string(o, [side + "TeamId", side + "TeamID", side + "Id", side + "ID"])
   }
@@ -528,19 +550,10 @@ struct QuantEngine {
   private func firstNumber(_ v: JSONValue, _ keys: [String]) -> Double? {
     v.firstNumber(keys: Set(keys.map { $0.lowercased() }))
   }
-  private func nestedID(_ o: [String: JSONValue], _ keys: [String]) -> String? {
-    for k in keys {
-      if let x = o[k]?.object, let id = string(x, ["uid", "id", "teamid", "team_id", "flashid"]) {
-        return id
-      }
-    }
-    return nil
-  }
   private func date(_ o: [String: JSONValue]) -> Date? {
     if let s = string(o, ["date", "datetime", "starttime", "start_time", "timestamp"]) {
       let f = ISO8601DateFormatter()
       if let d = f.date(from: s) { return d }
-      // Для строк с миллисекундами
       f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
       if let d = f.date(from: s) { return d }
       if let t = Double(s) { return Date(timeIntervalSince1970: t > 1e11 ? t / 1000 : t) }

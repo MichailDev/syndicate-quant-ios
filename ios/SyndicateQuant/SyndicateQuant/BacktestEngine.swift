@@ -13,9 +13,7 @@ struct BacktestResult {
   var hitRate: Double { wins + losses > 0 ? Double(wins) / Double(wins + losses) : 0 }
   var roi: Double { staked > 0 ? profit / staked : 0 }
 
-  // Разбивка по лигам
   var perLeague: [String: SegmentStats] = [:]
-  // Разбивка по рынкам
   var perMarket: [String: SegmentStats] = [:]
 }
 
@@ -98,7 +96,6 @@ struct WalkForwardBacktester {
         peak = max(peak, equity)
         r.maxDrawdown = max(r.maxDrawdown, peak - equity)
 
-        // Агрегируем по лиге и рынку
         var l = r.perLeague[match.league] ?? SegmentStats()
         l.matches += 1; l.bets += 1; l.staked += s.stake; l.profit += pnl
         if actual == 1 { l.wins += 1 } else if actual == 0.5 { l.pushes += 1 } else { l.losses += 1 }

@@ -156,6 +156,7 @@ struct RootView: View {
     }.navigationTitle("Настройки")
   }
 
+  // MARK: - Прогноз на сегодня
   private func refresh() async {
     guard !busy else { return }
     busy = true
@@ -177,11 +178,11 @@ struct RootView: View {
         let hs = await client.fetchTeamHistory(teamID: h, count: settings.historyMatches)
         let awayRecords = await client.fetchTeamHistory(teamID: a, count: settings.historyMatches)
         let info = try await client.gameInfo(match.id)
-        let odds = try await client.odds(match.id)
+        let oddsFromInfo = info.object?["data"]?.object?["odds"] ?? .array([])
         let glicko = try? await client.glicko(match.id)
         let s = QuantEngine().signals(
-          match: match, info: info, oddsJSON: odds, homeHistory: hs, awayHistory: awayRecords,
-          glicko: glicko)
+          match: match, info: info, oddsJSON: oddsFromInfo, homeHistory: hs,
+          awayHistory: awayRecords, glicko: glicko)
         all.append(contentsOf: s)
         diagnostics.append(
           "\(match.id) history=\(hs.count)/\(awayRecords.count) signals=\(s.count)")
@@ -199,14 +200,14 @@ struct RootView: View {
     }
   }
 
-  // MARK: - ДИАГНОСТИЧЕСКИЙ RUNBACKTEST (расширенный)
+  // MARK: - Backtest: walk-forward по прошлым матчам команд из сегодняшней выборки
   private func runBacktest() async {
     guard !busy else { return }
     busy = true
     defer { busy = false }
 
     var lines: [String] = []
-    func add(_ s: String) {
+    func log(_ s: String) {
       lines.append(s)
       backtestStatus = lines.joined(separator: "\n")
       print("[BT] \(s)")
@@ -219,97 +220,121 @@ struct RootView: View {
       let client = SStatsClient(settings: settings)
       let engine = QuantEngine()
 
+      // 1) Сегодняшние матчи
+      log("1) Сегодняшние матчи…")
       let todayJSON = try await client.listToday()
-      let todayMatches = engine.matches(from: todayJSON)
-      add("1) parsed matches: \(todayMatches.count)")
-      let withIDs = todayMatches.filter { $0.homeID != nil && $0.awayID != nil }
-      add("2) with homeID+awayID: \(withIDs.count)/\(todayMatches.count)")
-
-      guard let m = withIDs.first else {
-        add("Нет матчей для диагностики")
+      let todayMatches = engine.matches(from: todayJSON).filter { !isExcluded($0) }
+      log("1) Найдено: \(todayMatches.count)")
+      guard !todayMatches.isEmpty else {
+        log("Стоп: нет матчей на сегодня")
         return
       }
-      add("--- МАТЧ: \(m.home) vs \(m.away) id=\(m.id) ---")
 
-      // === A. /Ls/GameInfo ===
-      if let info = try? await client.gameInfo(m.id), let obj = info.object {
-        add("A) info top keys: \(Array(obj.keys).sorted().prefix(20).joined(separator: ","))")
-        if let data = obj["data"] {
-          switch data {
-          case .object(let d):
-            add("A) info.data OBJECT keys: \(Array(d.keys).sorted().prefix(30).joined(separator: ","))")
-            add("A) has homeFTResult: \(d["homeFTResult"] != nil)")
-            add("A) has game: \(d["game"] != nil)")
-            if let game = d["game"]?.object {
-              add("A) data.game keys: \(Array(game.keys).sorted().prefix(20).joined(separator: ","))")
-              add("A) data.game.homeFTResult: \(game["homeFTResult"].map { "\($0)" } ?? "nil")")
-            }
-          case .array(let a):
-            add("A) info.data ARRAY count=\(a.count)")
-            if let first = a.first?.object {
-              add("A) info.data[0] keys: \(Array(first.keys).sorted().prefix(30).joined(separator: ","))")
-              add("A) data[0].homeFTResult: \(first["homeFTResult"].map { "\($0)" } ?? "nil")")
-            }
-          default:
-            add("A) info.data: неизвестный тип")
-          }
-        } else {
-          add("A) info.data отсутствует")
-        }
-      } else {
-        add("A) gameInfo: FAILED")
+      // 2) Уникальные slug-и команд
+      var teamSlugs = Set<String>()
+      for m in todayMatches {
+        if let s = m.homeID { teamSlugs.insert(s) }
+        if let s = m.awayID { teamSlugs.insert(s) }
       }
+      let slugs = Array(teamSlugs)
+      log("2) Команд: \(slugs.count)")
+      if let s = slugs.first { log("2) Пример slug: \(s)") }
 
-      // === B. /Ls/List?Team=HOME_ID (прошлые матчи) ===
-      if let hid = m.homeID {
-        add("B) listTeam(\(hid), limit: 5)…")
-        if let teamJSON = try? await client.listTeam(hid, limit: 5), let obj = teamJSON.object {
-          add("B) team top keys: \(Array(obj.keys).sorted().prefix(10).joined(separator: ","))")
-          if let data = obj["data"]?.array {
-            add("B) team.data ARRAY count=\(data.count)")
-            if let first = data.first?.object {
-              add("B) team.data[0] keys: \(Array(first.keys).sorted().prefix(30).joined(separator: ","))")
-              add("B) data[0].homeFTResult: \(first["homeFTResult"].map { "\($0)" } ?? "nil")")
-              add("B) data[0].awayFTResult: \(first["awayFTResult"].map { "\($0)" } ?? "nil")")
-              add("B) data[0].homeResultFT: \(first["homeResultFT"].map { "\($0)" } ?? "nil")")
-              add("B) data[0].date: \(first["date"].map { "\($0)" } ?? "nil")")
-              if let ht = first["homeTeam"]?.object {
-                add("B) data[0].homeTeam keys: \(Array(ht.keys).sorted().joined(separator: ","))")
-                add("B) homeTeam.id=\(ht["id"].map { "\($0)" } ?? "nil") uid=\(ht["uid"].map { "\($0)" } ?? "nil") name=\(ht["name"].map { "\($0)" } ?? "nil")")
-              }
+      // 3) Прошлые матчи каждой команды
+      log("3) Тяну историю…")
+      var pastMatches: [Match] = []
+      var seen = Set<String>()
+      for (i, slug) in slugs.enumerated() {
+        if i % 5 == 0 { log("3) \(i + 1)/\(slugs.count)…") }
+        if let json = try? await client.listTeam(slug, limit: 50) {
+          for m in engine.matches(from: json) where !seen.contains(m.id) {
+            if let d = m.start, d < Date() {
+              seen.insert(m.id)
+              pastMatches.append(m)
             }
-          } else if let data = obj["data"]?.object {
-            add("B) team.data OBJECT keys: \(Array(data.keys).sorted().prefix(20).joined(separator: ","))")
-          } else {
-            add("B) team.data отсутствует или другого типа")
-          }
-        } else {
-          add("B) listTeam: FAILED")
-        }
-      }
-
-      // === C. /Odds/<id> ===
-      add("C) odds(\(m.id))…")
-      do {
-        let odds = try await client.odds(m.id)
-        if let obj = odds.object {
-          add("C) odds top keys: \(Array(obj.keys).sorted().prefix(10).joined(separator: ","))")
-          if let data = obj["data"]?.array {
-            add("C) odds.data ARRAY count=\(data.count)")
-            if let first = data.first?.object {
-              add("C) odds.data[0] keys: \(Array(first.keys).sorted().prefix(25).joined(separator: ","))")
-            }
-          } else if let data = obj["data"]?.object {
-            add("C) odds.data OBJECT keys: \(Array(data.keys).sorted().prefix(20).joined(separator: ","))")
           }
         }
-      } catch {
-        add("C) odds error: \(error.localizedDescription)")
+        try? await Task.sleep(for: .milliseconds(100))
+      }
+      log("3) Прошлых матчей: \(pastMatches.count)")
+      guard !pastMatches.isEmpty else {
+        log("Стоп: нет истории")
+        return
       }
 
-      add("--- конец диагностики ---")
+      // 4) GameInfo для прошлых матчей (там же odds)
+      let cap = min(pastMatches.count, 120)
+      log("4) Данные для \(cap) матчей…")
+      var infos: [String: JSONValue] = [:]
+      var odds: [String: JSONValue] = [:]
+      for i in 0..<cap {
+        let m = pastMatches[i]
+        if i % 15 == 0 { log("4) \(i + 1)/\(cap)…") }
+        if let info = try? await client.gameInfo(m.id) {
+          infos[m.id] = info
+          if let d = info.object?["data"]?.object, let o = d["odds"] {
+            odds[m.id] = o
+          }
+        }
+        try? await Task.sleep(for: .milliseconds(70))
+      }
+      log("4) info=\(infos.count), odds=\(odds.count)")
+
+      // 5) Истории команд из загруженных info
+      log("5) Строю истории…")
+      var histories: [String: [TeamRecord]] = [:]
+      for (_, info) in infos {
+        guard let data = info.object?["data"]?.object,
+          let game = data["game"]?.object
+        else { continue }
+        for side in ["home", "away"] {
+          guard let team = game[side + "Team"]?.object,
+            let id = team["id"]?.string
+          else { continue }
+          if let rec = engine.teamRecord(from: info, targetID: id) {
+            histories[id, default: []].append(rec)
+          }
+        }
+      }
+      for (k, v) in histories {
+        histories[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+      }
+      let totalRecs = histories.values.map { $0.count }.reduce(0, +)
+      log("5) Команд: \(histories.count), записей: \(totalRecs)")
+
+      // 6) Walk-forward
+      log("6) Walk-forward…")
+      let result = WalkForwardBacktester().run(
+        matches: pastMatches, histories: histories, odds: odds, infos: infos)
+
+      context.insert(
+        BacktestRun(
+          matches: result.matches, bets: result.bets, wins: result.wins, losses: result.losses,
+          pushes: result.pushes, profit: result.profit, staked: result.staked, roi: result.roi,
+          maxDrawdown: result.maxDrawdown, maxLosingStreak: result.maxLosingStreak))
+      try? context.save()
+
+      // 7) Отчёт
+      log("--- Итог ---")
+      log("Matches: \(result.matches)")
+      log("Bets: \(result.bets)")
+      log("W/L/P: \(result.wins)/\(result.losses)/\(result.pushes)")
+      log("ROI: \(String(format: "%+.2f%%", result.roi * 100))")
+      log("Profit: \(String(format: "%+.3f", result.profit))")
+      if !result.perLeague.isEmpty {
+        log("--- Лиги ---")
+        for (lg, s) in result.perLeague.sorted(by: { $0.value.bets > $1.value.bets }).prefix(5) {
+          log("\(lg): \(s.bets)b, \(String(format: "%+.1f%%", s.roi * 100))")
+        }
+      }
+      if !result.perMarket.isEmpty {
+        log("--- Рынки ---")
+        for (mk, s) in result.perMarket.sorted(by: { $0.value.bets > $1.value.bets }) {
+          log("\(mk): \(s.bets)b, \(String(format: "%+.1f%%", s.roi * 100))")
+        }
+      }
     } catch {
-      add("ERROR: \(error.localizedDescription)")
+      log("ERROR: \(error.localizedDescription)")
     }
   }
 

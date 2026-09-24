@@ -16,7 +16,7 @@ final class SStatsClient {
     cfg.waitsForConnectivity = true
     cfg.httpAdditionalHeaders = [
       "Accept": "application/json",
-      "User-Agent": "SyndicateQuant-iOS/5.2.2 (iPhone; iOS)",
+      "User-Agent": "SyndicateQuant-iOS/5.2.3 (iPhone; iOS)",
       "Accept-Language": "en-US,en;q=0.9",
     ]
     self.session = URLSession(configuration: cfg)
@@ -38,8 +38,11 @@ final class SStatsClient {
   }
 
   func listTeam(_ teamID: String, limit: Int = 25) async throws -> JSONValue {
-    try await get("/Ls/List", query: ["Team": teamID, "Upcoming": "false", "Limit": String(limit)])
+    try await get(
+      "/Ls/List",
+      query: ["Team": teamID, "Ended": "true", "Limit": String(limit), "Order": "-1"])
   }
+
   func gameInfo(_ id: String) async throws -> JSONValue {
     try await get("/Ls/GameInfo", query: ["id": id])
   }
@@ -70,9 +73,13 @@ final class SStatsClient {
   }
 
   private func matches(from json: JSONValue) -> [Match] { QuantEngine().matches(from: json) }
+
   private func recordsFromList(_ json: JSONValue, targetID: String) -> [TeamRecord] {
     var out: [TeamRecord] = []
-    for o in json.allObjects() {
+    let items: [JSONValue] =
+      json.object?["data"]?.array ?? json.allObjects().map { .object($0) }
+    for item in items {
+      guard let o = item.object else { continue }
       let homeID = teamID(o, "home")
       let awayID = teamID(o, "away")
       guard homeID == targetID || awayID == targetID else { continue }
@@ -82,8 +89,9 @@ final class SStatsClient {
       let stats = o["statistics"]?.object ?? o
       let rec = TeamRecord(
         id: string(o, ["id", "gameId", "game_id", "eventId", "flashId"]) ?? UUID().uuidString,
-        date: date(o), gf: number(o, [pref + "FTResult", pref + "Score", pref + "Goals"]),
-        ga: number(o, [opp + "FTResult", opp + "Score", opp + "Goals"]),
+        date: date(o),
+        gf: number(o, [pref + "FTResult", pref + "Result", pref + "Score", pref + "Goals"]),
+        ga: number(o, [opp + "FTResult", opp + "Result", opp + "Score", opp + "Goals"]),
         corners: number(
           stats, ["cornerKicks" + (home ? "Home" : "Away"), pref + "Corners", "corners"]),
         oppCorners: number(stats, ["cornerKicks" + (home ? "Away" : "Home"), opp + "Corners"]),
@@ -103,7 +111,7 @@ final class SStatsClient {
   }
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {
     if let x = o[side + "Team"]?.object {
-      return string(x, ["id", "teamId", "team_id", "flashId"])
+      return string(x, ["id", "teamId", "team_id", "flashId", "uid"])
     }
     return string(o, [side + "TeamId", side + "TeamID", side + "Id", side + "ID"])
   }
@@ -118,6 +126,8 @@ final class SStatsClient {
   private func date(_ o: [String: JSONValue]) -> Date? {
     if let s = string(o, ["date", "dateUtc", "startTime", "datetime"]) {
       let f = ISO8601DateFormatter()
+      if let d = f.date(from: s) { return d }
+      f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
       if let d = f.date(from: s) { return d }
       if let t = Double(s) { return Date(timeIntervalSince1970: t > 1e11 ? t / 1000 : t) }
     }
@@ -154,7 +164,6 @@ final class SStatsClient {
       return try JSONValue(data: data)
     } catch let urlErr as URLError {
       print("[SStats] URLError code=\(urlErr.code.rawValue) url=\(url.absoluteString)")
-      // Повторяем только при обрыве соединения, НЕ при таймауте
       let retriable: Set<URLError.Code> = [
         .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
       ]
