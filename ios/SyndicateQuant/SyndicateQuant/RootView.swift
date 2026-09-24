@@ -232,7 +232,8 @@ struct RootView: View {
       add("1) parsed matches: \(todayMatches.count)")
 
       if let firstRaw = rawObjects.first {
-        let preview = firstRaw.keys.sorted().prefix(15).joined(separator: ",")
+        let keyArray = Array(firstRaw.keys).sorted()
+        let preview = keyArray.prefix(15).joined(separator: ",")
         add("1) first object keys: \(preview)")
       }
 
@@ -242,9 +243,10 @@ struct RootView: View {
 
       // ШАГ 3. Для первых 3 матчей — GameInfo и Odds
       for (i, m) in withIDs.prefix(3).enumerated() {
-        add("3.\(i+1)) \(m.home) vs \(m.away) id=\(m.id)")
+        add("3.\(i + 1)) \(m.home) vs \(m.away) id=\(m.id)")
         if let info = try? await client.gameInfo(m.id) {
-          let keys = (info.object?.keys ?? []).sorted().prefix(10).joined(separator: ",")
+          let keyArray = Array((info.object ?? [:]).keys).sorted()
+          let keys = keyArray.prefix(10).joined(separator: ",")
           add("   info keys: \(keys)")
           let h = info.firstNumber(keys: ["homeftresult", "homescore", "homegoals"])
           let a = info.firstNumber(keys: ["awayftresult", "awayscore", "awaygoals"])
@@ -272,7 +274,8 @@ struct RootView: View {
           let objs = teamJSON.allObjects()
           add("4) listTeam('1') objects: \(objs.count)")
           if let first = objs.first {
-            let keys = first.keys.sorted().prefix(15).joined(separator: ",")
+            let keyArray = Array(first.keys).sorted()
+            let keys = keyArray.prefix(15).joined(separator: ",")
             add("4) first team match keys: \(keys)")
           }
           let matches = engine.matches(from: teamJSON)
