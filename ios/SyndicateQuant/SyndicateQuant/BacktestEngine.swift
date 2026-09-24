@@ -12,6 +12,23 @@ struct BacktestResult {
   var maxLosingStreak = 0
   var hitRate: Double { wins + losses > 0 ? Double(wins) / Double(wins + losses) : 0 }
   var roi: Double { staked > 0 ? profit / staked : 0 }
+
+  // Разбивка по лигам
+  var perLeague: [String: SegmentStats] = [:]
+  // Разбивка по рынкам
+  var perMarket: [String: SegmentStats] = [:]
+}
+
+struct SegmentStats {
+  var matches = 0
+  var bets = 0
+  var wins = 0
+  var losses = 0
+  var pushes = 0
+  var profit = 0.0
+  var staked = 0.0
+  var roi: Double { staked > 0 ? profit / staked : 0 }
+  var hitRate: Double { wins + losses > 0 ? Double(wins) / Double(wins + losses) : 0 }
 }
 
 struct CalibrationEngine {
@@ -42,13 +59,12 @@ struct WalkForwardBacktester {
     var lossStreak = 0
 
     for match in matches.sorted(by: { ($0.start ?? .distantPast) < ($1.start ?? .distantPast) }) {
-      r.matches += 1  // считаем КАЖДЫЙ матч, дошедший до цикла
+      r.matches += 1
 
       guard let h = match.homeID, let a = match.awayID,
         let info = infos[match.id], let odd = odds[match.id]
       else { continue }
 
-      // Walk-forward: используем только записи ДО даты матча (без утечки будущего)
       let matchStart = match.start ?? .distantFuture
       let hs = (histories[h] ?? []).filter { ($0.date ?? .distantPast) < matchStart }
       let awayRecords = (histories[a] ?? []).filter { ($0.date ?? .distantPast) < matchStart }
@@ -81,6 +97,17 @@ struct WalkForwardBacktester {
         equity += pnl
         peak = max(peak, equity)
         r.maxDrawdown = max(r.maxDrawdown, peak - equity)
+
+        // Агрегируем по лиге и рынку
+        var l = r.perLeague[match.league] ?? SegmentStats()
+        l.matches += 1; l.bets += 1; l.staked += s.stake; l.profit += pnl
+        if actual == 1 { l.wins += 1 } else if actual == 0.5 { l.pushes += 1 } else { l.losses += 1 }
+        r.perLeague[match.league] = l
+
+        var m = r.perMarket[s.market] ?? SegmentStats()
+        m.matches += 1; m.bets += 1; m.staked += s.stake; m.profit += pnl
+        if actual == 1 { m.wins += 1 } else if actual == 0.5 { m.pushes += 1 } else { m.losses += 1 }
+        r.perMarket[s.market] = m
       }
     }
     return r

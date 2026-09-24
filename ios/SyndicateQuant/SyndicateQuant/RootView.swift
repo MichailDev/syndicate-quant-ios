@@ -87,7 +87,7 @@ struct RootView: View {
         Text(
           "Локальный backtest использует только уже полученные данные SStats. Никаких будущих матчей в истории модели не используется."
         ).font(.caption).foregroundStyle(.secondary)
-        Text(backtestStatus)
+        Text(backtestStatus).font(.caption.monospaced())
         Button("Запустить на последнем наборе") { Task { await runBacktest() } }.disabled(busy)
       }
       ForEach(backtests) { b in
@@ -199,88 +199,92 @@ struct RootView: View {
     }
   }
 
+  // MARK: - ДИАГНОСТИЧЕСКИЙ RUNBACKTEST
+  // Ничего не считает. Показывает пошагово, где теряются данные SStats.
   private func runBacktest() async {
     guard !busy else { return }
     busy = true
     defer { busy = false }
 
+    var lines: [String] = []
+    func add(_ s: String) {
+      lines.append(s)
+      backtestStatus = lines.joined(separator: "\n")
+      print("[BT] \(s)")
+    }
+
     do {
       guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         throw APIError.missingAPIKey
       }
-
       let client = SStatsClient(settings: settings)
       let engine = QuantEngine()
 
-      // --- 1. Собираем матчи за последние N дней ---
-      let lookbackDays = 14
-      var allMatches: [Match] = []
-      var seen = Set<String>()
+      // ШАГ 1. Today
+      add("1) apiKey length: \(settings.apiKey.count)")
+      add("1) baseURL: \(settings.baseURL)")
 
-      for offset in 0..<lookbackDays {
-        guard let day = Calendar.current.date(byAdding: .day, value: -offset, to: Date()) else {
-          continue
+      let todayJSON = try await client.listToday()
+      let rawObjects = todayJSON.allObjects()
+      add("1) raw objects: \(rawObjects.count)")
+
+      let todayMatches = engine.matches(from: todayJSON)
+      add("1) parsed matches: \(todayMatches.count)")
+
+      if let firstRaw = rawObjects.first {
+        let preview = firstRaw.keys.sorted().prefix(15).joined(separator: ",")
+        add("1) first object keys: \(preview)")
+      }
+
+      // ШАГ 2. Проверяем homeID/awayID
+      let withIDs = todayMatches.filter { $0.homeID != nil && $0.awayID != nil }
+      add("2) matches with homeID+awayID: \(withIDs.count)/\(todayMatches.count)")
+
+      // ШАГ 3. Для первых 3 матчей — GameInfo и Odds
+      for (i, m) in withIDs.prefix(3).enumerated() {
+        add("3.\(i+1)) \(m.home) vs \(m.away) id=\(m.id)")
+        if let info = try? await client.gameInfo(m.id) {
+          let keys = (info.object?.keys ?? []).sorted().prefix(10).joined(separator: ",")
+          add("   info keys: \(keys)")
+          let h = info.firstNumber(keys: ["homeftresult", "homescore", "homegoals"])
+          let a = info.firstNumber(keys: ["awayftresult", "awayscore", "awaygoals"])
+          add("   info FT: \(h.map { String($0) } ?? "nil") - \(a.map { String($0) } ?? "nil")")
+        } else {
+          add("   info: FAILED")
         }
-        backtestStatus = "Собираю день \(offset + 1)/\(lookbackDays)…"
-        if let json = try? await client.listOn(date: day, upcoming: false) {
-          for m in engine.matches(from: json) where !isExcluded(m) && !seen.contains(m.id) {
-            seen.insert(m.id)
-            allMatches.append(m)
+        if let odd = try? await client.odds(m.id) {
+          let cnt = odd.allObjects().count
+          add("   odds objects: \(cnt)")
+        } else {
+          add("   odds: FAILED")
+        }
+        if let h = m.homeID {
+          let hist = await client.fetchTeamHistory(teamID: h, count: 10)
+          add("   home history: \(hist.count)")
+        }
+        try? await Task.sleep(for: .milliseconds(150))
+      }
+
+      // ШАГ 4. Если матчей на сегодня нет — пробуем listTeam
+      if withIDs.isEmpty {
+        add("4) матчей на сегодня нет — тестирую listTeam…")
+        if let teamJSON = try? await client.listTeam("1", limit: 10) {
+          let objs = teamJSON.allObjects()
+          add("4) listTeam('1') objects: \(objs.count)")
+          if let first = objs.first {
+            let keys = first.keys.sorted().prefix(15).joined(separator: ",")
+            add("4) first team match keys: \(keys)")
           }
+          let matches = engine.matches(from: teamJSON)
+          add("4) listTeam parsed matches: \(matches.count)")
+        } else {
+          add("4) listTeam: FAILED")
         }
-        try? await Task.sleep(for: .milliseconds(200))
       }
 
-      backtestStatus = "Матчей найдено: \(allMatches.count). Скачиваю данные…"
-
-      // --- 2. Тянем историю команд, GameInfo и коэффициенты ---
-      var histories: [String: [TeamRecord]] = [:]
-      var odds: [String: JSONValue] = [:]
-      var infos: [String: JSONValue] = [:]
-
-      let historySize = max(settings.historyMatches, 15)
-      for (idx, match) in allMatches.enumerated() {
-        backtestStatus = "Данные \(idx + 1)/\(allMatches.count)…"
-        if let h = match.homeID, histories[h] == nil {
-          histories[h] = await client.fetchTeamHistory(teamID: h, count: historySize)
-        }
-        if let a = match.awayID, histories[a] == nil {
-          histories[a] = await client.fetchTeamHistory(teamID: a, count: historySize)
-        }
-        if let info = try? await client.gameInfo(match.id) {
-          infos[match.id] = info
-        }
-        if let odd = try? await client.odds(match.id) {
-          odds[match.id] = odd
-        }
-        try? await Task.sleep(for: .milliseconds(80))
-      }
-
-      // --- 3. Реальный walk-forward ---
-      backtestStatus = "Считаю walk-forward…"
-      let result = WalkForwardBacktester().run(
-        matches: allMatches, histories: histories, odds: odds, infos: infos)
-
-      context.insert(
-        BacktestRun(
-          matches: result.matches,
-          bets: result.bets,
-          wins: result.wins,
-          losses: result.losses,
-          pushes: result.pushes,
-          profit: result.profit,
-          staked: result.staked,
-          roi: result.roi,
-          maxDrawdown: result.maxDrawdown,
-          maxLosingStreak: result.maxLosingStreak))
-      try? context.save()
-
-      backtestStatus = String(
-        format: "Готово: %d матчей · %d ставок · W/L/P %d/%d/%d · ROI %+.2f%%",
-        result.matches, result.bets, result.wins, result.losses, result.pushes,
-        result.roi * 100)
+      add("--- конец диагностики ---")
     } catch {
-      backtestStatus = "Ошибка: \(error.localizedDescription)"
+      add("ERROR: \(error.localizedDescription)")
     }
   }
 
@@ -302,7 +306,7 @@ struct SignalCard: View {
           .clipShape(Capsule())
       }
       Text(
-        "\(signal.league) · \(signal.market) · \(signal.selection)\(signal.line.map{" \($0)"} ?? "")"
+        "\(signal.league) · \(signal.market) · \(signal.selection)\(signal.line.map { " \($0)" } ?? "")"
       ).foregroundStyle(.secondary)
       HStack {
         metric("Odds", signal.odds, "%.2f")
