@@ -200,19 +200,88 @@ struct RootView: View {
   }
 
   private func runBacktest() async {
-    backtestStatus = "Собираю текущий набор…"
-    let subset = Array(signals.prefix(8))
-    let r = BacktestResult(
-      matches: subset.count, bets: subset.count, wins: 0, losses: 0, pushes: 0, profit: 0,
-      staked: subset.reduce(0) { $0 + $1.stake }, maxDrawdown: 0, maxLosingStreak: 0)
-    context.insert(
-      BacktestRun(
-        matches: r.matches, bets: r.bets, wins: r.wins, losses: r.losses, pushes: r.pushes,
-        profit: r.profit, staked: r.staked, roi: r.roi, maxDrawdown: r.maxDrawdown,
-        maxLosingStreak: r.maxLosingStreak))
-    try? context.save()
-    backtestStatus =
-      "Сохранён локальный контрольный прогон: \(r.matches) матчей / \(r.bets) сигналов"
+    guard !busy else { return }
+    busy = true
+    defer { busy = false }
+
+    do {
+      guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw APIError.missingAPIKey
+      }
+
+      let client = SStatsClient(settings: settings)
+      let engine = QuantEngine()
+
+      // --- 1. Собираем матчи за последние N дней ---
+      let lookbackDays = 14
+      var allMatches: [Match] = []
+      var seen = Set<String>()
+
+      for offset in 0..<lookbackDays {
+        guard let day = Calendar.current.date(byAdding: .day, value: -offset, to: Date()) else {
+          continue
+        }
+        backtestStatus = "Собираю день \(offset + 1)/\(lookbackDays)…"
+        if let json = try? await client.listOn(date: day, upcoming: false) {
+          for m in engine.matches(from: json) where !isExcluded(m) && !seen.contains(m.id) {
+            seen.insert(m.id)
+            allMatches.append(m)
+          }
+        }
+        try? await Task.sleep(for: .milliseconds(200))
+      }
+
+      backtestStatus = "Матчей найдено: \(allMatches.count). Скачиваю данные…"
+
+      // --- 2. Тянем историю команд, GameInfo и коэффициенты ---
+      var histories: [String: [TeamRecord]] = [:]
+      var odds: [String: JSONValue] = [:]
+      var infos: [String: JSONValue] = [:]
+
+      let historySize = max(settings.historyMatches, 15)
+      for (idx, match) in allMatches.enumerated() {
+        backtestStatus = "Данные \(idx + 1)/\(allMatches.count)…"
+        if let h = match.homeID, histories[h] == nil {
+          histories[h] = await client.fetchTeamHistory(teamID: h, count: historySize)
+        }
+        if let a = match.awayID, histories[a] == nil {
+          histories[a] = await client.fetchTeamHistory(teamID: a, count: historySize)
+        }
+        if let info = try? await client.gameInfo(match.id) {
+          infos[match.id] = info
+        }
+        if let odd = try? await client.odds(match.id) {
+          odds[match.id] = odd
+        }
+        try? await Task.sleep(for: .milliseconds(80))
+      }
+
+      // --- 3. Реальный walk-forward ---
+      backtestStatus = "Считаю walk-forward…"
+      let result = WalkForwardBacktester().run(
+        matches: allMatches, histories: histories, odds: odds, infos: infos)
+
+      context.insert(
+        BacktestRun(
+          matches: result.matches,
+          bets: result.bets,
+          wins: result.wins,
+          losses: result.losses,
+          pushes: result.pushes,
+          profit: result.profit,
+          staked: result.staked,
+          roi: result.roi,
+          maxDrawdown: result.maxDrawdown,
+          maxLosingStreak: result.maxLosingStreak))
+      try? context.save()
+
+      backtestStatus = String(
+        format: "Готово: %d матчей · %d ставок · W/L/P %d/%d/%d · ROI %+.2f%%",
+        result.matches, result.bets, result.wins, result.losses, result.pushes,
+        result.roi * 100)
+    } catch {
+      backtestStatus = "Ошибка: \(error.localizedDescription)"
+    }
   }
 
   private func isExcluded(_ m: Match) -> Bool {
