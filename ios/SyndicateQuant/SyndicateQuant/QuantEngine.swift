@@ -52,7 +52,7 @@ struct QuantEngine {
   static let countLines = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5]
   static let sharpBooks = ["pinnacle", "betfair", "sbo", "sbobet", "marathon", "bet365 exchange"]
 
-  // MARK: - Matches (работает и с /Ls/List, и с /Games/list)
+  // MARK: - Matches
   func matches(from json: JSONValue) -> [Match] {
     let items: [JSONValue]
     if let obj = json.object, let dataArr = obj["data"]?.array {
@@ -85,7 +85,7 @@ struct QuantEngine {
     return result
   }
 
-  // MARK: - Histories из того же ответа
+  // MARK: - Histories
   func allRecords(from json: JSONValue) -> [String: [TeamRecord]] {
     let items: [JSONValue]
     if let obj = json.object, let dataArr = obj["data"]?.array {
@@ -247,10 +247,11 @@ struct QuantEngine {
     return out.sorted { $0.qcs > $1.qcs }
   }
 
+  // ⚠️ Смягчены пороги: qcs >= 55 (было 70)
   func portfolio(_ signals: [BetSignal]) -> [BetSignal] {
     var chosen: [BetSignal] = []
     var total = 0.0
-    for s in signals.filter({ $0.robustEV > 0 && $0.qcs >= 70 }).sorted(by: {
+    for s in signals.filter({ $0.robustEV > 0 && $0.qcs >= 55 }).sorted(by: {
       $0.robustEV > $1.robustEV
     }) {
       let st = min(0.02, s.stake)
@@ -265,7 +266,6 @@ struct QuantEngine {
     return chosen
   }
 
-  // MARK: - Model components
   private func estimateLambdas(_ h: [TeamRecord], _ a: [TeamRecord]) -> (Double, Double)? {
     func b(_ x: [Double?]) -> Double? { QuantMath.shrink(x.compactMap { $0 }, baseline: nil, k: 8) }
     guard let hgf = b(h.map { $0.gf }), let hga = b(h.map { $0.ga }), let agf = b(a.map { $0.gf }),
@@ -391,6 +391,7 @@ struct QuantEngine {
       m, line: line, n: 20000, seed: UInt64(abs(Int(mean * 100)) + 17), over: true)
   }
 
+  // ⚠️ Смягчены пороги: conflict 0.25 (было 0.18), EV 0.02 (было 0.03)
   private func finish(
     _ match: Match, _ q: Quote, _ p: Double, _ odds: Double, _ dcs: Double, _ quotes: [Quote],
     sharp: SharpGuard, modelOutcomes: (home: Double, draw: Double, away: Double), model: String
@@ -410,7 +411,7 @@ struct QuantEngine {
     let fair = 1 / max(p, 0.001)
     let extreme = odds > fair * 1.25
     let anomaly = odds > fair * 1.35
-    let conflict = abs(p - marketProbability) > 0.18
+    let conflict = abs(p - marketProbability) > 0.25
     if extreme || anomaly || conflict { robust = -abs(robust) }
     let agreement =
       q.market == "1X2"
@@ -429,11 +430,11 @@ struct QuantEngine {
     let classification: String
     if anomaly || extreme || conflict {
       classification = "X NO BET"
-    } else if robust > 0 && ev >= 0.07 && qcs >= 85 && ms >= 50 && dcs >= 60 {
+    } else if robust > 0 && ev >= 0.05 && qcs >= 78 && ms >= 45 && dcs >= 55 {
       classification = "S BET"
-    } else if robust > 0 && ev >= 0.05 && qcs >= 78 && ms >= 50 && dcs >= 60 {
+    } else if robust > 0 && ev >= 0.03 && qcs >= 70 && ms >= 45 && dcs >= 55 {
       classification = "A BET"
-    } else if ev >= 0.03 {
+    } else if ev >= 0.02 {
       classification = "B LEAN"
     } else if ev > 0 {
       classification = "C WATCH"
@@ -475,7 +476,6 @@ struct QuantEngine {
     return 0.03
   }
 
-  // MARK: - Odds
   private func parseQuotes(_ json: JSONValue) -> [Quote] {
     var out: [Quote] = []
     if let arr = json.array {
@@ -557,34 +557,10 @@ struct QuantEngine {
     return ""
   }
 
-  // MARK: - JSON helpers
-  private func extractPlayers(_ g: [String: JSONValue], _ teamID: String) -> [PlayerRow] {
-    let arr = (g["playerStats"] ?? g["players"] ?? g["lineupPlayers"])?.allObjects() ?? []
-    return arr.compactMap { p in
-      let tid = string(p, ["teamId", "team_id"])
-      guard tid == nil || tid == teamID else { return nil }
-      let mins =
-        number(p, ["minutes", "minutesPlayed", "minutes_played", "mins", "timePlayed"])
-        ?? ((p["startXI"]?.bool ?? false || p["started"]?.bool ?? false) ? 90 : 0)
-      guard mins > 0 else { return nil }
-      return PlayerRow(
-        id: string(p, ["playerId", "id"]) ?? UUID().uuidString,
-        name: string(p, ["playerName", "name"]) ?? "", minutes: mins,
-        xg: number(p, ["expectedGoals", "xG", "xg"]) ?? 0,
-        xa: number(p, ["expectedAssists", "xA", "xa"]) ?? 0,
-        goals: number(p, ["goals", "goalsTotal", "goal"]) ?? 0,
-        assists: number(p, ["assists", "goalsAssists", "assist"]) ?? 0,
-        shots: number(p, ["shots", "shotsTotal", "totalShots"]) ?? 0,
-        sot: number(p, ["shotsOnGoal", "shotsOn", "sot"]) ?? 0,
-        starts: (p["startXI"]?.bool ?? false) ? 1 : 0)
-    }
-  }
   private func fullGame(_ p: JSONValue) -> [String: JSONValue] {
     if let o = p.object, let d = o["data"]?.object { return d }
     return p.object ?? [:]
   }
-
-  // ⚠️ ИСПРАВЛЕНО: теперь читает и строковый id (slug), и числовой id (для /Games/list)
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {
     if let x = o[side + "Team"]?.object {
       if let s = string(x, ["id", "teamid", "team_id", "flashid", "uid"]), !s.isEmpty {
@@ -598,7 +574,6 @@ struct QuantEngine {
     if let n = o[side + "TeamId"]?.number { return String(Int(n)) }
     return nil
   }
-
   private func string(_ o: [String: JSONValue], _ keys: [String]) -> String? {
     for k in keys { if let s = o[k]?.string { return s } }
     return nil
