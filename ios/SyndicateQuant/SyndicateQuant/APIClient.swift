@@ -1,4 +1,198 @@
 import Foundation
+import Network
+
+// MARK: - Response Cache
+// In-memory + disk. Ключ — path + sorted query (без apikey).
+// TTL по endpoint, см. `ttl(for:)`.
+
+actor ResponseCache {
+  static let shared = ResponseCache()
+
+  private struct Entry {
+    let json: JSONValue
+    let expiresAt: Date
+  }
+
+  private struct Envelope: Codable {
+    let payload: Data
+    let expiresAt: Date
+  }
+
+  private var memory: [String: Entry] = [:]
+  private let fm = FileManager.default
+  private let dir: URL
+
+  private init() {
+    let base = (try? fm.url(for: .cachesDirectory, in: .userDomainMask,
+                             appropriateFor: nil, create: true))
+      ?? URL(fileURLWithPath: NSTemporaryDirectory())
+    let d = base.appendingPathComponent("SStatsCache", isDirectory: true)
+    try? fm.createDirectory(at: d, withIntermediateDirectories: true)
+    self.dir = d
+    // Очищаем просроченное при старте
+    try? purgeExpiredOnDisk()
+  }
+
+  func get(key: String) -> JSONValue? {
+    // 1) Memory
+    if let e = memory[key], e.expiresAt > Date() {
+      return e.json
+    }
+    // 2) Disk
+    let url = fileURL(for: key)
+    guard let data = try? Data(contentsOf: url),
+          let env = try? JSONDecoder().decode(Envelope.self, from: data),
+          env.expiresAt > Date()
+    else {
+      // Просроченный файл сносим
+      try? fm.removeItem(at: url)
+      return nil
+    }
+    guard let json = try? JSONValue(data: env.payload) else { return nil }
+    memory[key] = Entry(json: json, expiresAt: env.expiresAt)
+    return json
+  }
+
+  func set(key: String, json: JSONValue, ttl: TimeInterval) {
+    let expiresAt = Date().addingTimeInterval(ttl)
+    memory[key] = Entry(json: json, expiresAt: expiresAt)
+    do {
+      let payload = try JSONEncoder().encode(json)
+      let env = Envelope(payload: payload, expiresAt: expiresAt)
+      let data = try JSONEncoder().encode(env)
+      let url = fileURL(for: key)
+      try data.write(to: url, options: .atomic)
+    } catch {
+      // Кэш — best-effort, ошибки не критичны
+    }
+  }
+
+  func clearAll() {
+    memory.removeAll()
+    try? fm.removeItem(at: dir)
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+  }
+
+  private func fileURL(for key: String) -> URL {
+    dir.appendingPathComponent(ResponseCache.fnv1a(key) + ".json")
+  }
+
+  private func purgeExpiredOnDisk() throws {
+    let files = (try? fm.contentsOfDirectory(
+      at: dir, includingPropertiesForKeys: nil)) ?? []
+    for f in files {
+      guard let data = try? Data(contentsOf: f),
+            let env = try? JSONDecoder().decode(Envelope.self, from: data)
+      else {
+        try? fm.removeItem(at: f)
+        continue
+      }
+      if env.expiresAt <= Date() {
+        try? fm.removeItem(at: f)
+      }
+    }
+  }
+
+  private static func fnv1a(_ s: String) -> String {
+    var h: UInt64 = 1469598103934665603
+    for b in s.utf8 {
+      h ^= UInt64(b)
+      h &*= 1099511628211
+    }
+    return String(h, radix: 16)
+  }
+}
+
+// MARK: - Rate Limiter
+// Минимальный интервал между запросами + адаптивный backoff на 429.
+
+actor RateLimiter {
+  static let shared = RateLimiter()
+
+  private var lastRequest = Date.distantPast
+  private var minInterval: TimeInterval = 0.20  // ~5 req/sec = 300/min
+
+  func acquire() async {
+    let now = Date()
+    let elapsed = now.timeIntervalSince(lastRequest)
+    if elapsed < minInterval {
+      let wait = minInterval - elapsed
+      try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+    }
+    lastRequest = Date()
+  }
+
+  func register429(retryAfter: TimeInterval?) {
+    // Увеличиваем минимальный интервал, чтобы погасить серию 429.
+    let cooldown = retryAfter ?? 5.0
+    minInterval = min(2.0, max(minInterval, cooldown / 10.0))
+    lastRequest = Date().addingTimeInterval(cooldown)
+    print("[RateLimit] 429; minInterval=\(minInterval)s cooldown=\(cooldown)s")
+  }
+
+  func onSuccess() {
+    // Плавно возвращаемся к нормальному ритму
+    minInterval = max(0.20, minInterval * 0.95)
+  }
+}
+
+// MARK: - Request Coalescer
+// Если одинаковый запрос уже выполняется — вернём тот же Task, не дублируя сеть.
+
+actor RequestCoalescer {
+  static let shared = RequestCoalescer()
+
+  private var inFlight: [String: Task<JSONValue, Error>] = [:]
+
+  func coalesce(
+    key: String,
+    operation: @escaping @Sendable () async throws -> JSONValue
+  ) async throws -> JSONValue {
+    if let existing = inFlight[key] {
+      return try await existing.value
+    }
+    let task = Task { try await operation() }
+    inFlight[key] = task
+    do {
+      let value = try await task.value
+      inFlight[key] = nil
+      return value
+    } catch {
+      inFlight[key] = nil
+      throw error
+    }
+  }
+}
+
+// MARK: - Network Monitor
+// Простая проверка online/offline, чтобы не ждать timeout 25 секунд.
+
+final class NetworkMonitor: @unchecked Sendable {
+  static let shared = NetworkMonitor()
+
+  private let monitor = NWPathMonitor()
+  private let queue = DispatchQueue(label: "com.syndicatequant.netmon")
+
+  private let lock = NSLock()
+  private var _isOnline = true
+
+  var isOnline: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return _isOnline
+  }
+
+  private init() {
+    monitor.pathUpdateHandler = { [weak self] path in
+      guard let self else { return }
+      self.lock.lock()
+      self._isOnline = (path.status == .satisfied)
+      self.lock.unlock()
+    }
+    monitor.start(queue: queue)
+  }
+}
+
+// MARK: - SStatsClient
 
 final class SStatsClient {
   private let baseURL: String
@@ -13,23 +207,23 @@ final class SStatsClient {
     cfg.timeoutIntervalForRequest = 25
     cfg.timeoutIntervalForResource = 40
     cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-    cfg.waitsForConnectivity = true
+    cfg.waitsForConnectivity = false
     cfg.httpAdditionalHeaders = [
       "Accept": "application/json",
-      "User-Agent": "SyndicateQuant-iOS/5.2.4 (iPhone; iOS)",
+      "User-Agent": "SyndicateQuant-iOS/5.3.0 (iPhone; iOS)",
       "Accept-Language": "en-US,en;q=0.9",
     ]
     self.session = URLSession(configuration: cfg)
   }
 
-  // MARK: - Сегодняшние матчи (Flashscore, slug ID)
+  // MARK: - Public API (сигнатуры не менялись)
+
   func listToday() async throws -> JSONValue {
     try await get(
       "/Ls/List",
       query: ["Date": Self.dateString(Date()), "TimeZone": "3", "Upcoming": "true"])
   }
 
-  // MARK: - Конкретная дата
   func listOn(date: Date, upcoming: Bool = false) async throws -> JSONValue {
     try await get(
       "/Ls/List",
@@ -40,7 +234,6 @@ final class SStatsClient {
       ])
   }
 
-  // MARK: - Диапазон дат через /Games/list (нативный SStats, числовой id + odds)
   func listGamesRange(from: Date, to: Date, limit: Int = 1000) async throws -> JSONValue {
     try await get(
       "/Games/list",
@@ -53,7 +246,6 @@ final class SStatsClient {
       ])
   }
 
-  // MARK: - Диапазон дат через /Ls/List (fallback)
   func listRange(from: Date, to: Date, limit: Int = 1000) async throws -> JSONValue {
     try await get(
       "/Ls/List",
@@ -66,29 +258,24 @@ final class SStatsClient {
       ])
   }
 
-  // MARK: - История команды (slug)
   func listTeam(_ teamID: String, limit: Int = 25) async throws -> JSONValue {
     try await get(
       "/Ls/List",
       query: ["Team": teamID, "Ended": "true", "Limit": String(limit), "Order": "-1"])
   }
 
-  // MARK: - Детали матча
   func gameInfo(_ id: String) async throws -> JSONValue {
     try await get("/Ls/GameInfo", query: ["id": id])
   }
 
-  // MARK: - Коэффициенты (нужен числовой ID)
   func odds(numericID: Int) async throws -> JSONValue {
     try await get("/Odds/\(numericID)", query: [:])
   }
 
-  // MARK: - Glicko 2
   func glicko(_ id: String) async throws -> JSONValue {
     try await get("/Games/glicko/\(id)", query: [:])
   }
 
-  // MARK: - История команды
   func fetchTeamHistory(teamID: String, count: Int = 15) async -> [TeamRecord] {
     do {
       let list = try await listTeam(teamID, limit: max(count * 2, 25))
@@ -97,21 +284,145 @@ final class SStatsClient {
         let ids = matches(from: list).prefix(count).map { $0.id }
         for id in ids {
           if let r = try? await gameInfo(id),
-            let x = QuantEngine().teamRecord(from: r, targetID: teamID)
-          {
+             let x = QuantEngine().teamRecord(from: r, targetID: teamID) {
             rows.append(x)
           }
         }
       }
       var unique = [String: TeamRecord]()
       for r in rows { unique[r.id] = r }
-      return Array(unique.values).sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+      return Array(unique.values)
+        .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
         .prefix(count).map { $0 }
     } catch { return [] }
   }
 
-  // MARK: - Private
-  private func matches(from json: JSONValue) -> [Match] { QuantEngine().matches(from: json) }
+  // MARK: - Cache policy
+
+  private static func ttl(for path: String) -> TimeInterval {
+    if path.hasPrefix("/Ls/List") { return 15 * 60 }         // 15 мин (сегодня)
+    if path.hasPrefix("/Games/list") { return 6 * 3600 }     // 6 ч
+    if path.hasPrefix("/Ls/Team") { return 3600 }            // 1 ч
+    if path.hasPrefix("/Ls/GameInfo") { return 30 * 60 }     // 30 мин
+    if path.hasPrefix("/Odds/") { return 5 * 60 }            // 5 мин
+    if path.hasPrefix("/Games/glicko") { return 6 * 3600 }   // 6 ч
+    return 5 * 60
+  }
+
+  private static func makeCacheKey(path: String, query: [String: String]) -> String {
+    let q = query
+      .filter { $0.key.lowercased() != "apikey" }
+      .sorted { $0.key < $1.key }
+      .map { "\($0.key)=\($0.value)" }
+      .joined(separator: "&")
+    return path + "?" + q
+  }
+
+  // MARK: - Networking core
+
+  private func get(
+    _ path: String, query: [String: String], attempt: Int = 0
+  ) async throws -> JSONValue {
+    let cacheKey = Self.makeCacheKey(path: path, query: query)
+
+    // 1. Cache hit
+    if let cached = await ResponseCache.shared.get(key: cacheKey) {
+      return cached
+    }
+
+    // 2. Offline check
+    if !NetworkMonitor.shared.isOnline {
+      throw APIError.server("Нет соединения с интернетом")
+    }
+
+    // 3. Coalesce identical requests
+    let baseURL = self.baseURL
+    let apiKey = self.apiKey
+    let session = self.session
+    let ttlValue = Self.ttl(for: path)
+
+    return try await RequestCoalescer.shared.coalesce(key: cacheKey) {
+      // 4. Rate limit
+      await RateLimiter.shared.acquire()
+
+      // 5. Perform request
+      let json = try await Self.performGet(
+        path: path, query: query, attempt: attempt,
+        baseURL: baseURL, apiKey: apiKey, session: session)
+
+      // 6. Save to cache
+      await ResponseCache.shared.set(key: cacheKey, json: json, ttl: ttlValue)
+      return json
+    }
+  }
+
+  private static func performGet(
+    path: String, query: [String: String], attempt: Int,
+    baseURL: String, apiKey: String, session: URLSession
+  ) async throws -> JSONValue {
+    guard var c = URLComponents(string: baseURL + path) else {
+      throw APIError.invalidURL
+    }
+    var items = query.map { URLQueryItem(name: $0.key, value: $0.value) }
+    items.append(URLQueryItem(name: "apikey", value: apiKey))
+    c.queryItems = items
+    guard let url = c.url else { throw APIError.invalidURL }
+
+    var req = URLRequest(url: url)
+    req.httpMethod = "GET"
+    req.timeoutInterval = 25
+
+    do {
+      let (data, response) = try await session.data(for: req)
+      guard let http = response as? HTTPURLResponse else {
+        throw APIError.invalidResponse
+      }
+
+      // 429 — читаем Retry-After, уведомляем RateLimiter, ждём и повторяем
+      if http.statusCode == 429 {
+        let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+          .flatMap { TimeInterval($0) }
+        await RateLimiter.shared.register429(retryAfter: retryAfter)
+
+        if attempt < 3 {
+          let wait = retryAfter ?? min(30, 1.0 * pow(2, Double(attempt)))
+          try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+          return try await performGet(
+            path: path, query: query, attempt: attempt + 1,
+            baseURL: baseURL, apiKey: apiKey, session: session)
+        }
+        throw APIError.rateLimited
+      }
+
+      guard (200..<300).contains(http.statusCode) else {
+        throw APIError.server("SStats HTTP \(http.statusCode)")
+      }
+
+      await RateLimiter.shared.onSuccess()
+      return try JSONValue(data: data)
+    } catch let urlErr as URLError {
+      print("[SStats] URLError code=\(urlErr.code.rawValue) url=\(url.absoluteString)")
+      let retriable: Set<URLError.Code> = [
+        .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
+      ]
+      if retriable.contains(urlErr.code) && attempt < 2 {
+        try? await Task.sleep(nanoseconds: UInt64(500 * (attempt + 1)) * 1_000_000)
+        return try await performGet(
+          path: path, query: query, attempt: attempt + 1,
+          baseURL: baseURL, apiKey: apiKey, session: session)
+      }
+      throw APIError.server("Сеть: \(urlErr.code.rawValue) — \(urlErr.localizedDescription)")
+    } catch {
+      print("[SStats] Error: \(error) url=\(url.absoluteString)")
+      throw error
+    }
+  }
+
+  // MARK: - Helpers
+
+  private func matches(from json: JSONValue) -> [Match] {
+    QuantEngine().matches(from: json)
+  }
 
   private func recordsFromList(_ json: JSONValue, targetID: String) -> [TeamRecord] {
     var out: [TeamRecord] = []
@@ -131,10 +442,11 @@ final class SStatsClient {
         date: date(o),
         gf: number(o, [pref + "FTResult", pref + "Result", pref + "Score", pref + "Goals"]),
         ga: number(o, [opp + "FTResult", opp + "Result", opp + "Score", opp + "Goals"]),
-        corners: number(
-          stats, ["cornerKicks" + (home ? "Home" : "Away"), pref + "Corners", "corners"]),
+        corners: number(stats, ["cornerKicks" + (home ? "Home" : "Away"),
+                                pref + "Corners", "corners"]),
         oppCorners: number(stats, ["cornerKicks" + (home ? "Away" : "Home"), opp + "Corners"]),
-        cards: number(stats, ["yellowCards" + (home ? "Home" : "Away"), pref + "Cards", "cards"]),
+        cards: number(stats, ["yellowCards" + (home ? "Home" : "Away"),
+                              pref + "Cards", "cards"]),
         oppCards: number(stats, ["yellowCards" + (home ? "Away" : "Home"), opp + "Cards"]),
         fouls: number(stats, ["fouls" + (home ? "Home" : "Away"), pref + "Fouls", "fouls"]),
         oppFouls: number(stats, ["fouls" + (home ? "Away" : "Home"), opp + "Fouls"]),
@@ -143,7 +455,9 @@ final class SStatsClient {
         possession: number(stats, ["ballPossession" + (home ? "Home" : "Away"), "possession"]),
         xg: number(stats, ["expectedGoals" + (home ? "Home" : "Away"), "xg"]),
         oppXg: number(stats, ["expectedGoals" + (home ? "Away" : "Home"), "opp_xg"]),
-        referee: string(o, ["refereeName", "referee"]), players: [])
+        referee: string(o, ["refereeName", "referee"]),
+        isHome: home,
+        players: [])
       if rec.gf != nil || rec.ga != nil { out.append(rec) }
     }
     return out
@@ -172,53 +486,11 @@ final class SStatsClient {
       if let d = f.date(from: s) { return d }
       f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
       if let d = f.date(from: s) { return d }
-      if let t = Double(s) { return Date(timeIntervalSince1970: t > 1e11 ? t / 1000 : t) }
+      if let t = Double(s) {
+        return Date(timeIntervalSince1970: t > 1e11 ? t / 1000 : t)
+      }
     }
     return nil
-  }
-
-  private func get(_ path: String, query: [String: String], attempt: Int = 0) async throws
-    -> JSONValue
-  {
-    guard var c = URLComponents(string: baseURL + path) else { throw APIError.invalidURL }
-    var items = query.map { URLQueryItem(name: $0.key, value: $0.value) }
-    items.append(URLQueryItem(name: "apikey", value: apiKey))
-    c.queryItems = items
-    guard let url = c.url else { throw APIError.invalidURL }
-
-    var req = URLRequest(url: url)
-    req.httpMethod = "GET"
-    req.timeoutInterval = 25
-
-    do {
-      let (data, response) = try await session.data(for: req)
-      guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
-
-      if http.statusCode == 429 {
-        if attempt < 2 {
-          try? await Task.sleep(for: .milliseconds(700 * (attempt + 1)))
-          return try await get(path, query: query, attempt: attempt + 1)
-        }
-        throw APIError.rateLimited
-      }
-      guard (200..<300).contains(http.statusCode) else {
-        throw APIError.server("SStats HTTP \(http.statusCode)")
-      }
-      return try JSONValue(data: data)
-    } catch let urlErr as URLError {
-      print("[SStats] URLError code=\(urlErr.code.rawValue) url=\(url.absoluteString)")
-      let retriable: Set<URLError.Code> = [
-        .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
-      ]
-      if retriable.contains(urlErr.code) && attempt < 2 {
-        try? await Task.sleep(for: .milliseconds(500 * (attempt + 1)))
-        return try await get(path, query: query, attempt: attempt + 1)
-      }
-      throw APIError.server("Сеть: \(urlErr.code.rawValue) — \(urlErr.localizedDescription)")
-    } catch {
-      print("[SStats] Error: \(error) url=\(url.absoluteString)")
-      throw error
-    }
   }
 
   private static func dateString(_ date: Date) -> String {
@@ -229,6 +501,8 @@ final class SStatsClient {
     return f.string(from: date)
   }
 }
+
+// MARK: - APIError
 
 enum APIError: LocalizedError {
   case invalidURL, invalidResponse, rateLimited, missingAPIKey
@@ -243,6 +517,8 @@ enum APIError: LocalizedError {
     }
   }
 }
+
+// MARK: - JSONValue
 
 enum JSONValue: Codable, Hashable {
   case object([String: JSONValue])
@@ -327,6 +603,7 @@ enum JSONValue: Codable, Hashable {
     return nil
   }
 }
+
 struct AnyCodingKey: CodingKey {
   let stringValue: String
   init?(stringValue: String) { self.stringValue = stringValue }
