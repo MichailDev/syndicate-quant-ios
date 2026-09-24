@@ -199,8 +199,7 @@ struct RootView: View {
     }
   }
 
-  // MARK: - ДИАГНОСТИЧЕСКИЙ RUNBACKTEST
-  // Ничего не считает. Показывает пошагово, где теряются данные SStats.
+  // MARK: - ДИАГНОСТИЧЕСКИЙ RUNBACKTEST (расширенный)
   private func runBacktest() async {
     guard !busy else { return }
     busy = true
@@ -220,69 +219,92 @@ struct RootView: View {
       let client = SStatsClient(settings: settings)
       let engine = QuantEngine()
 
-      // ШАГ 1. Today
-      add("1) apiKey length: \(settings.apiKey.count)")
-      add("1) baseURL: \(settings.baseURL)")
-
       let todayJSON = try await client.listToday()
-      let rawObjects = todayJSON.allObjects()
-      add("1) raw objects: \(rawObjects.count)")
-
       let todayMatches = engine.matches(from: todayJSON)
       add("1) parsed matches: \(todayMatches.count)")
-
-      if let firstRaw = rawObjects.first {
-        let keyArray = Array(firstRaw.keys).sorted()
-        let preview = keyArray.prefix(15).joined(separator: ",")
-        add("1) first object keys: \(preview)")
-      }
-
-      // ШАГ 2. Проверяем homeID/awayID
       let withIDs = todayMatches.filter { $0.homeID != nil && $0.awayID != nil }
-      add("2) matches with homeID+awayID: \(withIDs.count)/\(todayMatches.count)")
+      add("2) with homeID+awayID: \(withIDs.count)/\(todayMatches.count)")
 
-      // ШАГ 3. Для первых 3 матчей — GameInfo и Odds
-      for (i, m) in withIDs.prefix(3).enumerated() {
-        add("3.\(i + 1)) \(m.home) vs \(m.away) id=\(m.id)")
-        if let info = try? await client.gameInfo(m.id) {
-          let keyArray = Array((info.object ?? [:]).keys).sorted()
-          let keys = keyArray.prefix(10).joined(separator: ",")
-          add("   info keys: \(keys)")
-          let h = info.firstNumber(keys: ["homeftresult", "homescore", "homegoals"])
-          let a = info.firstNumber(keys: ["awayftresult", "awayscore", "awaygoals"])
-          add("   info FT: \(h.map { String($0) } ?? "nil") - \(a.map { String($0) } ?? "nil")")
+      guard let m = withIDs.first else {
+        add("Нет матчей для диагностики")
+        return
+      }
+      add("--- МАТЧ: \(m.home) vs \(m.away) id=\(m.id) ---")
+
+      // === A. /Ls/GameInfo ===
+      if let info = try? await client.gameInfo(m.id), let obj = info.object {
+        add("A) info top keys: \(Array(obj.keys).sorted().prefix(20).joined(separator: ","))")
+        if let data = obj["data"] {
+          switch data {
+          case .object(let d):
+            add("A) info.data OBJECT keys: \(Array(d.keys).sorted().prefix(30).joined(separator: ","))")
+            add("A) has homeFTResult: \(d["homeFTResult"] != nil)")
+            add("A) has game: \(d["game"] != nil)")
+            if let game = d["game"]?.object {
+              add("A) data.game keys: \(Array(game.keys).sorted().prefix(20).joined(separator: ","))")
+              add("A) data.game.homeFTResult: \(game["homeFTResult"].map { "\($0)" } ?? "nil")")
+            }
+          case .array(let a):
+            add("A) info.data ARRAY count=\(a.count)")
+            if let first = a.first?.object {
+              add("A) info.data[0] keys: \(Array(first.keys).sorted().prefix(30).joined(separator: ","))")
+              add("A) data[0].homeFTResult: \(first["homeFTResult"].map { "\($0)" } ?? "nil")")
+            }
+          default:
+            add("A) info.data: неизвестный тип")
+          }
         } else {
-          add("   info: FAILED")
+          add("A) info.data отсутствует")
         }
-        if let odd = try? await client.odds(m.id) {
-          let cnt = odd.allObjects().count
-          add("   odds objects: \(cnt)")
-        } else {
-          add("   odds: FAILED")
-        }
-        if let h = m.homeID {
-          let hist = await client.fetchTeamHistory(teamID: h, count: 10)
-          add("   home history: \(hist.count)")
-        }
-        try? await Task.sleep(for: .milliseconds(150))
+      } else {
+        add("A) gameInfo: FAILED")
       }
 
-      // ШАГ 4. Если матчей на сегодня нет — пробуем listTeam
-      if withIDs.isEmpty {
-        add("4) матчей на сегодня нет — тестирую listTeam…")
-        if let teamJSON = try? await client.listTeam("1", limit: 10) {
-          let objs = teamJSON.allObjects()
-          add("4) listTeam('1') objects: \(objs.count)")
-          if let first = objs.first {
-            let keyArray = Array(first.keys).sorted()
-            let keys = keyArray.prefix(15).joined(separator: ",")
-            add("4) first team match keys: \(keys)")
+      // === B. /Ls/List?Team=HOME_ID (прошлые матчи) ===
+      if let hid = m.homeID {
+        add("B) listTeam(\(hid), limit: 5)…")
+        if let teamJSON = try? await client.listTeam(hid, limit: 5), let obj = teamJSON.object {
+          add("B) team top keys: \(Array(obj.keys).sorted().prefix(10).joined(separator: ","))")
+          if let data = obj["data"]?.array {
+            add("B) team.data ARRAY count=\(data.count)")
+            if let first = data.first?.object {
+              add("B) team.data[0] keys: \(Array(first.keys).sorted().prefix(30).joined(separator: ","))")
+              add("B) data[0].homeFTResult: \(first["homeFTResult"].map { "\($0)" } ?? "nil")")
+              add("B) data[0].awayFTResult: \(first["awayFTResult"].map { "\($0)" } ?? "nil")")
+              add("B) data[0].homeResultFT: \(first["homeResultFT"].map { "\($0)" } ?? "nil")")
+              add("B) data[0].date: \(first["date"].map { "\($0)" } ?? "nil")")
+              if let ht = first["homeTeam"]?.object {
+                add("B) data[0].homeTeam keys: \(Array(ht.keys).sorted().joined(separator: ","))")
+                add("B) homeTeam.id=\(ht["id"].map { "\($0)" } ?? "nil") uid=\(ht["uid"].map { "\($0)" } ?? "nil") name=\(ht["name"].map { "\($0)" } ?? "nil")")
+              }
+            }
+          } else if let data = obj["data"]?.object {
+            add("B) team.data OBJECT keys: \(Array(data.keys).sorted().prefix(20).joined(separator: ","))")
+          } else {
+            add("B) team.data отсутствует или другого типа")
           }
-          let matches = engine.matches(from: teamJSON)
-          add("4) listTeam parsed matches: \(matches.count)")
         } else {
-          add("4) listTeam: FAILED")
+          add("B) listTeam: FAILED")
         }
+      }
+
+      // === C. /Odds/<id> ===
+      add("C) odds(\(m.id))…")
+      do {
+        let odds = try await client.odds(m.id)
+        if let obj = odds.object {
+          add("C) odds top keys: \(Array(obj.keys).sorted().prefix(10).joined(separator: ","))")
+          if let data = obj["data"]?.array {
+            add("C) odds.data ARRAY count=\(data.count)")
+            if let first = data.first?.object {
+              add("C) odds.data[0] keys: \(Array(first.keys).sorted().prefix(25).joined(separator: ","))")
+            }
+          } else if let data = obj["data"]?.object {
+            add("C) odds.data OBJECT keys: \(Array(data.keys).sorted().prefix(20).joined(separator: ","))")
+          }
+        }
+      } catch {
+        add("C) odds error: \(error.localizedDescription)")
       }
 
       add("--- конец диагностики ---")
