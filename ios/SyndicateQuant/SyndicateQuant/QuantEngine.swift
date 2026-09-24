@@ -52,22 +52,59 @@ struct QuantEngine {
   static let countLines = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5]
   static let sharpBooks = ["pinnacle", "betfair", "sbo", "sbobet", "marathon", "bet365 exchange"]
 
+  // MARK: - Matches (адаптировано под SStats {status, count, data: [...]})
+
   func matches(from json: JSONValue) -> [Match] {
+    let items: [JSONValue]
+    if let obj = json.object, let dataArr = obj["data"]?.array {
+      items = dataArr
+    } else if let arr = json.array {
+      items = arr
+    } else {
+      // Fallback: если это уже плоский массив объектов
+      items = json.allObjects().map { .object($0) }
+    }
+
     var result: [Match] = []
-    for o in json.allObjects() {
+    for item in items {
+      guard let o = item.object else { continue }
       guard let id = string(o, ["id", "gameid", "game_id", "eventid", "event_id", "flashid"]),
-        let home = string(o, ["home", "hometeam", "home_team", "participant1", "team1"]),
-        let away = string(o, ["away", "awayteam", "away_team", "participant2", "team2"]),
         !id.isEmpty
       else { continue }
-      let league = string(o, ["league", "tournament", "competition", "league_name"]) ?? "Unknown"
+
+      guard let home = teamName(o, "home"), let away = teamName(o, "away") else { continue }
+
+      let league = leagueName(o) ?? "Unknown"
       let m = Match(
         id: id, home: home, away: away, league: league, start: date(o),
-        homeID: nestedID(o, ["home", "hometeam", "home_team", "participant1", "team1"]),
-        awayID: nestedID(o, ["away", "awayteam", "away_team", "participant2", "team2"]))
+        homeID: teamID(o, "home"), awayID: teamID(o, "away"))
       if !result.contains(where: { $0.id == id }) { result.append(m) }
     }
     return result
+  }
+
+  private func teamName(_ o: [String: JSONValue], _ side: String) -> String? {
+    // SStats: homeTeam / awayTeam — это объект { uid, id, name }
+    if let team = o[side + "Team"]?.object, let name = team["name"]?.string {
+      return name
+    }
+    // Fallback: home / away как плоские строки
+    return string(o, [side, side + "team", side + "_team", side + "TeamName", side + "name"])
+  }
+
+  private func leagueName(_ o: [String: JSONValue]) -> String? {
+    // SStats: season.league.name
+    if let season = o["season"]?.object,
+      let league = season["league"]?.object,
+      let name = league["name"]?.string
+    {
+      return name
+    }
+    // Fallback: league.name
+    if let league = o["league"]?.object, let name = league["name"]?.string {
+      return name
+    }
+    return string(o, ["league", "tournament", "competition", "league_name"])
   }
 
   func teamRecord(from payload: JSONValue, targetID: String) -> TeamRecord? {
@@ -475,7 +512,8 @@ struct QuantEngine {
   }
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {
     if let x = o[side + "Team"]?.object {
-      return string(x, ["id", "teamid", "team_id", "flashid"])
+      // SStats: приоритет — uid (UUID). Fallback — id / teamId / flashId.
+      return string(x, ["uid", "id", "teamid", "team_id", "flashid"])
     }
     return string(o, [side + "TeamId", side + "TeamID", side + "Id", side + "ID"])
   }
@@ -492,7 +530,7 @@ struct QuantEngine {
   }
   private func nestedID(_ o: [String: JSONValue], _ keys: [String]) -> String? {
     for k in keys {
-      if let x = o[k]?.object, let id = string(x, ["id", "teamid", "team_id", "flashid"]) {
+      if let x = o[k]?.object, let id = string(x, ["uid", "id", "teamid", "team_id", "flashid"]) {
         return id
       }
     }
@@ -501,6 +539,9 @@ struct QuantEngine {
   private func date(_ o: [String: JSONValue]) -> Date? {
     if let s = string(o, ["date", "datetime", "starttime", "start_time", "timestamp"]) {
       let f = ISO8601DateFormatter()
+      if let d = f.date(from: s) { return d }
+      // Для строк с миллисекундами
+      f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
       if let d = f.date(from: s) { return d }
       if let t = Double(s) { return Date(timeIntervalSince1970: t > 1e11 ? t / 1000 : t) }
     }
