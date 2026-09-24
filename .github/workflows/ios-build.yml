@@ -1,4 +1,4 @@
-name: Build SYNDICATE QUANT iOS v5.2.1 (Windows-only workflow)
+name: Build SYNDICATE QUANT iOS v5.2.2 (Windows-only workflow)
 
 on:
   workflow_dispatch:
@@ -37,7 +37,8 @@ jobs:
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
+            CODE_SIGN_IDENTITY="" \
+            PRODUCT_NAME=SyndicateQuant
 
       - name: Validate built app bundle
         run: |
@@ -51,7 +52,7 @@ jobs:
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
           test "$EXEC" = "SyndicateQuant"
           test "$BUNDLE" = "com.syndicatequant.app"
-          test "$VERSION" = "5.2.1"
+          test "$VERSION" = "5.2.2"
           test -x "$APP/$EXEC"
           echo "Executable: $EXEC"
           echo "Bundle ID: $BUNDLE"
@@ -75,7 +76,7 @@ jobs:
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: syndicate-quant-ios-v5.2.1-unsigned
+          name: syndicate-quant-ios-v5.2.2-unsigned
           path: SYNDICATE_QUANT_iOS_UNSIGNED.ipa
           if-no-files-found: error
 
@@ -83,6 +84,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: syndicate-quant-ios-v5.2.1-build-log
+          name: syndicate-quant-ios-v5.2.2-build-log
           path: /tmp/build-settings.txt
           if-no-files-found: warn
