@@ -3,8 +3,7 @@
 
 @MainActor
 final class AppDelegate: NSObject, UIApplicationDelegate {
-  static let refreshID = "com.syndicatequant.app.refresh"
-  private static var pendingSchedule = false
+  nonisolated static let refreshID = "com.syndicatequant.app.refresh"
 
   func application(
     _ application: UIApplication,
@@ -32,8 +31,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
   // MARK: - BGTask handling
 
   nonisolated private static func handle(_ task: BGAppRefreshTask) {
-    // Планируем следующую попытку сразу — BGTaskScheduler требует наличие хотя бы
-    // одной зарегистрированной задачи, иначе iOS перестанет нас будить.
+    // Планируем следующую попытку сразу — иначе iOS может перестать будить.
     scheduleNextRefresh()
 
     let work = Task { @MainActor in
@@ -47,14 +45,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
   }
 
   nonisolated private static func scheduleNextRefresh() {
-    // Защита от параллельного планирования
-    guard !pendingSchedule else { return }
-    pendingSchedule = true
-    defer { pendingSchedule = false }
-
     let request = BGAppRefreshTaskRequest(identifier: refreshID)
-    // iOS сам решит, когда запускать (обычно от 15 минут). Ставим 30 минут
-    // как минимум — iOS всё равно может отложить.
+    // iOS сам решит, когда запускать (обычно ≥ 30 мин).
     request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
     do {
       try BGTaskScheduler.shared.submit(request)
