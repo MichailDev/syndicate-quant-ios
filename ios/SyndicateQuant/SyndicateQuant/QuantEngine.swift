@@ -165,11 +165,9 @@ struct QuantEngine {
     let refereeName = string(info.allObjects().first ?? [:], ["refereeName", "referee"])
     let ref = refereeProfile(homeHistory + awayHistory, refereeName)
 
-    // Sample class
     let combinedSample = min(homeHistory.count, awayHistory.count)
     let sampleClass = SampleClass.classify(combinedSample)
 
-    // DCS components (раздел 34)
     let sourceScore = 90.0
     let sampleScore = sampleClass.dcsScore
     let consensusScore = min(100, Double(max(quotes.count, 1)) * 12)
@@ -187,7 +185,6 @@ struct QuantEngine {
       else { continue }
       let sharp = sharpGuard(qs, median: median)
 
-      // Model probability p
       let p: Double
       let modelName: String
       if q.market == "1X2" {
@@ -221,9 +218,10 @@ struct QuantEngine {
       }
 
       if let s = finish(
-        match: match, q: q, p: p, medianOdds: median, dcs: dcs, quotes: qs,
+        match: match, q: q, p: p, dcs: dcs, quotes: qs,
         sharp: sharp, modelOutcomes: model.outcomes, modelName: modelName,
-        sampleClass: sampleClass, homeSample: homeHistory.count, awaySample: awayHistory.count)
+        sampleClass: sampleClass,
+        homeSample: homeHistory.count, awaySample: awayHistory.count)
       {
         out.append(s)
       }
@@ -231,50 +229,45 @@ struct QuantEngine {
     return out.sorted { $0.qcs > $1.qcs }
   }
 
-  // MARK: - Finish (ядро Этапа 4)
+  // MARK: - Finish
 
   private func finish(
-    match: Match, q: Quote, p: Double, medianOdds: Double,
+    match: Match, q: Quote, p: Double,
     dcs: Double, quotes: [Quote], sharp: SharpGuard,
     modelOutcomes: (home: Double, draw: Double, away: Double),
     modelName: String, sampleClass: SampleClass,
     homeSample: Int, awaySample: Int
   ) -> BetSignal? {
 
-    // Market probability (implied)
     let quoteProbs = quotes.map { 1.0 / max($0.odds, 1.01) }
     let marketProbability = QuantMath.median(quoteProbs) ?? 0.0
     let marketMAD = QuantMath.mad(quoteProbs.map { $0 * 100 }) ?? 0.0
 
-    // Probability interval (P10/P50/P90)
     let interval = QuantMath.probabilityInterval(
       p, sample: min(homeSample, awaySample), dcs: dcs, marketMAD: marketMAD)
 
     let robustP = QuantMath.confidenceAdjustedProbability(
       p, uncertainty: interval.uncertainty)
 
-    // EV
     let ev = QuantMath.ev(p: p, odds: q.odds)
     var robustEV = QuantMath.ev(p: robustP, odds: q.odds)
 
-    // Sharp guard
     var ms = marketScore(qs: quotes.count, odds: q.odds, sharp: sharp)
     if sharp.disagreement > 0.05 {
       ms = max(0, ms - 15)
       robustEV *= 0.70
     }
 
-    // Fair odds / anomalies
     let fair = 1 / max(p, 0.001)
     let extreme = q.odds > fair * 1.25
     let anomaly = q.odds > fair * 1.35
-    let conflict = abs(p - marketProbability) > 0.25    // раздел 32
+    let conflict = abs(p - marketProbability) > 0.25
 
     if extreme || anomaly || conflict { robustEV = -abs(robustEV) }
 
-    // MES = Model Edge Score (раздел 36)
+    // MES
     let mes: Double = {
-      let edge = max(0, ev)                              // 0..~0.30
+      let edge = max(0, ev)
       let robustBonus = robustEV > 0 ? 15 : 0
       let agreementBonus = q.market == "1X2"
         ? (1 - abs(p - (q.selectionKey == "1"
@@ -284,16 +277,11 @@ struct QuantEngine {
       return max(0, min(100, 30 + edge * 500 + robustBonus + agreementBonus))
     }()
 
-    // TS = Temporal Stability
     let ts = max(20, min(100, 100 - interval.uncertainty * 220))
-
-    // RS = Result Stability
     let rs = max(0, 100 * (1 - interval.uncertainty))
 
-    // QCS = 0.30 MES + 0.20 DCS + 0.20 MS + 0.15 TS + 0.15 RS  (раздел 36)
     let qcs = 0.30 * mes + 0.20 * dcs + 0.20 * ms + 0.15 * ts + 0.15 * rs
 
-    // Classification (раздел 37)
     let classification: String
     if anomaly || extreme || conflict {
       classification = "X NO BET"
@@ -311,10 +299,8 @@ struct QuantEngine {
 
     guard classification != "X NO BET" else { return nil }
 
-    // Uncertainty band (раздел 40)
     let band = UncertaintyBand.from(interval.uncertainty)
 
-    // Kelly (раздел 40)
     let fullKelly = QuantMath.kelly(p: robustP, odds: q.odds)
     let quarterKelly = 0.25 * fullKelly
     let stakeCap: Double = (classification == "S BET") ? 0.025 : 0.02
@@ -340,15 +326,13 @@ struct QuantEngine {
       portfolioCorrelation: 0, correlationReason: "")
   }
 
-  // MARK: - Portfolio (Этап 5)
+  // MARK: - Portfolio
 
-  /// Отбирает ставки, применяет корреляционный контроль и дневной cap 10%.
   func portfolio(_ signals: [BetSignal]) -> [BetSignal] {
     var chosen: [BetSignal] = []
     var totalExposure = 0.0
     let dailyCap = 0.10
 
-    // Оставляем только валидные сигналы, сортируем по robust EV
     let candidates = signals
       .filter { $0.robustEV > 0 }
       .filter { $0.qcs >= 78 }
@@ -356,7 +340,6 @@ struct QuantEngine {
       .sorted { $0.robustEV > $1.robustEV }
 
     for s in candidates {
-      // Проверяем корреляцию со всеми выбранными
       var maxCorr = 0.0
       var reason = ""
       for prev in chosen {
@@ -366,9 +349,7 @@ struct QuantEngine {
           reason = correlationReason(s, prev)
         }
       }
-      if maxCorr >= 0.65 { continue }       // слишком коррелировано
-
-      // Проверяем дневной cap
+      if maxCorr >= 0.65 { continue }
       guard totalExposure + s.stake <= dailyCap else { continue }
 
       var x = s
@@ -376,10 +357,8 @@ struct QuantEngine {
       x.correlationReason = reason
       chosen.append(x)
       totalExposure += s.stake
-
       if chosen.count >= 8 { break }
     }
-
     return chosen
   }
 
@@ -528,8 +507,6 @@ struct QuantEngine {
     return QuantMath.monteCarloTotal(
       m, line: line, n: 20000, seed: UInt64(abs(Int(mean * 100)) + 17), over: true)
   }
-
-  // MARK: - Market Score (раздел 33)
 
   private func marketScore(qs: Int, odds: Double, sharp: SharpGuard) -> Double {
     var score = 25.0

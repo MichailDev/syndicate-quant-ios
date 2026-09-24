@@ -81,7 +81,6 @@ struct WalkForwardBacktester {
 
       r.matches += 1
 
-      // Walk-forward: только записи ДО даты матча
       let matchStart = match.start ?? .distantFuture
       let hs = (histories[h] ?? []).filter { ($0.date ?? .distantPast) < matchStart }
       let awayRecords = (histories[a] ?? []).filter {
@@ -104,11 +103,9 @@ struct WalkForwardBacktester {
         r.staked += s.stake
         guard let actual = actualResult(match: match, signal: s) else { continue }
 
-        // Brier
         let predicted = s.probability
         r.brierSum += (predicted - actual) * (predicted - actual)
 
-        // Log Loss (clamp для защиты от log(0))
         let eps = 1e-9
         let clamped = min(1 - eps, max(eps, predicted))
         let ll: Double = actual == 1 ? -log(clamped) : -log(1 - clamped)

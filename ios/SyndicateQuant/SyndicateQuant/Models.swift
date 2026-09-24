@@ -1,7 +1,7 @@
 import Foundation
 import SwiftData
 
-// MARK: - League whitelist (раздел 5)
+// MARK: - League whitelist
 
 enum LeaguePool {
   static let pool: [(id: Int, name: String)] = [
@@ -14,22 +14,17 @@ enum LeaguePool {
     (2, "Champions League"),
     (3, "Europa League"),
   ]
-
-  static func id(for name: String) -> Int? {
-    pool.first(where: { $0.name == name })?.id
-  }
-  static func name(for id: Int) -> String? {
-    pool.first(where: { $0.id == id })?.name
-  }
+  static func id(for name: String) -> Int? { pool.first(where: { $0.name == name })?.id }
+  static func name(for id: Int) -> String? { pool.first(where: { $0.id == id })?.name }
 }
 
-// MARK: - Sample classification (раздел 15)
+// MARK: - Sample classification
 
 enum SampleClass: String, Codable {
-  case full = "FULL"           // ≥15
-  case good = "GOOD"           // 10-14
-  case usable = "USABLE"       // 6-9
-  case insufficient = "INS."   // <6
+  case full = "FULL"
+  case good = "GOOD"
+  case usable = "USABLE"
+  case insufficient = "INS."
 
   static func classify(_ n: Int) -> SampleClass {
     if n >= 15 { return .full }
@@ -37,8 +32,6 @@ enum SampleClass: String, Codable {
     if n >= 6 { return .usable }
     return .insufficient
   }
-
-  /// Вес доверия к данным для shrinkage
   var trustWeight: Double {
     switch self {
     case .full: return 1.0
@@ -47,8 +40,6 @@ enum SampleClass: String, Codable {
     case .insufficient: return 0.0
     }
   }
-
-  /// Численный вклад в DCS (0..100)
   var dcsScore: Double {
     switch self {
     case .full: return 100
@@ -59,18 +50,15 @@ enum SampleClass: String, Codable {
   }
 }
 
-// MARK: - Uncertainty band (раздел 30-31)
+// MARK: - Uncertainty band
 
 enum UncertaintyBand {
   case low, medium, high
-
-  static func from(_ uncertainty: Double) -> UncertaintyBand {
-    if uncertainty < 0.10 { return .low }
-    if uncertainty < 0.22 { return .medium }
+  static func from(_ u: Double) -> UncertaintyBand {
+    if u < 0.10 { return .low }
+    if u < 0.22 { return .medium }
     return .high
   }
-
-  /// Множитель к Kelly
   var kellyMultiplier: Double {
     switch self {
     case .low: return 1.00
@@ -78,7 +66,6 @@ enum UncertaintyBand {
     case .high: return 0.50
     }
   }
-
   var label: String {
     switch self {
     case .low: return "LOW"
@@ -112,7 +99,7 @@ struct Quote: Codable, Hashable {
   let bookmaker: String
 }
 
-// MARK: - BetSignal (расширен под метрики Этапа 4)
+// MARK: - BetSignal (финальная структура Этапов 4-5)
 
 struct BetSignal: Identifiable, Codable, Hashable {
   let id: String
@@ -126,8 +113,8 @@ struct BetSignal: Identifiable, Codable, Hashable {
   let odds: Double
   let probability: Double
   let fairOdds: Double
-  let ev: Double              // EV_mid
-  let robustEV: Double        // EV_robust
+  let ev: Double
+  let robustEV: Double
   let model: String
   let timestamp: Date
   let classification: String
@@ -135,16 +122,16 @@ struct BetSignal: Identifiable, Codable, Hashable {
   let priceAnomaly: Bool
   let bookmakers: Int
 
-  // Этап 4: разложенный скоринг
-  let dcs: Double             // Data Confidence Score
-  let ms: Double              // Market Score
-  let mes: Double             // Model Edge Score
-  let ts: Double              // Temporal Stability
-  let rs: Double              // Result Stability
-  let qcs: Double             // Quantitative Confidence Score
+  // Скоринг
+  let dcs: Double
+  let ms: Double
+  let mes: Double
+  let ts: Double
+  let rs: Double
+  let qcs: Double
 
-  // Этап 4: контекст
-  let sampleClass: String     // FULL/GOOD/USABLE/INS.
+  // Контекст
+  let sampleClass: String
   let homeSample: Int
   let awaySample: Int
   let uncertainty: Double
@@ -154,10 +141,10 @@ struct BetSignal: Identifiable, Codable, Hashable {
   let probabilityLow: Double
   let probabilityHigh: Double
 
-  // Этап 5: риск и портфель
-  var kellyFraction: Double        // full Kelly
-  var quarterKelly: Double         // 0.25 × full
-  var stakeCap: Double             // 2% / 2.5%
+  // Риск и портфель
+  let kellyFraction: Double
+  let quarterKelly: Double
+  let stakeCap: Double
   var portfolioCorrelation: Double
   var correlationReason: String
 }
@@ -230,7 +217,7 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
-// MARK: - BacktestRun
+// MARK: - BacktestRun (финальный с logLoss / avgCLV / yield / sharpe / brier)
 
 @Model final class BacktestRun {
   @Attribute(.unique) var id: String
