@@ -39,8 +39,6 @@ enum QuantMath {
     return xs.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Double(xs.count - 1)
   }
 
-  // MARK: - Uncertainty & Confidence
-
   static func probabilityInterval(
     _ p: Double, sample: Int, dcs: Double, marketMAD: Double
   ) -> (low: Double, mid: Double, high: Double, uncertainty: Double) {
@@ -57,8 +55,6 @@ enum QuantMath {
     let c = clamp(1 - min(0.80, uncertainty), 0.20, 1.0)
     return clamp(0.5 + (clamp(p) - 0.5) * c)
   }
-
-  // MARK: - Shrinkage
 
   static func weightedRecent(_ xs: [Double]) -> Double? {
     guard !xs.isEmpty else { return nil }
@@ -78,8 +74,6 @@ enum QuantMath {
     let w = Double(xs.count) / (Double(xs.count) + k)
     return w * r + (1 - w) * b
   }
-
-  // MARK: - Poisson / Dixon–Coles / NB
 
   static func poissonPMF(_ k: Int, _ lambda: Double) -> Double {
     guard k >= 0 else { return 0 }
@@ -121,7 +115,9 @@ enum QuantMath {
     var a = 0.0
     for i in 0..<m.n {
       for j in 0..<m.n {
-        if i > j { h += m[i, j] } else if i == j { d += m[i, j] } else { a += m[i, j] }
+        if i > j { h += m[i, j] }
+        else if i == j { d += m[i, j] }
+        else { a += m[i, j] }
       }
     }
     return (h, d, a)
@@ -130,7 +126,9 @@ enum QuantMath {
   static func totalOver(_ m: Matrix2D, _ line: Double) -> Double {
     var p = 0.0
     for i in 0..<m.n {
-      for j in 0..<m.n { if Double(i + j) > line { p += m[i, j] } }
+      for j in 0..<m.n {
+        if Double(i + j) > line { p += m[i, j] }
+      }
     }
     return p
   }
@@ -146,20 +144,15 @@ enum QuantMath {
     return prob * pow(p, r)
   }
 
-  // MARK: - EV & Kelly
-
-  /// EV = p × odds − 1
   static func ev(p: Double, odds: Double) -> Double { p * odds - 1 }
 
-  /// Full Kelly — БЕЗ урезаний. Все haircut'ы применяются в QuantEngine.
+  /// Full Kelly — без урезаний. Quarter + haircut применяются в QuantEngine.
   static func kelly(p: Double, odds: Double) -> Double {
     let b = odds - 1
     let q = 1 - p
     guard b > 0 else { return 0 }
     return max(0, (b * p - q) / b)
   }
-
-  // MARK: - Monte Carlo
 
   static func deterministicUniform(_ seed: inout UInt64) -> Double {
     seed = 6_364_136_223_846_793_005 &* seed &+ 1_442_695_040_888_963_407
@@ -169,13 +162,15 @@ enum QuantMath {
   static func monteCarloOutcome(
     _ matrix: Matrix2D, n: Int = 50000, seed: UInt64 = 42
   ) -> (Double, Double, Double) {
-    var h = 0, d = 0, a = 0
+    var h = 0
+    var d = 0
+    var a = 0
     var s = seed
     var flat = [Double]()
     flat.reserveCapacity(matrix.n * matrix.n)
     for x in matrix.a { flat.append(x) }
-    var c = 0.0
     var cum = [Double]()
+    var c = 0.0
     for p in flat { c += p; cum.append(c) }
     for _ in 0..<n {
       let u = deterministicUniform(&s)
@@ -210,5 +205,7 @@ enum QuantMath {
     return Double(hits) / Double(max(n, 1))
   }
 
-  static func normalCDF(_ x: Double) -> Double { 0.5 * (1 + erf(x / sqrt(2))) }
+  static func normalCDF(_ x: Double) -> Double {
+    0.5 * (1 + erf(x / sqrt(2)))
+  }
 }

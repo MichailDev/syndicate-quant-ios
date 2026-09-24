@@ -37,7 +37,7 @@ struct RootView: View {
     List {
       Section {
         HStack {
-          Text(status).font(.subheadline).fixedSize(horizontal: false, vertical: true)
+          Text(status).font(.subheadline)
           Spacer(minLength: 8)
           if busy { ProgressView().scaleEffect(0.9) }
         }
@@ -48,9 +48,12 @@ struct RootView: View {
           }
         }
         .pickerStyle(.menu)
-        Button { Task { await refresh() } } label: {
+        Button {
+          Task { await refresh() }
+        } label: {
           Label("Обновить", systemImage: "arrow.clockwise")
-        }.disabled(busy)
+        }
+        .disabled(busy)
       }
 
       if signals.isEmpty {
@@ -63,12 +66,14 @@ struct RootView: View {
 
       ForEach(signals) { s in
         Section {
-          SignalCard(signal: s).contentShape(Rectangle()).onTapGesture {
-            if !journal.contains(where: { $0.id == s.id }) {
-              context.insert(JournalEntry(signal: s))
-              try? context.save()
+          SignalCard(signal: s)
+            .contentShape(Rectangle())
+            .onTapGesture {
+              if !journal.contains(where: { $0.id == s.id }) {
+                context.insert(JournalEntry(signal: s))
+                try? context.save()
+              }
             }
-          }
         }
       }
 
@@ -85,45 +90,19 @@ struct RootView: View {
   private var journalView: some View {
     List {
       if journal.isEmpty {
-        Section { ContentUnavailableView("Журнал пуст", systemImage: "tray") }
-      } else {
-        Section("Статистика") {
-          let closed = journal.filter { $0.status == "CLOSED" }
-          let wins = closed.filter { $0.result == "WIN" }.count
-          let losses = closed.filter { $0.result == "LOSS" }.count
-          let profit = closed.compactMap { $0.profit }.reduce(0, +)
-          let staked = closed.reduce(0.0) { $0 + $1.stake }
-          HStack {
-            statBlock("Всего", "\(journal.count)")
-            statBlock("W/L", "\(wins)/\(losses)")
-            statBlock("ROI", String(format: "%+.1f%%", staked > 0 ? profit / staked * 100 : 0))
-          }
+        Section {
+          ContentUnavailableView("Журнал пуст", systemImage: "tray")
         }
+      } else {
+        Section("Статистика") { journalStatsView() }
         ForEach(journal) { e in
-          Section {
-            VStack(alignment: .leading, spacing: 6) {
-              HStack {
-                Text("\(e.home) — \(e.away)").font(.headline)
-                Spacer()
-                Text(e.classification).font(.caption.bold())
-                  .padding(.horizontal, 8).padding(.vertical, 3)
-                  .background(.thinMaterial).clipShape(Capsule())
-              }
-              Text("\(e.league) · \(e.market) · \(e.selection)\(e.line.map { " \($0)" } ?? "")")
-                .font(.subheadline).foregroundStyle(.secondary)
-              HStack(spacing: 12) {
-                mini("Odds", String(format: "%.2f", e.odds))
-                mini("P", String(format: "%.0f%%", e.probability * 100))
-                mini("EV", String(format: "%+.1f%%", e.ev * 100))
-                mini("QCS", String(format: "%.0f", e.qcs))
-                mini("Stake", String(format: "%.2f%%", e.stake * 100))
-              }
-            }.padding(.vertical, 2)
-          }
+          Section { journalRow(e) }
           .swipeActions(edge: .trailing) {
             Button(role: .destructive) {
               context.delete(e); try? context.save()
-            } label: { Label("Удалить", systemImage: "trash") }
+            } label: {
+              Label("Удалить", systemImage: "trash")
+            }
           }
         }
       }
@@ -134,6 +113,42 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
+  private func journalStatsView() -> some View {
+    let closed = journal.filter { $0.status == "CLOSED" }
+    let wins = closed.filter { $0.result == "WIN" }.count
+    let losses = closed.filter { $0.result == "LOSS" }.count
+    let profit = closed.compactMap { $0.profit }.reduce(0.0, +)
+    let staked = closed.reduce(0.0) { $0 + $1.stake }
+    let roiPct = staked > 0 ? (profit / staked) * 100 : 0
+    return HStack {
+      statBlock("Всего", "\(journal.count)")
+      statBlock("W/L", "\(wins)/\(losses)")
+      statBlock("ROI", String(format: "%+.1f%%", roiPct))
+    }
+  }
+
+  private func journalRow(_ e: JournalEntry) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack {
+        Text("\(e.home) — \(e.away)").font(.headline)
+        Spacer()
+        Text(e.classification).font(.caption.bold())
+          .padding(.horizontal, 8).padding(.vertical, 3)
+          .background(.thinMaterial).clipShape(Capsule())
+      }
+      Text("\(e.league) · \(e.market) · \(e.selection)\(e.line.map { " \($0)" } ?? "")")
+        .font(.subheadline).foregroundStyle(.secondary)
+      HStack(spacing: 12) {
+        miniBlock("Odds", String(format: "%.2f", e.odds))
+        miniBlock("P", String(format: "%.0f%%", e.probability * 100))
+        miniBlock("EV", String(format: "%+.1f%%", e.ev * 100))
+        miniBlock("QCS", String(format: "%.0f", e.qcs))
+        miniBlock("Stake", String(format: "%.2f%%", e.stake * 100))
+      }
+    }
+    .padding(.vertical, 2)
+  }
+
   private func statBlock(_ label: String, _ value: String) -> some View {
     VStack(alignment: .leading, spacing: 2) {
       Text(label).font(.caption2).foregroundStyle(.secondary)
@@ -141,7 +156,7 @@ struct RootView: View {
     }.frame(maxWidth: .infinity, alignment: .leading)
   }
 
-  private func mini(_ n: String, _ v: String) -> some View {
+  private func miniBlock(_ n: String, _ v: String) -> some View {
     VStack(alignment: .leading, spacing: 1) {
       Text(n).font(.caption2).foregroundStyle(.secondary)
       Text(v).font(.caption.monospacedDigit())
@@ -153,30 +168,23 @@ struct RootView: View {
   private var backtestView: some View {
     List {
       Section("Walk-forward") {
-        Text(
-          "Локальный backtest использует только данные, доступные ДО даты каждого матча. Никаких будущих матчей в истории модели."
-        )
-        .font(.caption).foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
-        Text(backtestStatus).font(.caption.monospaced())
-          .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
-        Button { Task { await runBacktest() } } label: {
+        Text("Локальный backtest использует только данные, доступные ДО даты каждого матча.")
+          .font(.caption).foregroundStyle(.secondary)
+        Text(backtestStatus)
+          .font(.caption.monospaced())
+          .fixedSize(horizontal: false, vertical: true)
+          .textSelection(.enabled)
+        Button {
+          Task { await runBacktest() }
+        } label: {
           Label("Запустить на 45 днях", systemImage: "play.fill")
-        }.disabled(busy)
+        }
+        .disabled(busy)
       }
       if !backtests.isEmpty {
         Section("История") {
           ForEach(backtests) { b in
-            VStack(alignment: .leading, spacing: 4) {
-              Text(b.createdAt.formatted(date: .abbreviated, time: .shortened))
-                .font(.headline)
-              Text("Matches \(b.matches) · Bets \(b.bets) · W/L/P \(b.wins)/\(b.losses)/\(b.pushes)")
-                .font(.subheadline)
-              Text("ROI \(b.roi*100,specifier:"%+.2f")% · Yield \(b.yieldPct*100,specifier:"%+.2f")% · Hit \(b.hitRate*100,specifier:"%.1f")%")
-                .font(.caption)
-              Text("DD \(b.maxDrawdown,specifier:"%.3f") · Sharpe \(b.sharpe,specifier:"%.2f") · Brier \(b.brier,specifier:"%.3f") · LL \(b.logLoss,specifier:"%.3f")")
-                .font(.caption).foregroundStyle(.secondary)
-            }.padding(.vertical, 2)
+            backtestRow(b)
           }
         }
       }
@@ -187,6 +195,19 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
+  private func backtestRow(_ b: BacktestRun) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text(b.createdAt.formatted(date: .abbreviated, time: .shortened))
+        .font(.headline)
+      Text("Matches \(b.matches) · Bets \(b.bets) · W/L/P \(b.wins)/\(b.losses)/\(b.pushes)")
+        .font(.subheadline)
+      Text("ROI \(b.roi * 100, specifier: "%+.2f")% · Yield \(b.yieldPct * 100, specifier: "%+.2f")% · Hit \(b.hitRate * 100, specifier: "%.1f")%")
+        .font(.caption)
+      Text("DD \(b.maxDrawdown, specifier: "%.3f") · Sharpe \(b.sharpe, specifier: "%.2f") · Brier \(b.brier, specifier: "%.3f") · LL \(b.logLoss, specifier: "%.3f")")
+        .font(.caption).foregroundStyle(.secondary)
+    }.padding(.vertical, 2)
+  }
+
   // MARK: - Контроль
 
   private var diagnosticsView: some View {
@@ -194,7 +215,7 @@ struct RootView: View {
       Section("API") {
         LabeledContent("Base URL", value: settings.baseURL)
         LabeledContent("API key", value: settings.apiKey.isEmpty
-          ? "не задан" : "✓ \(settings.apiKey.count) симв.")
+          ? "не задан" : "\(settings.apiKey.count) симв.")
         LabeledContent("Engine", value: settings.engineVersion)
       }
       Section("Пул лиг") {
@@ -246,8 +267,6 @@ struct RootView: View {
       }
       Section("Принцип") {
         Text("NO DATA → NO NUMBER → NO EDGE → NO BET").bold()
-        Text("Приложение не использует AI/ML API, Telegram или Windows-сервер.")
-          .font(.caption).foregroundStyle(.secondary)
       }
       Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
     }
@@ -263,16 +282,17 @@ struct RootView: View {
     defer { busy = false }
     diagnostics = []
     do {
-      guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw APIError.missingAPIKey
-      }
+      guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      else { throw APIError.missingAPIKey }
       status = "Получаю сегодняшние матчи…"
       let client = SStatsClient(settings: settings)
       let engine = QuantEngine()
-      var all = engine.matches(from: try await client.listToday()).filter { !isExcluded($0) }
-
+      var all = engine.matches(from: try await client.listToday())
+        .filter { !isExcluded($0) }
       if selectedLeague != "Все" {
-        all = all.filter { $0.league.localizedCaseInsensitiveContains(selectedLeague) }
+        all = all.filter {
+          $0.league.localizedCaseInsensitiveContains(selectedLeague)
+        }
       }
       let matches = all.prefix(settings.scanMatches)
 
@@ -280,10 +300,13 @@ struct RootView: View {
       for match in matches {
         guard let h = match.homeID, let a = match.awayID else { continue }
         status = "Анализ \(match.home) — \(match.away)…"
-        let hs = await client.fetchTeamHistory(teamID: h, count: settings.historyMatches)
-        let awayRecords = await client.fetchTeamHistory(teamID: a, count: settings.historyMatches)
+        let hs = await client.fetchTeamHistory(
+          teamID: h, count: settings.historyMatches)
+        let awayRecords = await client.fetchTeamHistory(
+          teamID: a, count: settings.historyMatches)
         let info = try await client.gameInfo(match.id)
-        var oddsFromInfo = info.object?["data"]?.object?["odds"] ?? match.oddsJSON ?? .array([])
+        var oddsFromInfo = info.object?["data"]?.object?["odds"]
+          ?? match.oddsJSON ?? .array([])
         if oddsFromInfo.array?.isEmpty != false, let nid = match.numericID {
           if let o = try? await client.odds(numericID: nid) {
             oddsFromInfo = o.object?["data"] ?? oddsFromInfo
@@ -294,11 +317,12 @@ struct RootView: View {
           match: match, info: info, oddsJSON: oddsFromInfo,
           homeHistory: hs, awayHistory: awayRecords, glicko: glicko)
         signalsOut.append(contentsOf: s)
-        diagnostics.append("\(match.id) hist=\(hs.count)/\(awayRecords.count) sig=\(s.count)")
+        diagnostics.append(
+          "\(match.id) hist=\(hs.count)/\(awayRecords.count) sig=\(s.count)")
       }
       signals = engine.portfolio(signalsOut)
       lastRefresh = Date()
-      status = "Обновлено \(lastRefresh!.formatted(date:.omitted,time:.shortened)) · \(signals.count) сигналов"
+      status = "Обновлено · \(signals.count) сигналов"
       if settings.notifyBets && !signals.isEmpty {
         await NotificationService.notify(signals: signals)
       }
@@ -323,9 +347,8 @@ struct RootView: View {
     }
 
     do {
-      guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw APIError.missingAPIKey
-      }
+      guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      else { throw APIError.missingAPIKey }
       let client = SStatsClient(settings: settings)
       let engine = QuantEngine()
 
@@ -345,19 +368,21 @@ struct RootView: View {
       log("1) Матчей: \(matches.count)")
 
       if selectedLeague != "Все" {
-        matches = matches.filter { $0.league.localizedCaseInsensitiveContains(selectedLeague) }
-        log("1) После фильтра лиги '\(selectedLeague)': \(matches.count)")
+        matches = matches.filter {
+          $0.league.localizedCaseInsensitiveContains(selectedLeague)
+        }
+        log("1) После фильтра: \(matches.count)")
       }
 
       matches = matches.filter { $0.homeFT != nil && $0.awayFT != nil }
-      log("1) С FT-счётом: \(matches.count)")
+      log("1) С FT: \(matches.count)")
 
       let inline = matches.filter { ($0.oddsJSON?.array?.isEmpty == false) }
-      log("1) С odds сразу: \(inline.count)")
+      log("1) С odds: \(inline.count)")
 
       let needFetch = matches.filter { ($0.oddsJSON?.array?.isEmpty != false) }
       let cap = min(needFetch.count, 80)
-      log("2) Подтягиваю /Odds/{id} для \(cap) матчей…")
+      log("2) /Odds для \(cap) матчей…")
       var prepared: [Match] = inline
       for (i, m) in needFetch.prefix(cap).enumerated() {
         var mm = m
@@ -370,26 +395,27 @@ struct RootView: View {
         }
         if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
       }
-      log("2) Итого матчей с odds: \(prepared.count)")
+      log("2) С odds итого: \(prepared.count)")
 
       guard !prepared.isEmpty else {
-        log("Стоп: не удалось получить коэффициенты")
+        log("Стоп: нет odds")
         return
       }
 
       let histories = engine.allRecords(from: json)
-      let totalRecs = histories.values.map { $0.count }.reduce(0, +)
-      log("3) Команд: \(histories.count), записей: \(totalRecs)")
+      log("3) Команд: \(histories.count)")
 
       log("4) Walk-forward…")
       let result = WalkForwardBacktester().run(matches: prepared, histories: histories)
 
       context.insert(
         BacktestRun(
-          matches: result.matches, bets: result.bets, wins: result.wins, losses: result.losses,
-          pushes: result.pushes, profit: result.profit, staked: result.staked, roi: result.roi,
+          matches: result.matches, bets: result.bets,
+          wins: result.wins, losses: result.losses, pushes: result.pushes,
+          profit: result.profit, staked: result.staked, roi: result.roi,
           yieldPct: result.yieldPct, hitRate: result.hitRate,
-          maxDrawdown: result.maxDrawdown, maxLosingStreak: result.maxLosingStreak,
+          maxDrawdown: result.maxDrawdown,
+          maxLosingStreak: result.maxLosingStreak,
           sharpe: result.sharpe, brier: result.brier,
           logLoss: result.logLoss, avgCLV: result.avgCLV))
       try? context.save()
@@ -407,13 +433,15 @@ struct RootView: View {
       log("LogLoss: \(String(format: "%.3f", result.logLoss))")
       if !result.perLeague.isEmpty {
         log("--- Лиги ---")
-        for (lg, s) in result.perLeague.sorted(by: { $0.value.bets > $1.value.bets }).prefix(5) {
+        for (lg, s) in result.perLeague
+          .sorted(by: { $0.value.bets > $1.value.bets }).prefix(5) {
           log("\(lg): \(s.bets)b, \(String(format: "%+.1f%%", s.roi * 100))")
         }
       }
       if !result.perMarket.isEmpty {
         log("--- Рынки ---")
-        for (mk, s) in result.perMarket.sorted(by: { $0.value.bets > $1.value.bets }) {
+        for (mk, s) in result.perMarket
+          .sorted(by: { $0.value.bets > $1.value.bets }) {
           log("\(mk): \(s.bets)b, \(String(format: "%+.1f%%", s.roi * 100))")
         }
       }
@@ -440,18 +468,18 @@ struct RootView: View {
 
 struct SignalCard: View {
   let signal: BetSignal
+
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       HStack(alignment: .top) {
         Text("\(signal.home) — \(signal.away)").font(.headline)
-          .fixedSize(horizontal: false, vertical: true)
         Spacer(minLength: 8)
         Text(signal.classification).font(.caption.bold())
           .padding(.horizontal, 8).padding(.vertical, 4)
           .background(classificationColor(signal.classification).opacity(0.25))
           .clipShape(Capsule())
       }
-      Text("\(signal.league) · \(signal.market) · \(signal.selection)\(signal.line.map { " \($0)" } ?? "")")
+      Text(marketLine)
         .font(.subheadline).foregroundStyle(.secondary)
       HStack(alignment: .top, spacing: 14) {
         metric("Odds", signal.odds, "%.2f")
@@ -464,12 +492,22 @@ struct SignalCard: View {
       HStack(spacing: 10) {
         Text("DCS \(String(format: "%.0f", signal.dcs))")
         Text("MS \(String(format: "%.0f", signal.ms))")
-        Text("Sample \(signal.sampleClass) (\(signal.homeSample)/\(signal.awaySample))")
+        Text("Sample \(signal.sampleClass)")
         Text("\(signal.bookmakers)b")
       }
       .font(.caption2).foregroundStyle(.secondary)
     }
     .padding(.vertical, 6)
+  }
+
+  private var marketLine: String {
+    let linePart: String
+    if let line = signal.line {
+      linePart = " \(line)"
+    } else {
+      linePart = ""
+    }
+    return "\(signal.league) · \(signal.market) · \(signal.selection)\(linePart)"
   }
 
   private func classificationColor(_ c: String) -> Color {
