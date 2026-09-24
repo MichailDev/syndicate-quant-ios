@@ -200,7 +200,7 @@ struct RootView: View {
     }
   }
 
-  // MARK: - Backtest: 1 запрос /Ls/List за 14 дней со всеми данными
+  // MARK: - Backtest: 1 запрос /Ls/List за 14 дней + GameInfo для odds (fallback)
   private func runBacktest() async {
     guard !busy else { return }
     busy = true
@@ -231,20 +231,43 @@ struct RootView: View {
       let withFT = matches.filter { $0.homeFT != nil && $0.awayFT != nil }
       log("1) Из них с FT-счётом: \(withFT.count)")
 
-      let withOdds = withFT.filter { $0.oddsJSON != nil }
-      log("1) Из них с odds: \(withOdds.count)")
+      let withOddsInline = withFT.filter { m in
+        if let arr = m.oddsJSON?.array { return !arr.isEmpty }
+        return false
+      }
+      log("1) Из них с odds сразу: \(withOddsInline.count)")
 
-      let histories = engine.allRecords(from: json)
-      let totalRecs = histories.values.map { $0.count }.reduce(0, +)
-      log("2) Команд в историях: \(histories.count), записей: \(totalRecs)")
+      // Fallback: тянем odds через GameInfo для ограниченного набора матчей
+      let cap = min(withFT.count, 60)
+      log("2) Подтягиваю odds через GameInfo для первых \(cap) матчей…")
+      var prepared: [Match] = []
+      for (i, m) in withFT.prefix(cap).enumerated() {
+        var mm = m
+        let hasInline = (mm.oddsJSON?.array?.isEmpty == false)
+        if !hasInline {
+          if i % 10 == 0 { log("2) \(i + 1)/\(cap)…") }
+          if let info = try? await client.gameInfo(m.id) {
+            if let d = info.object?["data"]?.object, let o = d["odds"] {
+              mm.oddsJSON = o
+            }
+          }
+          try? await Task.sleep(for: .milliseconds(700))
+        }
+        if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
+      }
+      log("2) Готово матчей с odds: \(prepared.count)")
 
-      guard withFT.count > 0 else {
-        log("Стоп: нет матчей с итоговым счётом")
+      guard !prepared.isEmpty else {
+        log("Стоп: не удалось получить ни одного матча с коэффициентами")
         return
       }
 
-      log("3) Walk-forward…")
-      let result = WalkForwardBacktester().run(matches: withFT, histories: histories)
+      let histories = engine.allRecords(from: json)
+      let totalRecs = histories.values.map { $0.count }.reduce(0, +)
+      log("3) Команд в историях: \(histories.count), записей: \(totalRecs)")
+
+      log("4) Walk-forward…")
+      let result = WalkForwardBacktester().run(matches: prepared, histories: histories)
 
       context.insert(
         BacktestRun(
