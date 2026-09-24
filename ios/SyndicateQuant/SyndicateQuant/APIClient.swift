@@ -9,7 +9,17 @@ final class SStatsClient {
   init(settings: AppSettings) {
     self.baseURL = settings.baseURL
     self.apiKey = settings.apiKey
-    self.session = URLSession(configuration: .ephemeral)
+    let cfg = URLSessionConfiguration.default
+    cfg.timeoutIntervalForRequest = 25
+    cfg.timeoutIntervalForResource = 40
+    cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+    cfg.waitsForConnectivity = true
+    cfg.httpAdditionalHeaders = [
+      "Accept": "application/json",
+      "User-Agent": "SyndicateQuant-iOS/5.2.2 (iPhone; iOS)",
+      "Accept-Language": "en-US,en;q=0.9",
+    ]
+    self.session = URLSession(configuration: cfg)
   }
 
   func listToday() async throws -> JSONValue {
@@ -122,14 +132,18 @@ final class SStatsClient {
     items.append(URLQueryItem(name: "apikey", value: apiKey))
     c.queryItems = items
     guard let url = c.url else { throw APIError.invalidURL }
+
     var req = URLRequest(url: url)
-    req.timeoutInterval = 45
+    req.httpMethod = "GET"
+    req.timeoutInterval = 25
+
     do {
       let (data, response) = try await session.data(for: req)
       guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+
       if http.statusCode == 429 {
-        if attempt < 3 {
-          try? await Task.sleep(for: .milliseconds(500 * (attempt + 1)))
+        if attempt < 2 {
+          try? await Task.sleep(for: .milliseconds(700 * (attempt + 1)))
           return try await get(path, query: query, attempt: attempt + 1)
         }
         throw APIError.rateLimited
@@ -138,14 +152,23 @@ final class SStatsClient {
         throw APIError.server("SStats HTTP \(http.statusCode)")
       }
       return try JSONValue(data: data)
-    } catch {
-      if attempt < 2 && !(error is APIError) {
-        try? await Task.sleep(for: .milliseconds(300 * (attempt + 1)))
+    } catch let urlErr as URLError {
+      print("[SStats] URLError code=\(urlErr.code.rawValue) url=\(url.absoluteString)")
+      // Повторяем только при обрыве соединения, НЕ при таймауте
+      let retriable: Set<URLError.Code> = [
+        .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
+      ]
+      if retriable.contains(urlErr.code) && attempt < 2 {
+        try? await Task.sleep(for: .milliseconds(500 * (attempt + 1)))
         return try await get(path, query: query, attempt: attempt + 1)
       }
+      throw APIError.server("Сеть: \(urlErr.code.rawValue) — \(urlErr.localizedDescription)")
+    } catch {
+      print("[SStats] Error: \(error) url=\(url.absoluteString)")
       throw error
     }
   }
+
   private static func dateString(_ date: Date) -> String {
     let f = DateFormatter()
     f.calendar = Calendar(identifier: .gregorian)
