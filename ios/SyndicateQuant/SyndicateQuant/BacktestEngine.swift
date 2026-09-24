@@ -40,19 +40,29 @@ struct WalkForwardBacktester {
     var equity = 0.0
     var peak = 0.0
     var lossStreak = 0
+
     for match in matches.sorted(by: { ($0.start ?? .distantPast) < ($1.start ?? .distantPast) }) {
-      guard let h = match.homeID, let a = match.awayID, let info = infos[match.id],
-        let odd = odds[match.id]
+      r.matches += 1  // считаем КАЖДЫЙ матч, дошедший до цикла
+
+      guard let h = match.homeID, let a = match.awayID,
+        let info = infos[match.id], let odd = odds[match.id]
       else { continue }
-      let hs = histories[h] ?? []
-      let awayRecords = histories[a] ?? []
+
+      // Walk-forward: используем только записи ДО даты матча (без утечки будущего)
+      let matchStart = match.start ?? .distantFuture
+      let hs = (histories[h] ?? []).filter { ($0.date ?? .distantPast) < matchStart }
+      let awayRecords = (histories[a] ?? []).filter { ($0.date ?? .distantPast) < matchStart }
+
       let signals = engine.portfolio(
         engine.signals(
-          match: match, info: info, oddsJSON: odd, homeHistory: hs, awayHistory: awayRecords))
+          match: match, info: info, oddsJSON: odd,
+          homeHistory: hs, awayHistory: awayRecords))
+
       for s in signals {
         r.bets += 1
         r.staked += s.stake
         guard let actual = actualResult(info: info, signal: s) else { continue }
+
         let pnl: Double
         if actual == 1 {
           r.wins += 1
@@ -72,10 +82,10 @@ struct WalkForwardBacktester {
         peak = max(peak, equity)
         r.maxDrawdown = max(r.maxDrawdown, peak - equity)
       }
-      r.matches += 1
     }
     return r
   }
+
   private func actualResult(info: JSONValue, signal: BetSignal) -> Double? {
     let home = info.firstNumber(keys: ["homeftresult", "homescore", "homegoals", "home_score"])
     let away = info.firstNumber(keys: ["awayftresult", "awayscore", "awaygoals", "away_score"])
