@@ -16,6 +16,17 @@ final class SStatsClient {
     try await get(
       "/Ls/List", query: ["Date": Self.dateString(Date()), "TimeZone": "3", "Upcoming": "true"])
   }
+
+  func listOn(date: Date, upcoming: Bool = false) async throws -> JSONValue {
+    try await get(
+      "/Ls/List",
+      query: [
+        "Date": Self.dateString(date),
+        "TimeZone": "3",
+        "Upcoming": upcoming ? "true" : "false",
+      ])
+  }
+
   func listTeam(_ teamID: String, limit: Int = 25) async throws -> JSONValue {
     try await get("/Ls/List", query: ["Team": teamID, "Upcoming": "false", "Limit": String(limit)])
   }
