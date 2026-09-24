@@ -52,7 +52,7 @@ struct QuantEngine {
   static let countLines = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5]
   static let sharpBooks = ["pinnacle", "betfair", "sbo", "sbobet", "marathon", "bet365 exchange"]
 
-  // MARK: - Matches from /Ls/List ({status, count, data: [...]})
+  // MARK: - Matches (работает и с /Ls/List, и с /Games/list)
   func matches(from json: JSONValue) -> [Match] {
     let items: [JSONValue]
     if let obj = json.object, let dataArr = obj["data"]?.array {
@@ -66,24 +66,26 @@ struct QuantEngine {
     var result: [Match] = []
     for item in items {
       guard let o = item.object else { continue }
-      guard let id = string(o, ["id", "gameid", "game_id", "eventid", "event_id", "flashid"]),
-        !id.isEmpty
+      guard let idStr = string(o, ["id", "flashId", "gameid", "game_id", "eventid", "event_id"]),
+        !idStr.isEmpty
       else { continue }
       guard let home = teamName(o, "home"), let away = teamName(o, "away") else { continue }
       let league = leagueName(o) ?? "Unknown"
       let homeFT = number(o, ["homeFTResult", "homeResult", "homeScore"])
       let awayFT = number(o, ["awayFTResult", "awayResult", "awayScore"])
       let oddsJSON = o["odds"]
+      let numericID = intValue(o, ["id", "gameId", "game_id"])
       let m = Match(
-        id: id, home: home, away: away, league: league, start: date(o),
+        id: idStr, home: home, away: away, league: league, start: date(o),
         homeID: teamID(o, "home"), awayID: teamID(o, "away"),
-        homeFT: homeFT, awayFT: awayFT, oddsJSON: oddsJSON)
-      if !result.contains(where: { $0.id == id }) { result.append(m) }
+        homeFT: homeFT, awayFT: awayFT, oddsJSON: oddsJSON,
+        numericID: numericID)
+      if !result.contains(where: { $0.id == idStr }) { result.append(m) }
     }
     return result
   }
 
-  // MARK: - Histories из того же ответа /Ls/List
+  // MARK: - Histories из того же ответа
   func allRecords(from json: JSONValue) -> [String: [TeamRecord]] {
     let items: [JSONValue]
     if let obj = json.object, let dataArr = obj["data"]?.array {
@@ -593,6 +595,13 @@ struct QuantEngine {
   }
   private func number(_ o: [String: JSONValue], _ keys: [String]) -> Double? {
     for k in keys { if let n = o[k]?.number { return n } }
+    return nil
+  }
+  private func intValue(_ o: [String: JSONValue], _ keys: [String]) -> Int? {
+    for k in keys {
+      if let n = o[k]?.number { return Int(n) }
+      if let s = o[k]?.string, let n = Int(s) { return n }
+    }
     return nil
   }
   private func firstNumber(_ v: JSONValue, _ keys: [String]) -> Double? {

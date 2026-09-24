@@ -15,145 +15,227 @@ struct RootView: View {
 
   var body: some View {
     TabView {
-      NavigationStack { forecast }.tabItem { Label("Прогноз", systemImage: "sparkles") }
-      NavigationStack { journalView }.tabItem {
-        Label("Журнал", systemImage: "list.bullet.rectangle")
-      }
-      NavigationStack { backtestView }.tabItem {
-        Label("Backtest", systemImage: "chart.xyaxis.line")
-      }
-      NavigationStack { diagnosticsView }.tabItem {
-        Label("Контроль", systemImage: "checkmark.shield")
-      }
-      NavigationStack { settingsView }.tabItem { Label("Настройки", systemImage: "gearshape") }
-    }.task { await refresh() }
+      NavigationStack { forecast }
+        .tabItem { Label("Прогноз", systemImage: "sparkles") }
+      NavigationStack { journalView }
+        .tabItem { Label("Журнал", systemImage: "list.bullet.rectangle") }
+      NavigationStack { backtestView }
+        .tabItem { Label("Backtest", systemImage: "chart.xyaxis.line") }
+      NavigationStack { diagnosticsView }
+        .tabItem { Label("Контроль", systemImage: "checkmark.shield") }
+      NavigationStack { settingsView }
+        .tabItem { Label("Настройки", systemImage: "gearshape") }
+    }
+    .tint(.blue)
+    .task { await refresh() }
   }
 
+  // MARK: - Прогноз
   private var forecast: some View {
     List {
       Section {
-        HStack {
+        HStack(spacing: 12) {
           Text(status)
-          Spacer()
-          if busy { ProgressView() }
+            .font(.subheadline)
+            .fixedSize(horizontal: false, vertical: true)
+          Spacer(minLength: 8)
+          if busy { ProgressView().scaleEffect(0.9) }
         }
         Button {
           Task { await refresh() }
         } label: {
           Label("Обновить", systemImage: "arrow.clockwise")
-        }.disabled(busy)
+        }
+        .disabled(busy)
       }
+
       if signals.isEmpty {
-        ContentUnavailableView(
-          "Нет подтверждённых ставок", systemImage: "checkmark.shield",
-          description: Text("NO DATA → NO NUMBER → NO EDGE → NO BET"))
-      }
-      ForEach(signals) { s in
-        SignalCard(signal: s).contentShape(Rectangle()).onTapGesture {
-          if !journal.contains(where: { $0.id == s.id }) {
-            context.insert(JournalEntry(signal: s))
-            try? context.save()
-          }
+        Section {
+          ContentUnavailableView(
+            "Нет подтверждённых ставок", systemImage: "checkmark.shield",
+            description: Text("NO DATA → NO NUMBER → NO EDGE → NO BET"))
         }
       }
-    }.navigationTitle("SYNDICATE QUANT").refreshable { await refresh() }
+
+      ForEach(signals) { s in
+        Section {
+          SignalCard(signal: s)
+            .contentShape(Rectangle())
+            .onTapGesture {
+              if !journal.contains(where: { $0.id == s.id }) {
+                context.insert(JournalEntry(signal: s))
+                try? context.save()
+              }
+            }
+        }
+      }
+
+      // Отступ под floating tab bar iOS 26
+      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("SYNDICATE QUANT")
+    .navigationBarTitleDisplayMode(.large)
+    .refreshable { await refresh() }
   }
 
+  // MARK: - Журнал
   private var journalView: some View {
     List {
       if journal.isEmpty {
-        ContentUnavailableView("Журнал пуст", systemImage: "tray")
+        Section {
+          ContentUnavailableView("Журнал пуст", systemImage: "tray")
+        }
       } else {
         ForEach(journal) { e in
-          VStack(alignment: .leading, spacing: 4) {
-            Text("\(e.home) — \(e.away)").font(.headline)
-            Text(
-              "\(e.market) · \(e.selection) · \(e.odds,specifier:"%.2f") · EV \(e.ev*100,specifier:"%+.1f")%"
-            ).font(.subheadline)
-            Text("\(e.status) · QCS \(e.qcs,specifier:"%.0f")").font(.caption).foregroundStyle(
-              .secondary)
+          Section {
+            VStack(alignment: .leading, spacing: 6) {
+              Text("\(e.home) — \(e.away)").font(.headline)
+              Text(
+                "\(e.market) · \(e.selection) · \(e.odds,specifier:"%.2f") · EV \(e.ev*100,specifier:"%+.1f")%"
+              ).font(.subheadline)
+              Text("\(e.status) · QCS \(e.qcs,specifier:"%.0f")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 2)
           }
-        }.onDelete {
-          for i in $0 { context.delete(journal[i]) }
-          try? context.save()
+          .swipeActions(edge: .trailing) {
+            Button(role: .destructive) {
+              context.delete(e)
+              try? context.save()
+            } label: {
+              Label("Удалить", systemImage: "trash")
+            }
+          }
         }
       }
-    }.navigationTitle("Журнал")
+      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("Журнал")
+    .navigationBarTitleDisplayMode(.large)
   }
 
+  // MARK: - Backtest
   private var backtestView: some View {
     List {
       Section("Walk-forward") {
         Text(
           "Локальный backtest использует только уже полученные данные SStats. Никаких будущих матчей в истории модели не используется."
-        ).font(.caption).foregroundStyle(.secondary)
-        Text(backtestStatus).font(.caption.monospaced())
-        Button("Запустить на последнем наборе") { Task { await runBacktest() } }.disabled(busy)
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+
+        Text(backtestStatus)
+          .font(.caption.monospaced())
+          .fixedSize(horizontal: false, vertical: true)
+          .textSelection(.enabled)
+
+        Button {
+          Task { await runBacktest() }
+        } label: {
+          Label("Запустить на последнем наборе", systemImage: "play.fill")
+        }
+        .disabled(busy)
       }
-      ForEach(backtests) { b in
-        VStack(alignment: .leading) {
-          Text(b.createdAt.formatted(date: .abbreviated, time: .shortened)).font(.headline)
-          Text("Matches \(b.matches) · Bets \(b.bets) · W/L/P \(b.wins)/\(b.losses)/\(b.pushes)")
-          Text(
-            "ROI \(b.roi*100,specifier:"%+.2f")% · Profit \(b.profit,specifier:"%+.3f") · DD \(b.maxDrawdown,specifier:"%.3f")"
-          ).font(.caption)
+
+      if !backtests.isEmpty {
+        Section("История") {
+          ForEach(backtests) { b in
+            VStack(alignment: .leading, spacing: 4) {
+              Text(b.createdAt.formatted(date: .abbreviated, time: .shortened))
+                .font(.headline)
+              Text("Matches \(b.matches) · Bets \(b.bets) · W/L/P \(b.wins)/\(b.losses)/\(b.pushes)")
+                .font(.subheadline)
+              Text(
+                "ROI \(b.roi*100,specifier:"%+.2f")% · Profit \(b.profit,specifier:"%+.3f") · DD \(b.maxDrawdown,specifier:"%.3f")"
+              )
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 2)
+          }
         }
       }
-    }.navigationTitle("Backtest")
+
+      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("Backtest")
+    .navigationBarTitleDisplayMode(.large)
   }
 
+  // MARK: - Диагностика
   private var diagnosticsView: some View {
     List {
       Section("Engine") {
-        Text(settings.engineVersion)
-        Text("Dixon–Coles")
-        Text("Poisson / Negative Binomial")
-        Text("Monte Carlo")
-        Text("Glicko adjustment")
-        Text("Bottom-Up Player Assembly / ExpMin")
-        Text("Referee profile")
-        Text("Market consensus / MAD guard")
-        Text("Sharp bookmaker guard")
-        Text("DCS / QCS / Robust EV / Kelly")
-        Text("Portfolio correlation")
-        Text("Calibration / Brier / reliability diagnostics")
-        Text("P10 / P50 / P90 probability uncertainty")
-        Text("Market probability / MAD dispersion")
-        Text("Model-vs-market conflict guard")
-        Text("Replacement-level player impact")
-        Text("Bayesian referee shrinkage")
-        Text("Walk-forward / CLV audit layer")
+        LabeledContent("Версия", value: settings.engineVersion)
+        Text("Dixon–Coles").font(.subheadline)
+        Text("Poisson / Negative Binomial").font(.subheadline)
+        Text("Monte Carlo").font(.subheadline)
+        Text("Glicko adjustment").font(.subheadline)
+        Text("Bottom-Up Player Assembly / ExpMin").font(.subheadline)
+        Text("Referee profile").font(.subheadline)
+        Text("Market consensus / MAD guard").font(.subheadline)
+        Text("Sharp bookmaker guard").font(.subheadline)
+        Text("DCS / QCS / Robust EV / Kelly").font(.subheadline)
+        Text("Portfolio correlation").font(.subheadline)
+        Text("Calibration / Brier").font(.subheadline)
+        Text("P10 / P50 / P90 uncertainty").font(.subheadline)
+        Text("Model-vs-market conflict guard").font(.subheadline)
+        Text("Walk-forward / CLV audit layer").font(.subheadline)
       }
-      Section("Последний запуск") {
-        ForEach(diagnostics, id: \.self) { Text($0).font(.caption.monospaced()) }
+      if !diagnostics.isEmpty {
+        Section("Последний запуск") {
+          ForEach(diagnostics, id: \.self) { d in
+            Text(d).font(.caption.monospaced()).textSelection(.enabled)
+          }
+        }
       }
-    }.navigationTitle("Контроль")
+      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("Контроль")
+    .navigationBarTitleDisplayMode(.large)
   }
 
+  // MARK: - Настройки
   private var settingsView: some View {
     Form {
       Section("SStats API") {
         SecureField("API key", text: $settings.apiKey)
+          .textInputAutocapitalization(.never)
+          .autocorrectionDisabled()
         Text("Ключ хранится в Keychain. Он используется только для запросов к api.sstats.net.")
-          .font(.caption).foregroundStyle(.secondary)
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
       Section("Автообновление") {
         Toggle("Фоновое обновление", isOn: $settings.autoRefresh)
         Stepper(
-          "Интервал: \(settings.refreshMinutes) мин", value: $settings.refreshMinutes, in: 15...120,
-          step: 15)
+          "Интервал: \(settings.refreshMinutes) мин",
+          value: $settings.refreshMinutes, in: 15...120, step: 15)
       }
       Section("Параметры модели") {
         Stepper(
-          "История: \(settings.historyMatches) матчей", value: $settings.historyMatches, in: 6...20)
+          "История: \(settings.historyMatches) матчей",
+          value: $settings.historyMatches, in: 6...20)
         Stepper(
-          "Матчей в сканере: \(settings.scanMatches)", value: $settings.scanMatches, in: 5...30)
+          "Матчей в сканере: \(settings.scanMatches)",
+          value: $settings.scanMatches, in: 5...30)
       }
       Section("Принцип") {
         Text("NO DATA → NO NUMBER → NO EDGE → NO BET").bold()
-        Text("Приложение не использует AI/ML API, Telegram или Windows-сервер.").font(.caption)
+        Text("Приложение не использует AI/ML API, Telegram или Windows-сервер.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
-    }.navigationTitle("Настройки")
+      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
+    }
+    .navigationTitle("Настройки")
+    .navigationBarTitleDisplayMode(.large)
   }
 
   // MARK: - Прогноз на сегодня
@@ -178,7 +260,12 @@ struct RootView: View {
         let hs = await client.fetchTeamHistory(teamID: h, count: settings.historyMatches)
         let awayRecords = await client.fetchTeamHistory(teamID: a, count: settings.historyMatches)
         let info = try await client.gameInfo(match.id)
-        let oddsFromInfo = info.object?["data"]?.object?["odds"] ?? match.oddsJSON ?? .array([])
+        var oddsFromInfo = info.object?["data"]?.object?["odds"] ?? match.oddsJSON ?? .array([])
+        if oddsFromInfo.array?.isEmpty != false, let nid = match.numericID {
+          if let o = try? await client.odds(numericID: nid) {
+            oddsFromInfo = o.object?["data"] ?? oddsFromInfo
+          }
+        }
         let glicko = try? await client.glicko(match.id)
         let s = QuantEngine().signals(
           match: match, info: info, oddsJSON: oddsFromInfo, homeHistory: hs,
@@ -200,7 +287,7 @@ struct RootView: View {
     }
   }
 
-  // MARK: - Backtest: 1 запрос /Ls/List за 14 дней + GameInfo для odds (fallback)
+  // MARK: - Backtest через /Games/list + /Odds/{gameId}
   private func runBacktest() async {
     guard !busy else { return }
     busy = true
@@ -222,43 +309,46 @@ struct RootView: View {
 
       let toDate = Date()
       let fromDate = Calendar.current.date(byAdding: .day, value: -14, to: toDate) ?? toDate
-      log("1) Запрос /Ls/List с \(Self.fmt(fromDate)) по \(Self.fmt(toDate))…")
 
-      let json = try await client.listRange(from: fromDate, to: toDate, limit: 1000)
-      let matches = engine.matches(from: json).filter { !isExcluded($0) }
-      log("1) Матчей получено: \(matches.count)")
-
-      let withFT = matches.filter { $0.homeFT != nil && $0.awayFT != nil }
-      log("1) Из них с FT-счётом: \(withFT.count)")
-
-      let withOddsInline = withFT.filter { m in
-        if let arr = m.oddsJSON?.array { return !arr.isEmpty }
-        return false
+      // 1) /Games/list — нативный SStats, там числовой id и odds
+      log("1) /Games/list \(Self.fmt(fromDate))…\(Self.fmt(toDate))")
+      var json: JSONValue
+      do {
+        json = try await client.listGamesRange(from: fromDate, to: toDate, limit: 1000)
+      } catch {
+        log("1) /Games/list не сработал (\(error.localizedDescription)), беру /Ls/List…")
+        json = try await client.listRange(from: fromDate, to: toDate, limit: 1000)
       }
-      log("1) Из них с odds сразу: \(withOddsInline.count)")
 
-      // Fallback: тянем odds через GameInfo для ограниченного набора матчей
-      let cap = min(withFT.count, 60)
-      log("2) Подтягиваю odds через GameInfo для первых \(cap) матчей…")
-      var prepared: [Match] = []
-      for (i, m) in withFT.prefix(cap).enumerated() {
+      var matches = engine.matches(from: json).filter { !isExcluded($0) }
+      log("1) Матчей: \(matches.count)")
+
+      matches = matches.filter { $0.homeFT != nil && $0.awayFT != nil }
+      log("1) С FT-счётом: \(matches.count)")
+
+      let inline = matches.filter { ($0.oddsJSON?.array?.isEmpty == false) }
+      log("1) С odds сразу: \(inline.count)")
+
+      // 2) Если odds нет — тянем через /Odds/{numericID}
+      let needFetch = matches.filter { ($0.oddsJSON?.array?.isEmpty != false) }
+      let cap = min(needFetch.count, 80)
+      log("2) Подтягиваю /Odds/{id} для \(cap) матчей…")
+      var prepared: [Match] = inline
+      for (i, m) in needFetch.prefix(cap).enumerated() {
         var mm = m
-        let hasInline = (mm.oddsJSON?.array?.isEmpty == false)
-        if !hasInline {
+        if let nid = mm.numericID {
           if i % 10 == 0 { log("2) \(i + 1)/\(cap)…") }
-          if let info = try? await client.gameInfo(m.id) {
-            if let d = info.object?["data"]?.object, let o = d["odds"] {
-              mm.oddsJSON = o
-            }
+          if let o = try? await client.odds(numericID: nid) {
+            mm.oddsJSON = o.object?["data"]
           }
           try? await Task.sleep(for: .milliseconds(700))
         }
         if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
       }
-      log("2) Готово матчей с odds: \(prepared.count)")
+      log("2) Итого матчей с odds: \(prepared.count)")
 
       guard !prepared.isEmpty else {
-        log("Стоп: не удалось получить ни одного матча с коэффициентами")
+        log("Стоп: не удалось получить коэффициенты")
         return
       }
 
@@ -316,17 +406,25 @@ struct RootView: View {
 struct SignalCard: View {
   let signal: BetSignal
   var body: some View {
-    VStack(alignment: .leading, spacing: 7) {
-      HStack {
-        Text("\(signal.home) — \(signal.away)").font(.headline)
-        Spacer()
-        Text(signal.classification).font(.caption.bold()).padding(5).background(.thinMaterial)
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(alignment: .top) {
+        Text("\(signal.home) — \(signal.away)")
+          .font(.headline)
+          .fixedSize(horizontal: false, vertical: true)
+        Spacer(minLength: 8)
+        Text(signal.classification)
+          .font(.caption.bold())
+          .padding(.horizontal, 8)
+          .padding(.vertical, 4)
+          .background(.thinMaterial)
           .clipShape(Capsule())
       }
       Text(
         "\(signal.league) · \(signal.market) · \(signal.selection)\(signal.line.map { " \($0)" } ?? "")"
-      ).foregroundStyle(.secondary)
-      HStack {
+      )
+      .font(.subheadline)
+      .foregroundStyle(.secondary)
+      HStack(alignment: .top, spacing: 16) {
         metric("Odds", signal.odds, "%.2f")
         metric("P", signal.probability * 100, "%.1f%%")
         metric("EV", signal.ev * 100, "%+.1f%%")
@@ -334,11 +432,14 @@ struct SignalCard: View {
         metric("QCS", signal.qcs, "%.0f")
       }
       Text("\(signal.model) · DCS \(signal.dcs,specifier:"%.0f") · \(signal.bookmakers) books")
-        .font(.caption).foregroundStyle(.secondary)
-    }.padding(.vertical, 5)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+    .padding(.vertical, 6)
   }
+
   private func metric(_ n: String, _ v: Double, _ f: String) -> some View {
-    VStack(alignment: .leading) {
+    VStack(alignment: .leading, spacing: 2) {
       Text(n).font(.caption2).foregroundStyle(.secondary)
       Text(String(format: f, v)).font(.subheadline.monospacedDigit())
     }

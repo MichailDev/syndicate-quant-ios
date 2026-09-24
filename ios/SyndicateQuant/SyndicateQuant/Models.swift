@@ -12,6 +12,7 @@ struct Match: Identifiable, Codable, Hashable {
   var homeFT: Double?
   var awayFT: Double?
   var oddsJSON: JSONValue?
+  var numericID: Int?
 }
 
 struct Quote: Codable, Hashable {

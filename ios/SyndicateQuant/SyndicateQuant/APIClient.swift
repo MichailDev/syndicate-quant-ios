@@ -16,13 +16,13 @@ final class SStatsClient {
     cfg.waitsForConnectivity = true
     cfg.httpAdditionalHeaders = [
       "Accept": "application/json",
-      "User-Agent": "SyndicateQuant-iOS/5.2.3 (iPhone; iOS)",
+      "User-Agent": "SyndicateQuant-iOS/5.2.4 (iPhone; iOS)",
       "Accept-Language": "en-US,en;q=0.9",
     ]
     self.session = URLSession(configuration: cfg)
   }
 
-  // MARK: - Today
+  // MARK: - Сегодняшние матчи (Flashscore, slug ID)
   func listToday() async throws -> JSONValue {
     try await get(
       "/Ls/List",
@@ -40,7 +40,20 @@ final class SStatsClient {
       ])
   }
 
-  // MARK: - Диапазон дат (для бэктеста). Ended=true → только завершённые матчи.
+  // MARK: - Диапазон дат через /Games/list (нативный SStats, числовой id + odds)
+  func listGamesRange(from: Date, to: Date, limit: Int = 1000) async throws -> JSONValue {
+    try await get(
+      "/Games/list",
+      query: [
+        "From": Self.dateString(from),
+        "To": Self.dateString(to),
+        "Ended": "true",
+        "Limit": String(limit),
+        "TimeZone": "3",
+      ])
+  }
+
+  // MARK: - Диапазон дат через /Ls/List (fallback)
   func listRange(from: Date, to: Date, limit: Int = 1000) async throws -> JSONValue {
     try await get(
       "/Ls/List",
@@ -53,16 +66,21 @@ final class SStatsClient {
       ])
   }
 
-  // MARK: - История конкретной команды (slug, e.g. "ugyen-academy/dWbdNOyO")
+  // MARK: - История команды (slug)
   func listTeam(_ teamID: String, limit: Int = 25) async throws -> JSONValue {
     try await get(
       "/Ls/List",
       query: ["Team": teamID, "Ended": "true", "Limit": String(limit), "Order": "-1"])
   }
 
-  // MARK: - Детали матча (тут же data.odds)
+  // MARK: - Детали матча
   func gameInfo(_ id: String) async throws -> JSONValue {
     try await get("/Ls/GameInfo", query: ["id": id])
+  }
+
+  // MARK: - Коэффициенты (нужен числовой ID)
+  func odds(numericID: Int) async throws -> JSONValue {
+    try await get("/Odds/\(numericID)", query: [:])
   }
 
   // MARK: - Glicko 2
@@ -70,7 +88,7 @@ final class SStatsClient {
     try await get("/Games/glicko/\(id)", query: [:])
   }
 
-  // MARK: - История команды через /Ls/List?Team=
+  // MARK: - История команды
   func fetchTeamHistory(teamID: String, count: Int = 15) async -> [TeamRecord] {
     do {
       let list = try await listTeam(teamID, limit: max(count * 2, 25))
