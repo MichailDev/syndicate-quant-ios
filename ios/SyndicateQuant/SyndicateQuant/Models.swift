@@ -1,6 +1,95 @@
 import Foundation
 import SwiftData
 
+// MARK: - League whitelist (раздел 5)
+
+enum LeaguePool {
+  static let pool: [(id: Int, name: String)] = [
+    (39, "Premier League"),
+    (78, "Bundesliga"),
+    (140, "La Liga"),
+    (135, "Serie A"),
+    (61, "Ligue 1"),
+    (235, "RPL"),
+    (2, "Champions League"),
+    (3, "Europa League"),
+  ]
+
+  static func id(for name: String) -> Int? {
+    pool.first(where: { $0.name == name })?.id
+  }
+  static func name(for id: Int) -> String? {
+    pool.first(where: { $0.id == id })?.name
+  }
+}
+
+// MARK: - Sample classification (раздел 15)
+
+enum SampleClass: String, Codable {
+  case full = "FULL"           // ≥15
+  case good = "GOOD"           // 10-14
+  case usable = "USABLE"       // 6-9
+  case insufficient = "INS."   // <6
+
+  static func classify(_ n: Int) -> SampleClass {
+    if n >= 15 { return .full }
+    if n >= 10 { return .good }
+    if n >= 6 { return .usable }
+    return .insufficient
+  }
+
+  /// Вес доверия к данным для shrinkage
+  var trustWeight: Double {
+    switch self {
+    case .full: return 1.0
+    case .good: return 0.85
+    case .usable: return 0.65
+    case .insufficient: return 0.0
+    }
+  }
+
+  /// Численный вклад в DCS (0..100)
+  var dcsScore: Double {
+    switch self {
+    case .full: return 100
+    case .good: return 80
+    case .usable: return 55
+    case .insufficient: return 20
+    }
+  }
+}
+
+// MARK: - Uncertainty band (раздел 30-31)
+
+enum UncertaintyBand {
+  case low, medium, high
+
+  static func from(_ uncertainty: Double) -> UncertaintyBand {
+    if uncertainty < 0.10 { return .low }
+    if uncertainty < 0.22 { return .medium }
+    return .high
+  }
+
+  /// Множитель к Kelly
+  var kellyMultiplier: Double {
+    switch self {
+    case .low: return 1.00
+    case .medium: return 0.75
+    case .high: return 0.50
+    }
+  }
+
+  var label: String {
+    switch self {
+    case .low: return "LOW"
+    case .medium: return "MED"
+    case .high: return "HIGH"
+    }
+  }
+}
+
+// MARK: - Match
+
 struct Match: Identifiable, Codable, Hashable {
   let id: String
   let home: String
@@ -23,6 +112,8 @@ struct Quote: Codable, Hashable {
   let bookmaker: String
 }
 
+// MARK: - BetSignal (расширен под метрики Этапа 4)
+
 struct BetSignal: Identifiable, Codable, Hashable {
   let id: String
   let gameID: String
@@ -35,24 +126,43 @@ struct BetSignal: Identifiable, Codable, Hashable {
   let odds: Double
   let probability: Double
   let fairOdds: Double
-  let ev: Double
-  let robustEV: Double
-  let qcs: Double
-  let dcs: Double
+  let ev: Double              // EV_mid
+  let robustEV: Double        // EV_robust
   let model: String
   let timestamp: Date
   let classification: String
   let stake: Double
   let priceAnomaly: Bool
   let bookmakers: Int
+
+  // Этап 4: разложенный скоринг
+  let dcs: Double             // Data Confidence Score
+  let ms: Double              // Market Score
+  let mes: Double             // Model Edge Score
+  let ts: Double              // Temporal Stability
+  let rs: Double              // Result Stability
+  let qcs: Double             // Quantitative Confidence Score
+
+  // Этап 4: контекст
+  let sampleClass: String     // FULL/GOOD/USABLE/INS.
+  let homeSample: Int
+  let awaySample: Int
+  let uncertainty: Double
+  let uncertaintyBand: String
+  let marketProbability: Double
+  let marketMAD: Double
+  let probabilityLow: Double
+  let probabilityHigh: Double
+
+  // Этап 5: риск и портфель
+  var kellyFraction: Double        // full Kelly
+  var quarterKelly: Double         // 0.25 × full
+  var stakeCap: Double             // 2% / 2.5%
   var portfolioCorrelation: Double
-  var marketProbability: Double = 0.0
-  var marketMAD: Double = 0.0
-  var probabilityLow: Double = 0.0
-  var probabilityHigh: Double = 1.0
-  var uncertainty: Double = 1.0
-  var modelAgreement: Double = 0.0
+  var correlationReason: String
 }
+
+// MARK: - Journal
 
 @Model final class JournalEntry {
   @Attribute(.unique) var id: String
@@ -62,13 +172,21 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var league: String
   var market: String
   var selection: String
+  var line: Double?
   var odds: Double
   var probability: Double
   var ev: Double
+  var robustEV: Double
   var qcs: Double
+  var dcs: Double
+  var classification: String
+  var stake: Double
   var status: String
   var createdAt: Date
   var result: String?
+  var closingOdds: Double?
+  var clv: Double?
+  var profit: Double?
 
   init(signal: BetSignal, status: String = "OPEN") {
     id = signal.id
@@ -78,13 +196,21 @@ struct BetSignal: Identifiable, Codable, Hashable {
     league = signal.league
     market = signal.market
     selection = signal.selection
+    line = signal.line
     odds = signal.odds
     probability = signal.probability
     ev = signal.ev
+    robustEV = signal.robustEV
     qcs = signal.qcs
+    dcs = signal.dcs
+    classification = signal.classification
+    stake = signal.stake
     self.status = status
     createdAt = signal.timestamp
     result = nil
+    closingOdds = nil
+    clv = nil
+    profit = nil
   }
 }
 
@@ -94,7 +220,8 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var actual: Double
   var market: String
   var createdAt: Date
-  init(id: String, predicted: Double, actual: Double, market: String, createdAt: Date = Date()) {
+  init(id: String, predicted: Double, actual: Double, market: String,
+       createdAt: Date = Date()) {
     self.id = id
     self.predicted = predicted
     self.actual = actual
@@ -102,6 +229,8 @@ struct BetSignal: Identifiable, Codable, Hashable {
     self.createdAt = createdAt
   }
 }
+
+// MARK: - BacktestRun
 
 @Model final class BacktestRun {
   @Attribute(.unique) var id: String
@@ -114,12 +243,21 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var profit: Double
   var staked: Double
   var roi: Double
+  var yieldPct: Double
+  var hitRate: Double
   var maxDrawdown: Double
   var maxLosingStreak: Int
+  var sharpe: Double
+  var brier: Double
+  var logLoss: Double
+  var avgCLV: Double
+
   init(
-    id: String = UUID().uuidString, createdAt: Date = Date(), matches: Int, bets: Int, wins: Int,
-    losses: Int, pushes: Int, profit: Double, staked: Double, roi: Double, maxDrawdown: Double,
-    maxLosingStreak: Int
+    id: String = UUID().uuidString, createdAt: Date = Date(),
+    matches: Int, bets: Int, wins: Int, losses: Int, pushes: Int,
+    profit: Double, staked: Double, roi: Double, yieldPct: Double,
+    hitRate: Double, maxDrawdown: Double, maxLosingStreak: Int,
+    sharpe: Double, brier: Double, logLoss: Double, avgCLV: Double
   ) {
     self.id = id
     self.createdAt = createdAt
@@ -131,8 +269,14 @@ struct BetSignal: Identifiable, Codable, Hashable {
     self.profit = profit
     self.staked = staked
     self.roi = roi
+    self.yieldPct = yieldPct
+    self.hitRate = hitRate
     self.maxDrawdown = maxDrawdown
     self.maxLosingStreak = maxLosingStreak
+    self.sharpe = sharpe
+    self.brier = brier
+    self.logLoss = logLoss
+    self.avgCLV = avgCLV
   }
 }
 
