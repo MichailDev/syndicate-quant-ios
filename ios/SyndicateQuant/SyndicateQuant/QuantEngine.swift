@@ -583,12 +583,22 @@ struct QuantEngine {
     if let o = p.object, let d = o["data"]?.object { return d }
     return p.object ?? [:]
   }
+
+  // ⚠️ ИСПРАВЛЕНО: теперь читает и строковый id (slug), и числовой id (для /Games/list)
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {
     if let x = o[side + "Team"]?.object {
-      return string(x, ["id", "teamid", "team_id", "flashid", "uid"])
+      if let s = string(x, ["id", "teamid", "team_id", "flashid", "uid"]), !s.isEmpty {
+        return s
+      }
+      if let n = x["id"]?.number { return String(Int(n)) }
     }
-    return string(o, [side + "TeamId", side + "TeamID", side + "Id", side + "ID"])
+    if let s = string(o, [side + "TeamId", side + "TeamID", side + "Id", side + "ID"]), !s.isEmpty {
+      return s
+    }
+    if let n = o[side + "TeamId"]?.number { return String(Int(n)) }
+    return nil
   }
+
   private func string(_ o: [String: JSONValue], _ keys: [String]) -> String? {
     for k in keys { if let s = o[k]?.string { return s } }
     return nil
