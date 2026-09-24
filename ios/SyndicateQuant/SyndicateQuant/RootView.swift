@@ -14,6 +14,11 @@ struct RootView: View {
   @State private var backtestStatus = "Не запускался"
   @State private var selectedLeague: String = "Все"
 
+  // Для вкладки Контроль
+  @State private var apiReachable: String = "—"
+  @State private var apiKeyState: String = "—"
+  @State private var lastSettleStatus: String = "—"
+
   var body: some View {
     TabView {
       NavigationStack { forecast }
@@ -89,20 +94,34 @@ struct RootView: View {
 
   private var journalView: some View {
     List {
+      Section {
+        Button {
+          Task { await settleJournal() }
+        } label: {
+          Label("Обновить результаты", systemImage: "checkmark.circle")
+        }
+        .disabled(busy)
+        Text(lastSettleStatus)
+          .font(.caption).foregroundStyle(.secondary)
+      }
+
       if journal.isEmpty {
         Section {
           ContentUnavailableView("Журнал пуст", systemImage: "tray")
         }
       } else {
         Section("Статистика") { journalStatsView() }
-        ForEach(journal) { e in
-          Section { journalRow(e) }
-          .swipeActions(edge: .trailing) {
-            Button(role: .destructive) {
-              context.delete(e); try? context.save()
-            } label: {
-              Label("Удалить", systemImage: "trash")
-            }
+        Section("Калибровка") { calibrationView() }
+        Section("Записи") {
+          ForEach(journal) { e in
+            journalRow(e)
+              .swipeActions(edge: .trailing) {
+                Button(role: .destructive) {
+                  context.delete(e); try? context.save()
+                } label: {
+                  Label("Удалить", systemImage: "trash")
+                }
+              }
           }
         }
       }
@@ -114,17 +133,53 @@ struct RootView: View {
   }
 
   private func journalStatsView() -> some View {
-    let closed = journal.filter { $0.status == "CLOSED" }
-    let wins = closed.filter { $0.result == "WIN" }.count
-    let losses = closed.filter { $0.result == "LOSS" }.count
-    let profit = closed.compactMap { $0.profit }.reduce(0.0, +)
-    let staked = closed.reduce(0.0) { $0 + $1.stake }
-    let roiPct = staked > 0 ? (profit / staked) * 100 : 0
-    return HStack {
-      statBlock("Всего", "\(journal.count)")
-      statBlock("W/L", "\(wins)/\(losses)")
-      statBlock("ROI", String(format: "%+.1f%%", roiPct))
+    let m = Metrics.compute(journal)
+    return VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        statBlock("Всего", "\(m.totalEntries)")
+        statBlock("Closed", "\(m.closedEntries)")
+        statBlock("Pending", "\(m.pending)")
+      }
+      HStack {
+        statBlock("W/L/P", "\(m.wins)/\(m.losses)/\(m.pushes)")
+        statBlock("Hit", String(format: "%.1f%%", m.hitRate * 100))
+        statBlock("ROI", String(format: "%+.2f%%", m.roi * 100))
+      }
+      HStack {
+        statBlock("CLV ср.", String(format: "%+.2f%%", m.avgCLV * 100))
+        statBlock("Brier", String(format: "%.3f", m.brier))
+        statBlock("LogLoss", String(format: "%.3f", m.logLoss))
+      }
     }
+    .padding(.vertical, 2)
+  }
+
+  private func calibrationView() -> some View {
+    let m = Metrics.compute(journal)
+    if m.calibration.isEmpty {
+      return AnyView(Text("Недостаточно закрытых записей для калибровки")
+        .font(.caption).foregroundStyle(.secondary))
+    }
+    return AnyView(
+      VStack(alignment: .leading, spacing: 4) {
+        ForEach(m.calibration) { b in
+          HStack {
+            Text(String(format: "P=%.0f%%", b.midpoint * 100))
+              .font(.caption.monospacedDigit())
+              .frame(width: 60, alignment: .leading)
+            Text(String(format: "act %.0f%%", b.actual * 100))
+              .font(.caption.monospacedDigit())
+              .foregroundStyle(abs(b.predicted - b.actual) < 0.08 ? .green : .orange)
+            Spacer()
+            Text("n=\(b.count)")
+              .font(.caption2)
+              .foregroundStyle(.secondary)
+          }
+        }
+        Text("CalErr: \(String(format: "%.3f", Metrics.calibrationError(m)))")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+    )
   }
 
   private func journalRow(_ e: JournalEntry) -> some View {
@@ -145,8 +200,45 @@ struct RootView: View {
         miniBlock("QCS", String(format: "%.0f", e.qcs))
         miniBlock("Stake", String(format: "%.2f%%", e.stake * 100))
       }
+      HStack(spacing: 12) {
+        statusBadge(e.status)
+        if let r = e.result { resultBadge(r) }
+        if let clv = e.clv {
+          Text("CLV \(String(format: "%+.2f%%", clv * 100))")
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(clv > 0 ? .green : .red)
+        }
+        if let p = e.profit {
+          Text("P/L \(String(format: "%+.3f", p))")
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(p >= 0 ? .green : .red)
+        }
+      }
     }
     .padding(.vertical, 2)
+  }
+
+  private func statusBadge(_ status: String) -> some View {
+    Text(status)
+      .font(.caption2.bold())
+      .padding(.horizontal, 6).padding(.vertical, 2)
+      .background(status == "CLOSED" ? Color.gray.opacity(0.3) : Color.blue.opacity(0.25))
+      .clipShape(Capsule())
+  }
+
+  private func resultBadge(_ r: String) -> some View {
+    let color: Color
+    switch r {
+    case "WIN": color = .green
+    case "LOSS": color = .red
+    case "PUSH": color = .orange
+    default: color = .gray
+    }
+    return Text(r)
+      .font(.caption2.bold())
+      .padding(.horizontal, 6).padding(.vertical, 2)
+      .background(color.opacity(0.25))
+      .clipShape(Capsule())
   }
 
   private func statBlock(_ label: String, _ value: String) -> some View {
@@ -218,6 +310,37 @@ struct RootView: View {
           ? "не задан" : "\(settings.apiKey.count) симв.")
         LabeledContent("Engine", value: settings.engineVersion)
       }
+      Section("Проверки") {
+        Button {
+          Task { await runChecks() }
+        } label: {
+          Label("Запустить проверки", systemImage: "checkmark.shield")
+        }
+        .disabled(busy)
+        LabeledContent("API reachable", value: apiReachable)
+        LabeledContent("API key", value: apiKeyState)
+        LabeledContent("Settle", value: lastSettleStatus)
+        if let lr = lastRefresh {
+          LabeledContent(
+            "Last refresh",
+            value: lr.formatted(date: .omitted, time: .shortened))
+        }
+      }
+      Section("Data freshness") {
+        Text("Свежесть данных матча обновляется раз в сутки (SStats).")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      Section("Sample / Consensus") {
+        let m = Metrics.compute(journal)
+        LabeledContent("Closed entries", value: "\(m.closedEntries)")
+        LabeledContent("Calibration err", value: String(format: "%.3f", Metrics.calibrationError(m)))
+        LabeledContent("Avg CLV", value: String(format: "%+.2f%%", m.avgCLV * 100))
+        LabeledContent("Brier", value: String(format: "%.3f", m.brier))
+      }
+      Section("Market / Referee / Lineup") {
+        Text("Referee и Lineup доступны через /Ls/GameInfo и /Games/{id}. Проверки включаются автоматически при анализе матча.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
       Section("Пул лиг") {
         ForEach(LeaguePool.pool, id: \.id) { lg in
           Text("\(lg.id) · \(lg.name)").font(.subheadline)
@@ -242,6 +365,34 @@ struct RootView: View {
     .listStyle(.insetGrouped)
     .navigationTitle("Контроль")
     .navigationBarTitleDisplayMode(.large)
+  }
+
+  private func runChecks() async {
+    guard !busy else { return }
+    busy = true
+    defer { busy = false }
+
+    // API key
+    let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    apiKeyState = key.isEmpty ? "пусто" : "задан (\(key.count) симв.)"
+    guard !key.isEmpty else {
+      apiReachable = "пропущено (нет ключа)"
+      return
+    }
+
+    // API reachable
+    let client = SStatsClient(settings: settings)
+    do {
+      _ = try await client.listToday()
+      apiReachable = "OK"
+    } catch {
+      apiReachable = "FAIL: \(error.localizedDescription)"
+    }
+
+    // Settle
+    let result = await JournalService.settleOpenEntries(
+      context: context, client: client)
+    lastSettleStatus = "закрыто \(result.closed), ошибок \(result.failed)"
   }
 
   // MARK: - Настройки
@@ -330,6 +481,26 @@ struct RootView: View {
       status = error.localizedDescription
       diagnostics.append("ERROR: \(error.localizedDescription)")
     }
+  }
+
+  // MARK: - Settle Journal
+
+  private func settleJournal() async {
+    guard !busy else { return }
+    busy = true
+    defer { busy = false }
+
+    guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
+      lastSettleStatus = "API key не задан"
+      return
+    }
+
+    let client = SStatsClient(settings: settings)
+    lastSettleStatus = "Обновляю…"
+    let result = await JournalService.settleOpenEntries(
+      context: context, client: client)
+    lastSettleStatus = "Закрыто \(result.closed), ошибок \(result.failed)"
   }
 
   // MARK: - Backtest
