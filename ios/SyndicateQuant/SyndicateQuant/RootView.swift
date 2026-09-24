@@ -42,6 +42,7 @@ struct RootView: View {
       Section {
         HStack {
           Text(status).font(.subheadline)
+            .fixedSize(horizontal: false, vertical: true)
           Spacer(minLength: 8)
           if busy { ProgressView().scaleEffect(0.9) }
         }
@@ -84,6 +85,7 @@ struct RootView: View {
       Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
     }
     .listStyle(.insetGrouped)
+    .contentMargins(.top, 4, for: .scrollContent)
     .navigationTitle("SYNDICATE QUANT")
     .navigationBarTitleDisplayMode(.large)
     .refreshable { await refresh() }
@@ -343,6 +345,8 @@ struct RootView: View {
           .font(.caption).foregroundStyle(.secondary)
         Text("Portfolio cap 10% bankroll в день")
           .font(.caption).foregroundStyle(.secondary)
+        Text("Background refresh: BGAppRefreshTask, интервал ≥ 30 мин")
+          .font(.caption).foregroundStyle(.secondary)
       }
       if !diagnostics.isEmpty {
         Section("Последний запуск") {
@@ -397,12 +401,22 @@ struct RootView: View {
         Toggle("Фоновое обновление", isOn: $settings.autoRefresh)
         Stepper("Интервал: \(settings.refreshMinutes) мин",
                 value: $settings.refreshMinutes, in: 15...120, step: 15)
+        Text("iOS сама решает, когда запускать фон (обычно ≥30 мин).")
+          .font(.caption2).foregroundStyle(.secondary)
       }
       Section("Параметры модели") {
         Stepper("История: \(settings.historyMatches) матчей",
                 value: $settings.historyMatches, in: 6...20)
         Stepper("Матчей в сканере: \(settings.scanMatches)",
                 value: $settings.scanMatches, in: 5...30)
+      }
+      Section("Уведомления") {
+        Toggle("Уведомлять при S/A BET", isOn: $settings.notifyBets)
+        Button {
+          NotificationService.resetDedupe()
+        } label: {
+          Label("Сбросить дубликаты", systemImage: "arrow.counterclockwise")
+        }
       }
       Section("Принцип") {
         Text("NO DATA → NO NUMBER → NO EDGE → NO BET").bold()
@@ -413,62 +427,27 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
-  // MARK: - Refresh
+  // MARK: - Refresh (через ScanCoordinator)
 
   private func refresh() async {
     guard !busy else { return }
     busy = true
     defer { busy = false }
     diagnostics = []
-    do {
-      guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      else { throw APIError.missingAPIKey }
-      status = "Получаю сегодняшние матчи…"
-      let client = SStatsClient(settings: settings)
-      let engine = QuantEngine()
-      var all = engine.matches(from: try await client.listToday())
-        .filter { !isExcluded($0) }
-      if selectedLeague != "Все" {
-        all = all.filter {
-          $0.league.localizedCaseInsensitiveContains(selectedLeague)
-        }
-      }
-      let matches = all.prefix(settings.scanMatches)
+    status = "Сканирую…"
 
-      var signalsOut: [BetSignal] = []
-      for match in matches {
-        guard let h = match.homeID, let a = match.awayID else { continue }
-        status = "Анализ \(match.home) — \(match.away)…"
-        let hs = await client.fetchTeamHistory(
-          teamID: h, count: settings.historyMatches)
-        let awayRecords = await client.fetchTeamHistory(
-          teamID: a, count: settings.historyMatches)
-        let info = try await client.gameInfo(match.id)
-        var oddsFromInfo = info.object?["data"]?.object?["odds"]
-          ?? match.oddsJSON ?? .array([])
-        if oddsFromInfo.array?.isEmpty != false, let nid = match.numericID {
-          if let o = try? await client.odds(numericID: nid) {
-            oddsFromInfo = o.object?["data"] ?? oddsFromInfo
-          }
-        }
-        let glicko = try? await client.glicko(match.id)
-        let s = engine.signals(
-          match: match, info: info, oddsJSON: oddsFromInfo,
-          homeHistory: hs, awayHistory: awayRecords, glicko: glicko)
-        signalsOut.append(contentsOf: s)
-        diagnostics.append(
-          "\(match.id) hist=\(hs.count)/\(awayRecords.count) sig=\(s.count)")
-      }
-      signals = engine.portfolio(signalsOut)
-      lastRefresh = Date()
+    let summary = await ScanCoordinator.shared.scan(
+      settings: settings, selectedLeague: selectedLeague)
+
+    signals = summary.signals
+    lastRefresh = summary.finishedAt
+    if summary.success {
       status = "Обновлено · \(signals.count) сигналов"
-      if settings.notifyBets && !signals.isEmpty {
-        await NotificationService.notify(signals: signals)
-      }
-    } catch {
-      status = error.localizedDescription
-      diagnostics.append("ERROR: \(error.localizedDescription)")
+    } else {
+      status = summary.notes.first ?? "Ошибка"
     }
+    for n in summary.notes { diagnostics.append(n) }
+    diagnostics.append("scanned=\(summary.scannedMatches)")
   }
 
   // MARK: - Settle Journal
@@ -491,7 +470,7 @@ struct RootView: View {
     lastSettleStatus = "Закрыто \(result.closed), ошибок \(result.failed)"
   }
 
-  // MARK: - Backtest (Этап 7: расширенный отчёт)
+  // MARK: - Backtest
 
   private func runBacktest() async {
     guard !busy else { return }
@@ -568,7 +547,6 @@ struct RootView: View {
       let report = WalkForwardBacktester().run(
         matches: prepared, histories: histories)
 
-      // Сохраняем в SwiftData (только базовые поля)
       context.insert(
         BacktestRun(
           matches: report.matches, bets: report.bets,
@@ -581,7 +559,6 @@ struct RootView: View {
           logLoss: report.logLoss, avgCLV: report.avgCLV))
       try? context.save()
 
-      // === Отчёт ===
       log("--- Итог ---")
       log("Matches: \(report.matches)")
       log("Bets: \(report.bets)")
@@ -590,7 +567,6 @@ struct RootView: View {
       log("ROI: \(String(format: "%+.2f%%", report.roi * 100))")
       log("Yield: \(String(format: "%+.2f%%", report.yieldPct * 100))")
       log("Profit: \(String(format: "%+.3f", report.profit))")
-      log("Staked: \(String(format: "%.3f", report.staked))")
       log("Avg odds: \(String(format: "%.2f", report.avgOdds))")
       log("Expectancy: \(String(format: "%+.3f", report.expectancy))")
 
@@ -610,7 +586,6 @@ struct RootView: View {
       logSection("Classification", log: log, dict: report.byClassification)
       logSection("Odds bands", log: log, dict: report.byOddsBand)
 
-      // Лиги — топ 5
       log("--- Лиги ---")
       let topLeagues = report.perLeague
         .sorted(by: { $0.value.bets > $1.value.bets })
@@ -619,13 +594,11 @@ struct RootView: View {
         log("\(lg): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100)), hit \(String(format: "%.0f%%", s.hitRate * 100))")
       }
 
-      // Рынки
       log("--- Рынки ---")
       for (mk, s) in report.perMarket.sorted(by: { $0.value.bets > $1.value.bets }) {
         log("\(mk): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100))")
       }
 
-      // Недели — стабильность
       log("--- По неделям ---")
       let weeksSorted = report.byWeek.sorted(by: { $0.key < $1.key })
       for (wk, s) in weeksSorted {
@@ -671,6 +644,7 @@ struct SignalCard: View {
     VStack(alignment: .leading, spacing: 8) {
       HStack(alignment: .top) {
         Text("\(signal.home) — \(signal.away)").font(.headline)
+          .fixedSize(horizontal: false, vertical: true)
         Spacer(minLength: 8)
         Text(signal.classification).font(.caption.bold())
           .padding(.horizontal, 8).padding(.vertical, 4)

@@ -552,3 +552,115 @@ enum JournalService {
     return nil
   }
 }
+
+// MARK: - ScanCoordinator (Этап 8)
+// Общий сервис сканирования, доступный и из UI, и из BGAppRefreshTask.
+// Логика повторяет refresh() из RootView, но без UI-зависимостей и без @State.
+
+@MainActor
+final class ScanCoordinator {
+  static let shared = ScanCoordinator()
+
+  private var isScanning = false
+
+  private init() {}
+
+  struct ScanSummary {
+    var signals: [BetSignal] = []
+    var scannedMatches = 0
+    var skippedExcluded = 0
+    var notes: [String] = []
+    var finishedAt: Date?
+    var success: Bool = false
+  }
+
+  /// Основное сканирование. Возвращает summary.
+  /// - Parameters:
+  ///   - settings: настройки приложения. Если nil — берётся новый AppSettings (Keychain).
+  ///   - selectedLeague: "Все" или название лиги из LeaguePool.
+  func scan(
+    settings: AppSettings? = nil,
+    selectedLeague: String = "Все"
+  ) async -> ScanSummary {
+    if isScanning {
+      return ScanSummary(notes: ["Уже выполняется"])
+    }
+    isScanning = true
+    defer { isScanning = false }
+
+    var summary = ScanSummary()
+
+    let resolvedSettings: AppSettings = settings ?? AppSettings()
+    let key = resolvedSettings.apiKey
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else {
+      summary.notes.append("API key не задан")
+      return summary
+    }
+
+    do {
+      let client = SStatsClient(settings: resolvedSettings)
+      let engine = QuantEngine()
+
+      var all = engine.matches(from: try await client.listToday())
+        .filter { !Self.isExcluded($0) }
+      summary.skippedExcluded = all.count
+
+      if selectedLeague != "Все" {
+        all = all.filter {
+          $0.league.localizedCaseInsensitiveContains(selectedLeague)
+        }
+      }
+      let matches = all.prefix(resolvedSettings.scanMatches)
+
+      var signalsOut: [BetSignal] = []
+      var count = 0
+      for match in matches {
+        guard let h = match.homeID, let a = match.awayID else { continue }
+        count += 1
+        let hs = await client.fetchTeamHistory(
+          teamID: h, count: resolvedSettings.historyMatches)
+        let awayRecords = await client.fetchTeamHistory(
+          teamID: a, count: resolvedSettings.historyMatches)
+        guard let info = try? await client.gameInfo(match.id) else { continue }
+        var oddsFromInfo = info.object?["data"]?.object?["odds"]
+          ?? match.oddsJSON ?? .array([])
+        if oddsFromInfo.array?.isEmpty != false, let nid = match.numericID {
+          if let o = try? await client.odds(numericID: nid) {
+            oddsFromInfo = o.object?["data"] ?? oddsFromInfo
+          }
+        }
+        let glicko = try? await client.glicko(match.id)
+        let s = engine.signals(
+          match: match, info: info, oddsJSON: oddsFromInfo,
+          homeHistory: hs, awayHistory: awayRecords, glicko: glicko)
+        signalsOut.append(contentsOf: s)
+      }
+
+      summary.scannedMatches = count
+      summary.signals = engine.portfolio(signalsOut)
+      summary.finishedAt = Date()
+      summary.success = true
+
+      if resolvedSettings.notifyBets && !summary.signals.isEmpty {
+        await NotificationService.notify(signals: summary.signals)
+      }
+    } catch {
+      summary.notes.append("Ошибка: \(error.localizedDescription)")
+    }
+
+    return summary
+  }
+
+  /// Обёртка для BGAppRefreshTask — возвращает true при успехе.
+  func scanInBackground() async -> Bool {
+    let result = await scan(settings: nil)
+    return result.success
+  }
+
+  private static func isExcluded(_ m: Match) -> Bool {
+    let x = "\(m.league) \(m.home) \(m.away)".lowercased()
+    let bad = ["friendly", "women", "женщ", "u19 women", "u20 women"]
+    return bad.contains(where: x.contains)
+  }
+}

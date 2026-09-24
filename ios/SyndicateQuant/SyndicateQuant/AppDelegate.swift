@@ -4,6 +4,7 @@
 @MainActor
 final class AppDelegate: NSObject, UIApplicationDelegate {
   static let refreshID = "com.syndicatequant.app.refresh"
+  private static var pendingSchedule = false
 
   func application(
     _ application: UIApplication,
@@ -11,13 +12,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
   ) -> Bool {
     BGTaskScheduler.shared.register(
       forTaskWithIdentifier: Self.refreshID,
-      using: .main
+      using: nil
     ) { task in
       guard let refreshTask = task as? BGAppRefreshTask else {
         task.setTaskCompleted(success: false)
         return
       }
-      Self.handle(refreshTask)
+      AppDelegate.handle(refreshTask)
     }
 
     NotificationService.request()
@@ -25,33 +26,40 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
   }
 
   func applicationDidEnterBackground(_ application: UIApplication) {
-    schedule()
+    Self.scheduleNextRefresh()
   }
 
-  private static func handle(_ task: BGAppRefreshTask) {
-    task.expirationHandler = nil
+  // MARK: - BGTask handling
 
-    let settings = AppSettings()
-    let key = settings.apiKey
-    guard !key.isEmpty else {
-      task.setTaskCompleted(success: false)
-      return
+  nonisolated private static func handle(_ task: BGAppRefreshTask) {
+    // Планируем следующую попытку сразу — BGTaskScheduler требует наличие хотя бы
+    // одной зарегистрированной задачи, иначе iOS перестанет нас будить.
+    scheduleNextRefresh()
+
+    let work = Task { @MainActor in
+      let success = await ScanCoordinator.shared.scanInBackground()
+      task.setTaskCompleted(success: success)
     }
 
-    Task { @MainActor in
-      let client = SStatsClient(settings: settings)
-      do {
-        _ = try await client.listToday()
-        task.setTaskCompleted(success: true)
-      } catch {
-        task.setTaskCompleted(success: false)
-      }
+    task.expirationHandler = {
+      work.cancel()
     }
   }
 
-  private func schedule() {
-    let request = BGAppRefreshTaskRequest(identifier: Self.refreshID)
+  nonisolated private static func scheduleNextRefresh() {
+    // Защита от параллельного планирования
+    guard !pendingSchedule else { return }
+    pendingSchedule = true
+    defer { pendingSchedule = false }
+
+    let request = BGAppRefreshTaskRequest(identifier: refreshID)
+    // iOS сам решит, когда запускать (обычно от 15 минут). Ставим 30 минут
+    // как минимум — iOS всё равно может отложить.
     request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
-    try? BGTaskScheduler.shared.submit(request)
+    do {
+      try BGTaskScheduler.shared.submit(request)
+    } catch {
+      print("[BG] submit failed: \(error.localizedDescription)")
+    }
   }
 }
