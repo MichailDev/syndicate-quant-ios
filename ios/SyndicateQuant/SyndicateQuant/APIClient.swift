@@ -22,11 +22,14 @@ final class SStatsClient {
     self.session = URLSession(configuration: cfg)
   }
 
+  // MARK: - Today
   func listToday() async throws -> JSONValue {
     try await get(
-      "/Ls/List", query: ["Date": Self.dateString(Date()), "TimeZone": "3", "Upcoming": "true"])
+      "/Ls/List",
+      query: ["Date": Self.dateString(Date()), "TimeZone": "3", "Upcoming": "true"])
   }
 
+  // MARK: - Конкретная дата
   func listOn(date: Date, upcoming: Bool = false) async throws -> JSONValue {
     try await get(
       "/Ls/List",
@@ -37,20 +40,37 @@ final class SStatsClient {
       ])
   }
 
+  // MARK: - Диапазон дат (для бэктеста). Ended=true → только завершённые матчи.
+  func listRange(from: Date, to: Date, limit: Int = 1000) async throws -> JSONValue {
+    try await get(
+      "/Ls/List",
+      query: [
+        "From": Self.dateString(from),
+        "To": Self.dateString(to),
+        "Ended": "true",
+        "Limit": String(limit),
+        "TimeZone": "3",
+      ])
+  }
+
+  // MARK: - История конкретной команды (slug, e.g. "ugyen-academy/dWbdNOyO")
   func listTeam(_ teamID: String, limit: Int = 25) async throws -> JSONValue {
     try await get(
       "/Ls/List",
       query: ["Team": teamID, "Ended": "true", "Limit": String(limit), "Order": "-1"])
   }
 
+  // MARK: - Детали матча (тут же data.odds)
   func gameInfo(_ id: String) async throws -> JSONValue {
     try await get("/Ls/GameInfo", query: ["id": id])
   }
-  func odds(_ id: String) async throws -> JSONValue { try await get("/Odds/\(id)", query: [:]) }
+
+  // MARK: - Glicko 2
   func glicko(_ id: String) async throws -> JSONValue {
     try await get("/Games/glicko/\(id)", query: [:])
   }
 
+  // MARK: - История команды через /Ls/List?Team=
   func fetchTeamHistory(teamID: String, count: Int = 15) async -> [TeamRecord] {
     do {
       let list = try await listTeam(teamID, limit: max(count * 2, 25))
@@ -72,6 +92,7 @@ final class SStatsClient {
     } catch { return [] }
   }
 
+  // MARK: - Private
   private func matches(from json: JSONValue) -> [Match] { QuantEngine().matches(from: json) }
 
   private func recordsFromList(_ json: JSONValue, targetID: String) -> [TeamRecord] {
@@ -109,20 +130,24 @@ final class SStatsClient {
     }
     return out
   }
+
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {
     if let x = o[side + "Team"]?.object {
       return string(x, ["id", "teamId", "team_id", "flashId", "uid"])
     }
     return string(o, [side + "TeamId", side + "TeamID", side + "Id", side + "ID"])
   }
+
   private func string(_ o: [String: JSONValue], _ keys: [String]) -> String? {
     for k in keys { if let s = o[k]?.string { return s } }
     return nil
   }
+
   private func number(_ o: [String: JSONValue], _ keys: [String]) -> Double? {
     for k in keys { if let n = o[k]?.number { return n } }
     return nil
   }
+
   private func date(_ o: [String: JSONValue]) -> Date? {
     if let s = string(o, ["date", "dateUtc", "startTime", "datetime"]) {
       let f = ISO8601DateFormatter()

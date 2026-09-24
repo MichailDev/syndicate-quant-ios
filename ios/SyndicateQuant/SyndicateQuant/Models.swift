@@ -9,6 +9,9 @@ struct Match: Identifiable, Codable, Hashable {
   let start: Date?
   let homeID: String?
   let awayID: String?
+  var homeFT: Double?
+  var awayFT: Double?
+  var oddsJSON: JSONValue?
 }
 
 struct Quote: Codable, Hashable {

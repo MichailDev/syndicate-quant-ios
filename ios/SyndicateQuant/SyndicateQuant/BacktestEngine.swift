@@ -46,10 +46,8 @@ struct CalibrationEngine {
 }
 
 struct WalkForwardBacktester {
-  func run(
-    matches: [Match], histories: [String: [TeamRecord]], odds: [String: JSONValue],
-    infos: [String: JSONValue]
-  ) -> BacktestResult {
+  /// Ходит по матчам, где есть `homeFT/awayFT` (завершённые), и на истории команд строит сигналы.
+  func run(matches: [Match], histories: [String: [TeamRecord]]) -> BacktestResult {
     let engine = QuantEngine()
     var r = BacktestResult()
     var equity = 0.0
@@ -57,25 +55,30 @@ struct WalkForwardBacktester {
     var lossStreak = 0
 
     for match in matches.sorted(by: { ($0.start ?? .distantPast) < ($1.start ?? .distantPast) }) {
-      r.matches += 1
+      guard let h = match.homeID, let a = match.awayID else { continue }
+      guard let hFT = match.homeFT, let aFT = match.awayFT else { continue }
 
-      guard let h = match.homeID, let a = match.awayID,
-        let info = infos[match.id], let odd = odds[match.id]
-      else { continue }
+      r.matches += 1
 
       let matchStart = match.start ?? .distantFuture
       let hs = (histories[h] ?? []).filter { ($0.date ?? .distantPast) < matchStart }
       let awayRecords = (histories[a] ?? []).filter { ($0.date ?? .distantPast) < matchStart }
 
+      let oddsJSON = match.oddsJSON ?? .array([])
+      let infoJSON: JSONValue = .object([
+        "homeFTResult": .number(hFT),
+        "awayFTResult": .number(aFT),
+      ])
+
       let signals = engine.portfolio(
         engine.signals(
-          match: match, info: info, oddsJSON: odd,
+          match: match, info: infoJSON, oddsJSON: oddsJSON,
           homeHistory: hs, awayHistory: awayRecords))
 
       for s in signals {
         r.bets += 1
         r.staked += s.stake
-        guard let actual = actualResult(info: info, signal: s) else { continue }
+        guard let actual = actualResult(match: match, signal: s) else { continue }
 
         let pnl: Double
         if actual == 1 {
@@ -110,19 +113,18 @@ struct WalkForwardBacktester {
     return r
   }
 
-  private func actualResult(info: JSONValue, signal: BetSignal) -> Double? {
-    let home = info.firstNumber(keys: ["homeftresult", "homescore", "homegoals", "home_score"])
-    let away = info.firstNumber(keys: ["awayftresult", "awayscore", "awaygoals", "away_score"])
-    if signal.market == "1X2", let h = home, let a = away {
-      let win =
-        signal.selection.lowercased().contains("home") || signal.selection == "1"
-        ? h > a
-        : signal.selection.lowercased().contains("draw") || signal.selection == "x" ? h == a : a > h
+  private func actualResult(match: Match, signal: BetSignal) -> Double? {
+    guard let h = match.homeFT, let a = match.awayFT else { return nil }
+    if signal.market == "1X2" {
+      let sel = signal.selection.lowercased()
+      let win: Bool
+      if sel.contains("home") || sel == "1" { win = h > a }
+      else if sel.contains("draw") || sel == "x" { win = h == a }
+      else { win = a > h }
       return win ? 1 : 0
     }
-    let total = info.firstNumber(keys: ["totalgoals", "goals", "score"])
-    guard let total else { return nil }
     guard let line = signal.line else { return nil }
+    let total = h + a
     let over =
       signal.selection.lowercased().contains("over") || signal.selection.lowercased().hasPrefix("o")
     if abs(line.rounded() - line) < 0.001 && Double(Int(line)) == total { return 0.5 }

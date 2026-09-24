@@ -178,7 +178,7 @@ struct RootView: View {
         let hs = await client.fetchTeamHistory(teamID: h, count: settings.historyMatches)
         let awayRecords = await client.fetchTeamHistory(teamID: a, count: settings.historyMatches)
         let info = try await client.gameInfo(match.id)
-        let oddsFromInfo = info.object?["data"]?.object?["odds"] ?? .array([])
+        let oddsFromInfo = info.object?["data"]?.object?["odds"] ?? match.oddsJSON ?? .array([])
         let glicko = try? await client.glicko(match.id)
         let s = QuantEngine().signals(
           match: match, info: info, oddsJSON: oddsFromInfo, homeHistory: hs,
@@ -200,7 +200,7 @@ struct RootView: View {
     }
   }
 
-  // MARK: - Backtest: walk-forward по прошлым матчам команд из сегодняшней выборки
+  // MARK: - Backtest: 1 запрос /Ls/List за 14 дней со всеми данными
   private func runBacktest() async {
     guard !busy else { return }
     busy = true
@@ -220,92 +220,31 @@ struct RootView: View {
       let client = SStatsClient(settings: settings)
       let engine = QuantEngine()
 
-      // 1) Сегодняшние матчи
-      log("1) Сегодняшние матчи…")
-      let todayJSON = try await client.listToday()
-      let todayMatches = engine.matches(from: todayJSON).filter { !isExcluded($0) }
-      log("1) Найдено: \(todayMatches.count)")
-      guard !todayMatches.isEmpty else {
-        log("Стоп: нет матчей на сегодня")
-        return
-      }
+      let toDate = Date()
+      let fromDate = Calendar.current.date(byAdding: .day, value: -14, to: toDate) ?? toDate
+      log("1) Запрос /Ls/List с \(Self.fmt(fromDate)) по \(Self.fmt(toDate))…")
 
-      // 2) Уникальные slug-и команд
-      var teamSlugs = Set<String>()
-      for m in todayMatches {
-        if let s = m.homeID { teamSlugs.insert(s) }
-        if let s = m.awayID { teamSlugs.insert(s) }
-      }
-      let slugs = Array(teamSlugs)
-      log("2) Команд: \(slugs.count)")
-      if let s = slugs.first { log("2) Пример slug: \(s)") }
+      let json = try await client.listRange(from: fromDate, to: toDate, limit: 1000)
+      let matches = engine.matches(from: json).filter { !isExcluded($0) }
+      log("1) Матчей получено: \(matches.count)")
 
-      // 3) Прошлые матчи каждой команды
-      log("3) Тяну историю…")
-      var pastMatches: [Match] = []
-      var seen = Set<String>()
-      for (i, slug) in slugs.enumerated() {
-        if i % 5 == 0 { log("3) \(i + 1)/\(slugs.count)…") }
-        if let json = try? await client.listTeam(slug, limit: 50) {
-          for m in engine.matches(from: json) where !seen.contains(m.id) {
-            if let d = m.start, d < Date() {
-              seen.insert(m.id)
-              pastMatches.append(m)
-            }
-          }
-        }
-        try? await Task.sleep(for: .milliseconds(100))
-      }
-      log("3) Прошлых матчей: \(pastMatches.count)")
-      guard !pastMatches.isEmpty else {
-        log("Стоп: нет истории")
-        return
-      }
+      let withFT = matches.filter { $0.homeFT != nil && $0.awayFT != nil }
+      log("1) Из них с FT-счётом: \(withFT.count)")
 
-      // 4) GameInfo для прошлых матчей (там же odds)
-      let cap = min(pastMatches.count, 120)
-      log("4) Данные для \(cap) матчей…")
-      var infos: [String: JSONValue] = [:]
-      var odds: [String: JSONValue] = [:]
-      for i in 0..<cap {
-        let m = pastMatches[i]
-        if i % 15 == 0 { log("4) \(i + 1)/\(cap)…") }
-        if let info = try? await client.gameInfo(m.id) {
-          infos[m.id] = info
-          if let d = info.object?["data"]?.object, let o = d["odds"] {
-            odds[m.id] = o
-          }
-        }
-        try? await Task.sleep(for: .milliseconds(70))
-      }
-      log("4) info=\(infos.count), odds=\(odds.count)")
+      let withOdds = withFT.filter { $0.oddsJSON != nil }
+      log("1) Из них с odds: \(withOdds.count)")
 
-      // 5) Истории команд из загруженных info
-      log("5) Строю истории…")
-      var histories: [String: [TeamRecord]] = [:]
-      for (_, info) in infos {
-        guard let data = info.object?["data"]?.object,
-          let game = data["game"]?.object
-        else { continue }
-        for side in ["home", "away"] {
-          guard let team = game[side + "Team"]?.object,
-            let id = team["id"]?.string
-          else { continue }
-          if let rec = engine.teamRecord(from: info, targetID: id) {
-            histories[id, default: []].append(rec)
-          }
-        }
-      }
-      for (k, v) in histories {
-        histories[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
-      }
+      let histories = engine.allRecords(from: json)
       let totalRecs = histories.values.map { $0.count }.reduce(0, +)
-      log("5) Команд: \(histories.count), записей: \(totalRecs)")
+      log("2) Команд в историях: \(histories.count), записей: \(totalRecs)")
 
-      // 6) Walk-forward
-      log("6) Walk-forward…")
-      let result = WalkForwardBacktester().run(
-        matches: pastMatches, histories: histories, odds: odds, infos: infos)
+      guard withFT.count > 0 else {
+        log("Стоп: нет матчей с итоговым счётом")
+        return
+      }
+
+      log("3) Walk-forward…")
+      let result = WalkForwardBacktester().run(matches: withFT, histories: histories)
 
       context.insert(
         BacktestRun(
@@ -314,7 +253,6 @@ struct RootView: View {
           maxDrawdown: result.maxDrawdown, maxLosingStreak: result.maxLosingStreak))
       try? context.save()
 
-      // 7) Отчёт
       log("--- Итог ---")
       log("Matches: \(result.matches)")
       log("Bets: \(result.bets)")
@@ -336,6 +274,13 @@ struct RootView: View {
     } catch {
       log("ERROR: \(error.localizedDescription)")
     }
+  }
+
+  private static func fmt(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    f.timeZone = TimeZone(secondsFromGMT: 3 * 3600)
+    return f.string(from: d)
   }
 
   private func isExcluded(_ m: Match) -> Bool {

@@ -52,7 +52,7 @@ struct QuantEngine {
   static let countLines = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5]
   static let sharpBooks = ["pinnacle", "betfair", "sbo", "sbobet", "marathon", "bet365 exchange"]
 
-  // MARK: - Matches (SStats /Ls/List → {status, count, data: [...]})
+  // MARK: - Matches from /Ls/List ({status, count, data: [...]})
   func matches(from json: JSONValue) -> [Match] {
     let items: [JSONValue]
     if let obj = json.object, let dataArr = obj["data"]?.array {
@@ -71,12 +71,75 @@ struct QuantEngine {
       else { continue }
       guard let home = teamName(o, "home"), let away = teamName(o, "away") else { continue }
       let league = leagueName(o) ?? "Unknown"
+      let homeFT = number(o, ["homeFTResult", "homeResult", "homeScore"])
+      let awayFT = number(o, ["awayFTResult", "awayResult", "awayScore"])
+      let oddsJSON = o["odds"]
       let m = Match(
         id: id, home: home, away: away, league: league, start: date(o),
-        homeID: teamID(o, "home"), awayID: teamID(o, "away"))
+        homeID: teamID(o, "home"), awayID: teamID(o, "away"),
+        homeFT: homeFT, awayFT: awayFT, oddsJSON: oddsJSON)
       if !result.contains(where: { $0.id == id }) { result.append(m) }
     }
     return result
+  }
+
+  // MARK: - Histories из того же ответа /Ls/List
+  func allRecords(from json: JSONValue) -> [String: [TeamRecord]] {
+    let items: [JSONValue]
+    if let obj = json.object, let dataArr = obj["data"]?.array {
+      items = dataArr
+    } else if let arr = json.array {
+      items = arr
+    } else {
+      items = []
+    }
+
+    var out: [String: [TeamRecord]] = [:]
+    for item in items {
+      guard let o = item.object else { continue }
+      if let hid = teamID(o, "home"),
+        let rec = recordFromGame(o, teamID: hid, isHome: true)
+      {
+        out[hid, default: []].append(rec)
+      }
+      if let aid = teamID(o, "away"),
+        let rec = recordFromGame(o, teamID: aid, isHome: false)
+      {
+        out[aid, default: []].append(rec)
+      }
+    }
+    for (k, v) in out {
+      out[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+    }
+    return out
+  }
+
+  private func recordFromGame(
+    _ o: [String: JSONValue], teamID: String, isHome: Bool
+  ) -> TeamRecord? {
+    let pref = isHome ? "home" : "away"
+    let opp = isHome ? "away" : "home"
+    let gf = number(o, [pref + "FTResult", pref + "Result", pref + "Score", pref + "Goals"])
+    let ga = number(o, [opp + "FTResult", opp + "Result", opp + "Score", opp + "Goals"])
+    guard gf != nil || ga != nil else { return nil }
+    let stats = o["statistics"]?.object ?? o
+    return TeamRecord(
+      id: string(o, ["id"]) ?? UUID().uuidString,
+      date: date(o),
+      gf: gf, ga: ga,
+      corners: number(stats, ["cornerKicks\(isHome ? "Home" : "Away")", pref + "Corners"]),
+      oppCorners: number(stats, ["cornerKicks\(isHome ? "Away" : "Home")", opp + "Corners"]),
+      cards: number(stats, ["yellowCards\(isHome ? "Home" : "Away")", pref + "Cards"]),
+      oppCards: number(stats, ["yellowCards\(isHome ? "Away" : "Home")", opp + "Cards"]),
+      fouls: number(stats, ["fouls\(isHome ? "Home" : "Away")", pref + "Fouls"]),
+      oppFouls: number(stats, ["fouls\(isHome ? "Away" : "Home")", opp + "Fouls"]),
+      shots: number(stats, ["totalShots\(isHome ? "Home" : "Away")", pref + "Shots"]),
+      sot: number(stats, ["shotsOnGoal\(isHome ? "Home" : "Away")", pref + "SOT"]),
+      possession: number(stats, ["ballPossession\(isHome ? "Home" : "Away")"]),
+      xg: number(stats, ["expectedGoals\(isHome ? "Home" : "Away")", pref + "XG"]),
+      oppXg: number(stats, ["expectedGoals\(isHome ? "Away" : "Home")", opp + "XG"]),
+      referee: string(o, ["refereeName", "referee"]),
+      players: [])
   }
 
   private func teamName(_ o: [String: JSONValue], _ side: String) -> String? {
@@ -106,21 +169,7 @@ struct QuantEngine {
     let aid = teamID(game, "away")
     guard targetID == hid || targetID == aid else { return nil }
     let isHome = targetID == hid
-    let pref = isHome ? "Home" : "Away"
-    let opp = isHome ? "Away" : "Home"
-    let stats = g["statistics"]?.object ?? [:]
-    func s(_ k: String) -> Double? { number(stats, [k + pref]) }
-    let gf = number(game, [isHome ? "homeFTResult" : "awayFTResult"])
-    let ga = number(game, [isHome ? "awayFTResult" : "homeFTResult"])
-    return TeamRecord(
-      id: targetID, date: date(game), gf: gf, ga: ga,
-      corners: s("cornerKicks"), oppCorners: number(stats, ["cornerKicks" + opp]),
-      cards: s("yellowCards"), oppCards: number(stats, ["yellowCards" + opp]),
-      fouls: s("fouls"), oppFouls: number(stats, ["fouls" + opp]),
-      shots: s("totalShots"), sot: s("shotsOnGoal"), possession: s("ballPossession"),
-      xg: s("expectedGoals"), oppXg: number(stats, ["expectedGoals" + opp]),
-      referee: string(g, ["refereeName"]) ?? string(game, ["refereeName"]),
-      players: extractPlayers(g, targetID))
+    return recordFromGame(game, teamID: targetID, isHome: isHome)
   }
 
   func model(home: [TeamRecord], away: [TeamRecord], glicko: JSONValue? = nil) -> MatchModel? {
@@ -424,7 +473,7 @@ struct QuantEngine {
     return 0.03
   }
 
-  // MARK: - Odds (SStats: data.odds = [ {marketId, marketName, odds:[{name,value}]} ])
+  // MARK: - Odds
   private func parseQuotes(_ json: JSONValue) -> [Quote] {
     var out: [Quote] = []
     if let arr = json.array {
@@ -506,7 +555,7 @@ struct QuantEngine {
     return ""
   }
 
-  // MARK: - JSON normalization
+  // MARK: - JSON helpers
   private func extractPlayers(_ g: [String: JSONValue], _ teamID: String) -> [PlayerRow] {
     let arr = (g["playerStats"] ?? g["players"] ?? g["lineupPlayers"])?.allObjects() ?? []
     return arr.compactMap { p in
@@ -532,7 +581,6 @@ struct QuantEngine {
     if let o = p.object, let d = o["data"]?.object { return d }
     return p.object ?? [:]
   }
-  // Приоритет: id (slug для ?Team=), потом uid
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {
     if let x = o[side + "Team"]?.object {
       return string(x, ["id", "teamid", "team_id", "flashid", "uid"])
