@@ -14,7 +14,6 @@ struct RootView: View {
   @State private var backtestStatus = "Не запускался"
   @State private var selectedLeague: String = "Все"
 
-  // Для вкладки Контроль
   @State private var apiReachable: String = "—"
   @State private var apiKeyState: String = "—"
   @State private var lastSettleStatus: String = "—"
@@ -326,20 +325,12 @@ struct RootView: View {
             value: lr.formatted(date: .omitted, time: .shortened))
         }
       }
-      Section("Data freshness") {
-        Text("Свежесть данных матча обновляется раз в сутки (SStats).")
-          .font(.caption).foregroundStyle(.secondary)
-      }
       Section("Sample / Consensus") {
         let m = Metrics.compute(journal)
         LabeledContent("Closed entries", value: "\(m.closedEntries)")
         LabeledContent("Calibration err", value: String(format: "%.3f", Metrics.calibrationError(m)))
         LabeledContent("Avg CLV", value: String(format: "%+.2f%%", m.avgCLV * 100))
         LabeledContent("Brier", value: String(format: "%.3f", m.brier))
-      }
-      Section("Market / Referee / Lineup") {
-        Text("Referee и Lineup доступны через /Ls/GameInfo и /Games/{id}. Проверки включаются автоматически при анализе матча.")
-          .font(.caption).foregroundStyle(.secondary)
       }
       Section("Пул лиг") {
         ForEach(LeaguePool.pool, id: \.id) { lg in
@@ -372,7 +363,6 @@ struct RootView: View {
     busy = true
     defer { busy = false }
 
-    // API key
     let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
     apiKeyState = key.isEmpty ? "пусто" : "задан (\(key.count) симв.)"
     guard !key.isEmpty else {
@@ -380,7 +370,6 @@ struct RootView: View {
       return
     }
 
-    // API reachable
     let client = SStatsClient(settings: settings)
     do {
       _ = try await client.listToday()
@@ -389,7 +378,6 @@ struct RootView: View {
       apiReachable = "FAIL: \(error.localizedDescription)"
     }
 
-    // Settle
     let result = await JournalService.settleOpenEntries(
       context: context, client: client)
     lastSettleStatus = "закрыто \(result.closed), ошибок \(result.failed)"
@@ -503,7 +491,7 @@ struct RootView: View {
     lastSettleStatus = "Закрыто \(result.closed), ошибок \(result.failed)"
   }
 
-  // MARK: - Backtest
+  // MARK: - Backtest (Этап 7: расширенный отчёт)
 
   private func runBacktest() async {
     guard !busy else { return }
@@ -577,47 +565,86 @@ struct RootView: View {
       log("3) Команд: \(histories.count)")
 
       log("4) Walk-forward…")
-      let result = WalkForwardBacktester().run(matches: prepared, histories: histories)
+      let report = WalkForwardBacktester().run(
+        matches: prepared, histories: histories)
 
+      // Сохраняем в SwiftData (только базовые поля)
       context.insert(
         BacktestRun(
-          matches: result.matches, bets: result.bets,
-          wins: result.wins, losses: result.losses, pushes: result.pushes,
-          profit: result.profit, staked: result.staked, roi: result.roi,
-          yieldPct: result.yieldPct, hitRate: result.hitRate,
-          maxDrawdown: result.maxDrawdown,
-          maxLosingStreak: result.maxLosingStreak,
-          sharpe: result.sharpe, brier: result.brier,
-          logLoss: result.logLoss, avgCLV: result.avgCLV))
+          matches: report.matches, bets: report.bets,
+          wins: report.wins, losses: report.losses, pushes: report.pushes,
+          profit: report.profit, staked: report.staked, roi: report.roi,
+          yieldPct: report.yieldPct, hitRate: report.hitRate,
+          maxDrawdown: report.maxDrawdown,
+          maxLosingStreak: report.maxLosingStreak,
+          sharpe: report.sharpe, brier: report.brier,
+          logLoss: report.logLoss, avgCLV: report.avgCLV))
       try? context.save()
 
+      // === Отчёт ===
       log("--- Итог ---")
-      log("Matches: \(result.matches)")
-      log("Bets: \(result.bets)")
-      log("W/L/P: \(result.wins)/\(result.losses)/\(result.pushes)")
-      log("ROI: \(String(format: "%+.2f%%", result.roi * 100))")
-      log("Yield: \(String(format: "%+.2f%%", result.yieldPct * 100))")
-      log("Hit: \(String(format: "%.1f%%", result.hitRate * 100))")
-      log("DD: \(String(format: "%.3f", result.maxDrawdown))")
-      log("Sharpe: \(String(format: "%.2f", result.sharpe))")
-      log("Brier: \(String(format: "%.3f", result.brier))")
-      log("LogLoss: \(String(format: "%.3f", result.logLoss))")
-      if !result.perLeague.isEmpty {
-        log("--- Лиги ---")
-        for (lg, s) in result.perLeague
-          .sorted(by: { $0.value.bets > $1.value.bets }).prefix(5) {
-          log("\(lg): \(s.bets)b, \(String(format: "%+.1f%%", s.roi * 100))")
-        }
+      log("Matches: \(report.matches)")
+      log("Bets: \(report.bets)")
+      log("W/L/P: \(report.wins)/\(report.losses)/\(report.pushes)")
+      log("Hit: \(String(format: "%.1f%%", report.hitRate * 100))")
+      log("ROI: \(String(format: "%+.2f%%", report.roi * 100))")
+      log("Yield: \(String(format: "%+.2f%%", report.yieldPct * 100))")
+      log("Profit: \(String(format: "%+.3f", report.profit))")
+      log("Staked: \(String(format: "%.3f", report.staked))")
+      log("Avg odds: \(String(format: "%.2f", report.avgOdds))")
+      log("Expectancy: \(String(format: "%+.3f", report.expectancy))")
+
+      log("--- Риск ---")
+      log("Max DD: \(String(format: "%.3f", report.maxDrawdown))")
+      log("Max loss streak: \(report.maxLosingStreak)")
+      log("Sharpe: \(String(format: "%.2f", report.sharpe))")
+      log("Sortino: \(String(format: "%.2f", report.sortino))")
+      log("Profit Factor: \(String(format: "%.2f", report.profitFactor))")
+
+      log("--- Качество прогноза ---")
+      log("Brier: \(String(format: "%.3f", report.brier))")
+      log("LogLoss: \(String(format: "%.3f", report.logLoss))")
+      log("Avg CLV: \(String(format: "%+.2f%%", report.avgCLV * 100))")
+
+      logSection("EV buckets", log: log, dict: report.byEVBucket)
+      logSection("Classification", log: log, dict: report.byClassification)
+      logSection("Odds bands", log: log, dict: report.byOddsBand)
+
+      // Лиги — топ 5
+      log("--- Лиги ---")
+      let topLeagues = report.perLeague
+        .sorted(by: { $0.value.bets > $1.value.bets })
+        .prefix(5)
+      for (lg, s) in topLeagues {
+        log("\(lg): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100)), hit \(String(format: "%.0f%%", s.hitRate * 100))")
       }
-      if !result.perMarket.isEmpty {
-        log("--- Рынки ---")
-        for (mk, s) in result.perMarket
-          .sorted(by: { $0.value.bets > $1.value.bets }) {
-          log("\(mk): \(s.bets)b, \(String(format: "%+.1f%%", s.roi * 100))")
-        }
+
+      // Рынки
+      log("--- Рынки ---")
+      for (mk, s) in report.perMarket.sorted(by: { $0.value.bets > $1.value.bets }) {
+        log("\(mk): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100))")
+      }
+
+      // Недели — стабильность
+      log("--- По неделям ---")
+      let weeksSorted = report.byWeek.sorted(by: { $0.key < $1.key })
+      for (wk, s) in weeksSorted {
+        log("\(wk): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100))")
       }
     } catch {
       log("ERROR: \(error.localizedDescription)")
+    }
+  }
+
+  private func logSection(
+    _ title: String,
+    log: (String) -> Void,
+    dict: [String: SegmentStats]
+  ) {
+    guard !dict.isEmpty else { return }
+    log("--- \(title) ---")
+    for (k, s) in dict.sorted(by: { $0.value.bets > $1.value.bets }) {
+      log("\(k): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100)), hit \(String(format: "%.0f%%", s.hitRate * 100))")
     }
   }
 
