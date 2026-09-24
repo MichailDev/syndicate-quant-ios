@@ -17,6 +17,7 @@ struct TeamRecord: Hashable, Codable {
   var xg: Double?
   var oppXg: Double?
   var referee: String?
+  var isHome: Bool = true
   var players: [PlayerRow] = []
 }
 
@@ -37,6 +38,7 @@ struct RefProfile {
   var cards: Double?
   var fouls: Double?
   var confidence: Double
+  var rsi: Double
 }
 struct SharpGuard {
   var score: Double = 0
@@ -68,7 +70,8 @@ struct QuantEngine {
     for item in items {
       guard let o = item.object else { continue }
       guard let idStr = string(o, ["id", "flashId", "gameid", "game_id"]),
-        !idStr.isEmpty else { continue }
+            !idStr.isEmpty
+      else { continue }
       guard let home = teamName(o, "home"), let away = teamName(o, "away")
       else { continue }
       let league = leagueName(o) ?? "Unknown"
@@ -90,11 +93,11 @@ struct QuantEngine {
     for item in items {
       guard let o = item.object else { continue }
       if let hid = teamID(o, "home"),
-        let rec = recordFromGame(o, teamID: hid, isHome: true) {
+         let rec = recordFromGame(o, teamID: hid, isHome: true) {
         out[hid, default: []].append(rec)
       }
       if let aid = teamID(o, "away"),
-        let rec = recordFromGame(o, teamID: aid, isHome: false) {
+         let rec = recordFromGame(o, teamID: aid, isHome: false) {
         out[aid, default: []].append(rec)
       }
     }
@@ -119,7 +122,9 @@ struct QuantEngine {
       cards: nil, oppCards: nil,
       fouls: nil, oppFouls: nil,
       shots: nil, sot: nil, possession: nil, xg: nil, oppXg: nil,
-      referee: string(o, ["refereeName", "referee"]), players: [])
+      referee: string(o, ["refereeName", "referee"]),
+      isHome: isHome,
+      players: [])
   }
 
   func teamRecord(from payload: JSONValue, targetID: String) -> TeamRecord? {
@@ -131,7 +136,7 @@ struct QuantEngine {
     return recordFromGame(game, teamID: targetID, isHome: targetID == hid)
   }
 
-  // MARK: - Model
+  // MARK: - Model (Dixon–Coles + Bivariate Poisson)
 
   func model(home: [TeamRecord], away: [TeamRecord], glicko: JSONValue? = nil) -> MatchModel? {
     guard let base = estimateLambdas(home, away) else { return nil }
@@ -139,14 +144,26 @@ struct QuantEngine {
     let pa = playerAssembly(away)
     let player = (base.0 * ph.factor, base.1 * pa.factor)
     let final = glickoAdjust(player, glicko)
-    let baseM = QuantMath.dixonColes(base.0, base.1, rho: -0.055, maxGoals: 12)
-    let finalM = QuantMath.dixonColes(final.0, final.1, rho: -0.055, maxGoals: 12)
-    let bo = QuantMath.outcomes(baseM)
-    let fo = QuantMath.outcomes(finalM)
+
+    // Используем bivariate Poisson для низких счётов (xG < 1.5 обе команды),
+    // Dixon–Coles — для остальных случаев.
+    let useBivariate = final.0 < 1.5 && final.1 < 1.5
+    let baseMatrix: Matrix2D
+    let finalMatrix: Matrix2D
+    if useBivariate {
+      baseMatrix = QuantMath.bivariatePoisson(base.0, base.1, l3: 0.05, maxGoals: 12)
+      finalMatrix = QuantMath.bivariatePoisson(final.0, final.1, l3: 0.05, maxGoals: 12)
+    } else {
+      baseMatrix = QuantMath.dixonColes(base.0, base.1, rho: -0.055, maxGoals: 12)
+      finalMatrix = QuantMath.dixonColes(final.0, final.1, rho: -0.055, maxGoals: 12)
+    }
+
+    let bo = QuantMath.outcomes(baseMatrix)
+    let fo = QuantMath.outcomes(finalMatrix)
     return MatchModel(
       lh: final.0, la: final.1,
       baseLH: base.0, baseLA: base.1,
-      baseMatrix: baseM, playerMatrix: baseM, matrix: finalM,
+      baseMatrix: baseMatrix, playerMatrix: baseMatrix, matrix: finalMatrix,
       outcomes: fo,
       components: [bo.home, bo.draw, bo.away, fo.home, fo.draw, fo.away],
       playerHome: ph, playerAway: pa)
@@ -183,6 +200,9 @@ struct QuantEngine {
       + 0.15 * freshnessScore
       + 0.10 * definitionScore
 
+    // Полная дистрибуция тотала для азиатских линий
+    let totalDist = QuantMath.totalDistribution(matchModel.matrix)
+
     for (_, qs) in grouped {
       guard !qs.isEmpty else { continue }
       guard let median = QuantMath.median(qs.map { $0.odds }) else { continue }
@@ -192,23 +212,15 @@ struct QuantEngine {
       let p: Double
       let modelName: String
       if q.market == "1X2" {
-        p = compute1X2Probability(
-          q: q, model: matchModel, n: 20000, seed: 17)
+        p = compute1X2Probability(q: q, model: matchModel, n: 20000, seed: 17)
         modelName = "DC+PLAYER+GLICKO+MC"
       } else if q.market == "GOALS" {
-        p = totalProbability(
-          q, mean: max(0.1, matchModel.lh + matchModel.la),
-          variance: goalVariance(homeHistory + awayHistory))
-        modelName = "POISSON/NB+MC"
+        p = totalProbabilityFromDistribution(q, dist: totalDist)
+        modelName = "DC/BIVAR+MC"
       } else if q.market == "CARDS" {
-        var mean = meanCount(homeHistory + awayHistory, \.cards) ?? 4.0
-        if ref.n >= 6, let rv = ref.cards {
-          mean = blendRef(base: mean, ref: rv, n: ref.n)
-        }
-        p = totalProbability(
-          q, mean: mean,
-          variance: countVariance(homeHistory + awayHistory, \.cards))
-        modelName = "POISSON/NB+REFEREE"
+        p = computeCardsProbability(
+          q: q, records: homeHistory + awayHistory, ref: ref)
+        modelName = "POISSON/NB+REFEREE+RSI"
       } else if q.market == "CORNERS" {
         let mean = meanCount(homeHistory + awayHistory, \.corners) ?? 10.0
         p = totalProbability(
@@ -230,7 +242,7 @@ struct QuantEngine {
     return out.sorted { $0.qcs > $1.qcs }
   }
 
-  // MARK: - Model outcome -> 1X2 probability
+  // MARK: - Probability calculations
 
   private func compute1X2Probability(
     q: Quote, model: MatchModel, n: Int, seed: UInt64
@@ -249,6 +261,30 @@ struct QuantEngine {
     default:  mcSide = mc.2
     }
     return 0.80 * modelSide + 0.20 * mcSide
+  }
+
+  /// GOALS: используем готовую дистрибуцию totalDistribution и Asian-aware probabilities
+  private func totalProbabilityFromDistribution(_ q: Quote, dist: [Double]) -> Double {
+    guard let line = q.line else { return 0.5 }
+    let s = q.selection.lowercased()
+    let isUnder = s.contains("under") || s.hasPrefix("u")
+    if isUnder {
+      return QuantMath.underAsianProbability(dist, line: line).under
+    } else {
+      return QuantMath.overAsianProbability(dist, line: line).over
+    }
+  }
+
+  /// CARDS: Poisson/NB с referee RSI
+  private func computeCardsProbability(
+    q: Quote, records: [TeamRecord], ref: RefProfile
+  ) -> Double {
+    var mean = meanCount(records, \.cards) ?? 4.0
+    if ref.n >= 6, let rv = ref.cards {
+      mean = blendRef(base: mean, ref: rv, n: ref.n)
+    }
+    return totalProbability(
+      q, mean: mean, variance: countVariance(records, \.cards))
   }
 
   // MARK: - Finish
@@ -328,7 +364,7 @@ struct QuantEngine {
       portfolioCorrelation: 0, correlationReason: "")
   }
 
-  // MARK: - MES (Model Edge Score)
+  // MARK: - MES
 
   private func computeMES(
     ev: Double, robustEV: Double, q: Quote, p: Double,
@@ -433,23 +469,54 @@ struct QuantEngine {
 
   // MARK: - Model helpers
 
+  /// H/A-aware lambda estimation:
+  /// - Для домашней команды берём её домашние gf/ga, если выборка ≥ 6
+  /// - Аналогично для гостевой команды
+  /// - Иначе используем общую выборку с H/A-компонентой как модификатор
   private func estimateLambdas(
     _ h: [TeamRecord], _ a: [TeamRecord]
   ) -> (Double, Double)? {
+    // Разделяем на home / away
+    let hHome = h.filter { $0.isHome }
+    let aAway = a.filter { !$0.isHome }
+
     func shrink(_ x: [Double?]) -> Double? {
       QuantMath.shrink(x.compactMap { $0 }, baseline: nil, k: 8)
     }
-    guard let hgf = shrink(h.map { $0.gf }),
-          let hga = shrink(h.map { $0.ga }),
-          let agf = shrink(a.map { $0.gf }),
-          let aga = shrink(a.map { $0.ga })
+
+    // Атака хозяев: домашние матчи + общий fallback
+    let hGfHome = shrink(hHome.map { $0.gf })
+    let hGfAll = shrink(h.map { $0.gf })
+    let hAtt = hGfHome ?? hGfAll
+
+    // Защита хозяев: домашние пропущенные + общий fallback
+    let hGaHome = shrink(hHome.map { $0.ga })
+    let hGaAll = shrink(h.map { $0.ga })
+    let hDef = hGaHome ?? hGaAll
+
+    // Атака гостей: выездные забитые + общий fallback
+    let aGfAway = shrink(aAway.map { $0.gf })
+    let aGfAll = shrink(a.map { $0.gf })
+    let aAtt = aGfAway ?? aGfAll
+
+    // Защита гостей: выездные пропущенные + общий fallback
+    let aGaAway = shrink(aAway.map { $0.ga })
+    let aGaAll = shrink(a.map { $0.ga })
+    let aDef = aGaAway ?? aGaAll
+
+    guard let hAttV = hAtt, let hDefV = hDef,
+          let aAttV = aAtt, let aDefV = aDef
     else { return nil }
-    let hatt = 0.65 * (shrink(h.map { $0.xg }) ?? hgf) + 0.35 * hgf
-    let aatt = 0.65 * (shrink(a.map { $0.xg }) ?? agf) + 0.35 * agf
-    let hdef = 0.65 * hga + 0.35 * (shrink(h.map { $0.oppXg }) ?? hga)
-    let adef = 0.65 * aga + 0.35 * (shrink(a.map { $0.oppXg }) ?? aga)
-    let lh = max(0.08, 0.56 * hatt + 0.44 * adef)
-    let la = max(0.08, 0.56 * aatt + 0.44 * hdef)
+
+    // xG как уточнение, если доступно
+    let hXg = shrink(h.map { $0.xg })
+    let aXg = shrink(a.map { $0.xg })
+    let hAttFinal = hXg.map { 0.6 * $0 + 0.4 * hAttV } ?? hAttV
+    let aAttFinal = aXg.map { 0.6 * $0 + 0.4 * aAttV } ?? aAttV
+
+    // λ_home = (attack_home + defense_away) / 2 с H/A weighting
+    let lh = max(0.08, 0.55 * hAttFinal + 0.45 * aDefV + 0.15)  // +0.15 = домашнее преимущество
+    let la = max(0.08, 0.55 * aAttFinal + 0.45 * hDefV)
     return (lh, la)
   }
 
@@ -504,21 +571,32 @@ struct QuantEngine {
       playersUsed: scored.count, top: top.map { $0.0 })
   }
 
+  /// Referee profile с beta shrinkage + RSI
   private func refereeProfile(_ records: [TeamRecord], _ name: String?) -> RefProfile {
     guard let name else {
-      return RefProfile(n: 0, cards: nil, fouls: nil, confidence: 0)
+      return RefProfile(n: 0, cards: nil, fouls: nil, confidence: 0, rsi: 50)
     }
     let r = records.filter {
       ($0.referee ?? "").caseInsensitiveCompare(name) == .orderedSame
     }
     let cards = r.map { ($0.cards ?? 0) + ($0.oppCards ?? 0) }
-    let base = QuantMath.mean(
-      records.compactMap { ($0.cards ?? 0) + ($0.oppCards ?? 0) }) ?? 4
-    let w = Double(r.count) / Double(r.count + 8)
-    let shrunk = cards.map { w * $0 + (1 - w) * base }
+    let allCards = records.compactMap { ($0.cards ?? 0) + ($0.oppCards ?? 0) }
+
+    // Beta-shrunk карточки за игру
+    let leagueMean = QuantMath.mean(allCards) ?? 4.0
+    let totalCardsInt = Int(cards.reduce(0, +))
+    let totalGames = max(cards.count, 1)
+    let shrunkAvg = QuantMath.betaShrink(
+      totalCardsInt, totalGames * 4, priorMean: leagueMean / 8.0, priorStrength: 4) * 8.0
+
+    // RSI судьи
+    let rsi = QuantMath.refereeRSI(
+      cardsPerGame: shrunkAvg, leagueMean: leagueMean, n: cards.count)
+
     return RefProfile(
-      n: r.count, cards: QuantMath.mean(shrunk), fouls: nil,
-      confidence: min(100, Double(r.count) / 15 * 100))
+      n: r.count, cards: shrunkAvg, fouls: nil,
+      confidence: min(100, Double(r.count) / 15 * 100),
+      rsi: rsi)
   }
 
   private func blendRef(base: Double, ref: Double, n: Int) -> Double {
@@ -539,11 +617,6 @@ struct QuantEngine {
     return QuantMath.variance(x) ?? max(1, QuantMath.mean(x) ?? 1)
   }
 
-  private func goalVariance(_ r: [TeamRecord]) -> Double {
-    let x = r.compactMap { $0.gf }
-    return QuantMath.variance(x) ?? max(1, QuantMath.mean(x) ?? 2.5)
-  }
-
   private func totalProbability(_ q: Quote, mean: Double, variance: Double) -> Double {
     guard let line = q.line else {
       return min(0.9, max(0.1, 1 - exp(-mean)))
@@ -554,17 +627,26 @@ struct QuantEngine {
     return isUnder ? 1 - over : over
   }
 
+  /// distributionOver с поддержкой азиатских линий через splitQuarterLine.
   private func distributionOver(
     mean: Double, variance: Double, line: Double
   ) -> Double {
-    let frac = line.rounded() - line
-    if abs(abs(frac) - 0.25) < 0.001 || abs(abs(frac) - 0.75) < 0.001 {
-      let lo = floor(line * 2) / 2
-      let hi = ceil(line * 2) / 2
-      let a = distributionOver(mean: mean, variance: variance, line: lo)
-      let b = distributionOver(mean: mean, variance: variance, line: hi)
-      return 0.5 * a + 0.5 * b
+    let lines = QuantMath.splitQuarterLine(line)
+
+    if lines.count == 1 {
+      return singleLineOver(mean: mean, variance: variance, line: lines[0])
     }
+
+    // Quarter line: 0.5 × P(over l1) + 0.5 × P(over l2)
+    let l1 = lines[0]
+    let l2 = lines[1]
+    let p1 = singleLineOver(mean: mean, variance: variance, line: l1)
+    let p2 = singleLineOver(mean: mean, variance: variance, line: l2)
+    return 0.5 * p1 + 0.5 * p2
+  }
+
+  private func singleLineOver(mean: Double, variance: Double, line: Double) -> Double {
+    // NB при повышенной дисперсии
     if variance > mean * 1.08 {
       let k = Int(floor(line))
       var cdf = 0.0
@@ -575,6 +657,7 @@ struct QuantEngine {
       }
       return 1 - cdf
     }
+    // Poisson через Dixon–Coles
     let m = QuantMath.dixonColes(mean / 2, mean / 2, rho: 0, maxGoals: 20)
     let seedValue = UInt64(abs(Int(mean * 100)) + 17)
     return QuantMath.monteCarloTotal(

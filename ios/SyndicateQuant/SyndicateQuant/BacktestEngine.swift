@@ -46,15 +46,12 @@ struct WalkForwardReport {
 
   var equityCurve: [Double] = []
 
-  // Разбивки
   var perLeague: [String: SegmentStats] = [:]
   var perMarket: [String: SegmentStats] = [:]
   var byEVBucket: [String: SegmentStats] = [:]
   var byClassification: [String: SegmentStats] = [:]
   var byOddsBand: [String: SegmentStats] = [:]
   var byWeek: [String: SegmentStats] = [:]
-
-  // MARK: - Computed metrics
 
   var roi: Double { staked > 0 ? profit / staked : 0 }
   var yieldPct: Double { roi }
@@ -68,8 +65,6 @@ struct WalkForwardReport {
   var profitFactor: Double {
     grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? 99 : 0)
   }
-
-  /// Sharpe: среднее / sd(returns) — без нормировки на длину (посмотреть в относительных величинах)
   var sharpe: Double {
     guard bets > 1 else { return 0 }
     let mean = returnSum / Double(bets)
@@ -77,8 +72,6 @@ struct WalkForwardReport {
     let sd = variance > 0 ? sqrt(variance) : 0
     return sd > 0 ? mean / sd : 0
   }
-
-  /// Sortino: среднее / sd(только отрицательных returns)
   var sortino: Double {
     guard negativeReturnCount > 0 else { return 0 }
     let mean = returnSum / Double(bets)
@@ -110,7 +103,6 @@ struct WalkForwardBacktester {
 
       r.matches += 1
 
-      // Walk-forward: только записи ДО даты матча
       let matchStart = match.start ?? .distantFuture
       let hs = (histories[h] ?? []).filter { ($0.date ?? .distantPast) < matchStart }
       let awayRecords = (histories[a] ?? []).filter {
@@ -128,7 +120,6 @@ struct WalkForwardBacktester {
           match: match, info: infoJSON, oddsJSON: oddsJSON,
           homeHistory: hs, awayHistory: awayRecords))
 
-      // Ключ недели (год + номер ISO-недели)
       let weekKey: String = {
         guard let d = match.start else { return "unknown" }
         let c = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: d)
@@ -142,33 +133,42 @@ struct WalkForwardBacktester {
         r.staked += s.stake
         r.oddsSum += s.odds
 
-        guard let actual = actualResult(match: match, signal: s) else { continue }
+        guard let outcome = settle(match: match, signal: s) else { continue }
 
-        // Brier
+        // probabilityValue: WIN=1, PUSH=0.5, LOSS=0
+        let actualVal = outcome.probabilityValue
         let predicted = s.probability
-        r.brierSum += (predicted - actual) * (predicted - actual)
+        r.brierSum += (predicted - actualVal) * (predicted - actualVal)
+        r.logLossSum += QuantMath.logLoss(predicted: predicted, actual: actualVal)
 
-        // LogLoss
-        let eps = 1e-9
-        let clamped = min(1 - eps, max(eps, predicted))
-        let ll: Double = actual == 1 ? -log(clamped) : -log(1 - clamped)
-        r.logLossSum += ll
+        // PnL через multiplier
+        let pnlMultiplier = outcome.pnlMultiplier(odds: s.odds)
+        let pnl = s.stake * pnlMultiplier
 
-        let pnl: Double
-        if actual == 1 {
+        switch outcome {
+        case .win:
           r.wins += 1
-          pnl = s.stake * (s.odds - 1)
           r.grossWin += pnl
           lossStreak = 0
-        } else if actual == 0.5 {
+        case .halfWin:
+          r.wins += 1
+          r.grossWin += pnl
+          lossStreak = 0
+        case .push:
           r.pushes += 1
-          pnl = 0
-        } else {
+          lossStreak = 0
+        case .halfLoss:
           r.losses += 1
-          pnl = -s.stake
-          r.grossLoss += s.stake
+          r.grossLoss += abs(pnl)
           lossStreak += 1
           r.maxLosingStreak = max(r.maxLosingStreak, lossStreak)
+        case .loss:
+          r.losses += 1
+          r.grossLoss += abs(pnl)
+          lossStreak += 1
+          r.maxLosingStreak = max(r.maxLosingStreak, lossStreak)
+        case .void:
+          break
         }
 
         r.profit += pnl
@@ -177,7 +177,6 @@ struct WalkForwardBacktester {
         r.maxDrawdown = max(r.maxDrawdown, peak - equity)
         r.equityCurve.append(equity)
 
-        // Returns для Sharpe/Sortino (нормированные на stake)
         let ret = s.stake > 0 ? pnl / s.stake : 0
         r.returnSum += ret
         r.returnSumSq += ret * ret
@@ -186,19 +185,18 @@ struct WalkForwardBacktester {
           r.negativeReturnCount += 1
         }
 
-        // Сегментация
         accumulate(&r.perLeague, key: match.league,
-                   actual: actual, stake: s.stake, odds: s.odds, pnl: pnl)
+                   outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.perMarket, key: s.market,
-                   actual: actual, stake: s.stake, odds: s.odds, pnl: pnl)
+                   outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.byEVBucket, key: evBucket(s.ev),
-                   actual: actual, stake: s.stake, odds: s.odds, pnl: pnl)
+                   outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.byClassification, key: s.classification,
-                   actual: actual, stake: s.stake, odds: s.odds, pnl: pnl)
+                   outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.byOddsBand, key: oddsBand(s.odds),
-                   actual: actual, stake: s.stake, odds: s.odds, pnl: pnl)
+                   outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.byWeek, key: weekKey,
-                   actual: actual, stake: s.stake, odds: s.odds, pnl: pnl)
+                   outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
       }
     }
     return r
@@ -209,7 +207,7 @@ struct WalkForwardBacktester {
   private func accumulate(
     _ dict: inout [String: SegmentStats],
     key: String,
-    actual: Double,
+    outcome: AsianOutcome,
     stake: Double,
     odds: Double,
     pnl: Double
@@ -220,9 +218,12 @@ struct WalkForwardBacktester {
     seg.staked += stake
     seg.oddsSum += odds
     seg.profit += pnl
-    if actual == 1 { seg.wins += 1 }
-    else if actual == 0.5 { seg.pushes += 1 }
-    else { seg.losses += 1 }
+    switch outcome {
+    case .win, .halfWin: seg.wins += 1
+    case .push: seg.pushes += 1
+    case .loss, .halfLoss: seg.losses += 1
+    case .void: break
+    }
     dict[key] = seg
   }
 
@@ -240,26 +241,28 @@ struct WalkForwardBacktester {
     return "Odds 5.0+"
   }
 
-  private func actualResult(match: Match, signal: BetSignal) -> Double? {
+  /// Правильный settlement через AsianOutcome.
+  private func settle(match: Match, signal: BetSignal) -> AsianOutcome? {
     guard let h = match.homeFT, let a = match.awayFT else { return nil }
+
     if signal.market == "1X2" {
       let sel = signal.selection.lowercased()
       let win: Bool
       if sel.contains("home") || sel == "1" { win = h > a }
       else if sel.contains("draw") || sel == "x" { win = h == a }
       else { win = a > h }
-      return win ? 1 : 0
+      return win ? .win : .loss
     }
+
     guard let line = signal.line else { return nil }
-    let total = h + a
-    let over = signal.selection.lowercased().contains("over")
+    let total = Int(h + a)
+    let isOver = signal.selection.lowercased().contains("over")
       || signal.selection.lowercased().hasPrefix("o")
-    if abs(line.rounded() - line) < 0.001 && Double(Int(line)) == total { return 0.5 }
-    return over ? (total > line ? 1 : 0) : (total < line ? 1 : 0)
+    return QuantMath.settleAsianTotal(total: total, line: line, isOver: isOver)
   }
 }
 
-// MARK: - CalibrationEngine (оставлен для совместимости)
+// MARK: - CalibrationEngine (совместимость)
 
 struct CalibrationEngine {
   static func brier(_ samples: [CalibrationSample]) -> Double {
