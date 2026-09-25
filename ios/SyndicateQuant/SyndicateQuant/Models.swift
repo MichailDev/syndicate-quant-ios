@@ -205,12 +205,11 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
-// MARK: - Tuning config (Волна F)
+// MARK: - Tuning config (F)
 
 @Model final class TuningConfig {
   @Attribute(.unique) var id: String
 
-  // Флаги механизмов (UI-переключаемые).
   var autoExcludeEnabled: Bool
   var posteriorEnabled: Bool
   var stopLossEnabled: Bool
@@ -218,7 +217,6 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var playerImpactEnabled: Bool
   var teamRatingEnabled: Bool
 
-  // Пороги.
   var posteriorWeight: Double
   var autoExcludeMinROI: Double
   var autoExcludeMinBets: Int
@@ -249,8 +247,8 @@ struct BetSignal: Identifiable, Codable, Hashable {
 @Model final class TuningEvent {
   @Attribute(.unique) var id: String
   var createdAt: Date
-  var kind: String       // "toggle" | "threshold" | "rollback" | "auto"
-  var target: String     // "posteriorWeight", "autoExcludeEnabled", ...
+  var kind: String
+  var target: String
   var beforeValue: String
   var afterValue: String
   var note: String
@@ -283,7 +281,7 @@ struct AutoDecision: Identifiable, Hashable {
   var summary: String
   var detail: String
   var enabled: Bool
-  var flagKey: String   // для toggle
+  var flagKey: String
 }
 
 @MainActor
@@ -323,7 +321,6 @@ enum TuningService {
     return (try? context.fetch(descriptor)) ?? []
   }
 
-  /// Откат последнего изменения порога.
   static func rollbackLastThreshold(in context: ModelContext) -> TuningEvent? {
     let descriptor = FetchDescriptor<TuningEvent>(
       sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
@@ -365,7 +362,6 @@ enum TuningService {
     return last
   }
 
-  /// Снимок решений, показываемый в панели Self-Tuning.
   static func decisions(
     config: TuningConfig,
     snapshot: BacktestSnapshot?,
@@ -374,7 +370,6 @@ enum TuningService {
   ) -> [AutoDecision] {
     var out: [AutoDecision] = []
 
-    // Auto-Exclude
     let rules = snapshot.map {
       AutoExclude.rules(
         from: $0,
@@ -394,7 +389,6 @@ enum TuningService {
       enabled: config.autoExcludeEnabled,
       flagKey: "autoExcludeEnabled"))
 
-    // Posterior
     let buckets = snapshot?.decodedPosteriorBuckets() ?? []
     let usable = buckets.filter { $0.n >= 20 }.count
     out.append(AutoDecision(
@@ -408,7 +402,6 @@ enum TuningService {
       enabled: config.posteriorEnabled,
       flagKey: "posteriorEnabled"))
 
-    // Stop-loss
     let streak = VolatilityStop.evaluate(
       journal,
       capThreshold: config.stopLossCapStreak,
@@ -423,7 +416,6 @@ enum TuningService {
       enabled: config.stopLossEnabled,
       flagKey: "stopLossEnabled"))
 
-    // Correlation
     out.append(AutoDecision(
       id: "correlation",
       title: "Correlation matrix",
@@ -434,7 +426,6 @@ enum TuningService {
       enabled: config.correlationEnabled,
       flagKey: "correlationEnabled"))
 
-    // Player impact
     out.append(AutoDecision(
       id: "playerimpact",
       title: "Player impact",
@@ -445,7 +436,6 @@ enum TuningService {
       enabled: config.playerImpactEnabled,
       flagKey: "playerImpactEnabled"))
 
-    // Team rating
     out.append(AutoDecision(
       id: "teamrating",
       title: "Team rating (Elo)",
@@ -460,7 +450,7 @@ enum TuningService {
   }
 }
 
-// MARK: - Volatility stop (B5, параметризовано под F)
+// MARK: - Volatility stop (B5)
 
 enum VolatilityState: Equatable {
   case normal
@@ -674,12 +664,9 @@ enum CorrelationBuilder {
     let (lc, ln) = toCorr(leagueSum)
 
     return CorrelationMatrix(
-      marketPairs: mc,
-      leaguePairs: lc,
-      marketPairsN: mn,
-      leaguePairsN: ln,
-      totalPairs: totalPairs,
-      lastUpdated: Date())
+      marketPairs: mc, leaguePairs: lc,
+      marketPairsN: mn, leaguePairsN: ln,
+      totalPairs: totalPairs, lastUpdated: Date())
   }
 }
 
@@ -948,7 +935,7 @@ extension BacktestSnapshot {
   }
 }
 
-// MARK: - Auto-Exclude (параметризовано под F)
+// MARK: - Auto-Exclude
 
 enum AutoExclude {
   static let defaultMinBets = 20
@@ -1341,7 +1328,7 @@ final class AppDependencies {
   private init() {}
 }
 
-// MARK: - BacktestService
+// MARK: - BacktestService (G2 + G3)
 
 @MainActor
 final class BacktestService {
@@ -1744,7 +1731,7 @@ final class BacktestService {
   }
 }
 
-// MARK: - ScanCoordinator (слушает TuningConfig)
+// MARK: - ScanCoordinator (F: слушает TuningConfig)
 
 @MainActor
 final class ScanCoordinator {
@@ -1792,13 +1779,11 @@ final class ScanCoordinator {
     let journalContext = container.map { ModelContext($0) }
     let ratingContext = container.map { ModelContext($0) }
 
-    // F: читаем конфиг тюнинга.
     let tuning: TuningConfig = {
       guard let ctx = journalContext else { return TuningConfig() }
       return TuningService.fetchOrCreate(in: ctx)
     }()
 
-    // B4: корреляция из журнала.
     let corrMatrix: CorrelationMatrix = {
       guard let ctx = journalContext else { return .empty }
       let descriptor = FetchDescriptor<JournalEntry>()
@@ -1807,7 +1792,6 @@ final class ScanCoordinator {
     }()
     summary.correlationPairs = corrMatrix.marketPairsN.count + corrMatrix.leaguePairsN.count
 
-    // B5: серия проигрышей.
     let streak: (streak: Int, state: VolatilityState) = {
       guard let ctx = journalContext else { return (0, .normal) }
       let descriptor = FetchDescriptor<JournalEntry>()
@@ -1820,7 +1804,6 @@ final class ScanCoordinator {
     summary.lossStreak = streak.streak
     summary.volatilityLabel = tuning.stopLossEnabled ? streak.state.label : "OFF"
 
-    // F: применяем флаги.
     if !tuning.stopLossEnabled {
       summary.notes.append("Self-Tuning: stop-loss отключён")
     } else if streak.streak > 0 {
@@ -1857,7 +1840,6 @@ final class ScanCoordinator {
       }
       let matches = all.prefix(resolvedSettings.scanMatches)
 
-      // B2: posterior buckets (если включён).
       let posteriorBuckets: [PosteriorBucket] = tuning.posteriorEnabled
         ? Self.loadPosteriorBuckets()
         : []
@@ -1866,7 +1848,6 @@ final class ScanCoordinator {
         summary.notes.append("Posterior: \(usableBuckets) надёжных бакетов")
       }
 
-      // G6: Auto-Exclude (если включён).
       let excludedRules: [AutoExcludeRule] = tuning.autoExcludeEnabled
         ? Self.loadExcludedRules(
             minROI: tuning.autoExcludeMinROI,
@@ -1874,7 +1855,6 @@ final class ScanCoordinator {
         : []
       let excludedCount = excludedRules.filter { $0.excluded }.count
 
-      // B5: stopLoss state по конфигу.
       let stopState: VolatilityState = tuning.stopLossEnabled
         ? streak.state : .normal
 
@@ -1898,7 +1878,6 @@ final class ScanCoordinator {
         }
         let glicko = try? await client.glicko(match.id)
 
-        // B3: локальные рейтинги (если включён).
         let ratings: (Double?, Double?) = {
           guard tuning.teamRatingEnabled, let ctx = ratingContext else {
             return (nil, nil)
@@ -1909,7 +1888,6 @@ final class ScanCoordinator {
           )
         }()
 
-        // B6: ожидаемые составы (если включён).
         let lineups: (home: [String], away: [String])? = {
           guard tuning.playerImpactEnabled else { return nil }
           return Self.parseUpcomingLineups(from: info)
@@ -2057,4 +2035,88 @@ final class ScanCoordinator {
     let bad = ["friendly", "women", "женщ", "u19 women", "u20 women"]
     return bad.contains(where: x.contains)
   }
+}
+
+// MARK: - Волна C: Odds format + Theme + Deep-link (C)
+
+enum OddsFormat: String, CaseIterable, Identifiable {
+  case eu, us, uk
+  var id: String { rawValue }
+  var label: String {
+    switch self {
+    case .eu: return "EU"
+    case .us: return "US"
+    case .uk: return "UK"
+    }
+  }
+  var hint: String {
+    switch self {
+    case .eu: return "Десятичные · 2.10"
+    case .us: return "Американские · +110 / −150"
+    case .uk: return "Дробные · 11/10"
+    }
+  }
+}
+
+enum AppColorScheme: String, CaseIterable, Identifiable {
+  case system, light, dark
+  var id: String { rawValue }
+  var label: String {
+    switch self {
+    case .system: return "Система"
+    case .light: return "Светлая"
+    case .dark: return "Тёмная"
+    }
+  }
+}
+
+enum OddsFormatter {
+  static func format(_ value: Double, as format: OddsFormat) -> String {
+    guard value > 1.0 else { return "—" }
+    switch format {
+    case .eu:
+      return String(format: "%.2f", value)
+    case .us:
+      if value >= 2.0 {
+        return String(format: "+%d", Int(round((value - 1) * 100)))
+      } else {
+        return String(format: "−%d", Int(round(100 / (value - 1))))
+      }
+    case .uk:
+      let frac = fractional(value)
+      return "\(frac.0)/\(frac.1)"
+    }
+  }
+
+  private static func fractional(_ value: Double) -> (Int, Int) {
+    let net = value - 1.0
+    guard net > 0 else { return (0, 1) }
+    var bestNum = 1
+    var bestDen = 1
+    var bestErr = Double.greatestFiniteMagnitude
+    for den in 1...20 {
+      let num = Int(round(net * Double(den)))
+      if num < 1 { continue }
+      let approx = Double(num) / Double(den)
+      let err = abs(approx - net)
+      if err < bestErr {
+        bestErr = err
+        bestNum = num
+        bestDen = den
+      }
+    }
+    return (bestNum, bestDen)
+  }
+}
+
+// MARK: - Notification name for deep-link (C1)
+
+extension Notification.Name {
+  static let openSignal = Notification.Name("com.syndicatequant.openSignal")
+}
+
+// MARK: - Wrapper для sheet(item:) (C1)
+
+struct SignalIDWrapper: Identifiable {
+  let id: String
 }

@@ -1,5 +1,6 @@
 @preconcurrency import BackgroundTasks
 @preconcurrency import UIKit
+@preconcurrency import UserNotifications
 import SwiftData
 
 @MainActor
@@ -11,7 +12,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
-    // Волна A: BGAppRefreshTask — сканирование + авто-settle.
     BGTaskScheduler.shared.register(
       forTaskWithIdentifier: Self.refreshID,
       using: nil
@@ -23,7 +23,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
       AppDelegate.handle(refreshTask)
     }
 
-    // Волна G: BGProcessingTask — сбор/докачка backtest-базы.
     BGTaskScheduler.shared.register(
       forTaskWithIdentifier: Self.processingID,
       using: nil
@@ -34,6 +33,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
       }
       AppDelegate.handleProcessing(processing)
     }
+
+    UNUserNotificationCenter.current().delegate = self
 
     NotificationService.request()
     Self.scheduleNextRefresh()
@@ -94,11 +95,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
   // MARK: - BGProcessingTask (Волна G)
 
   nonisolated private static func handleProcessing(_ task: BGProcessingTask) {
-    // Планируем следующее воскресенье сразу.
     scheduleWeeklyProcessing()
 
     let work = Task { @MainActor in
-      // G3: докачка базы за неделю. G2 — отдельный вызов из UI (полный сбор).
       let ok = await BacktestService.shared.updateIncremental()
       task.setTaskCompleted(success: ok)
     }
@@ -121,12 +120,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
   }
 
-  /// Ближайшее воскресенье, 02:00 по локальному времени.
   nonisolated private static func nextSundayEarlyMorning() -> Date {
     var cal = Calendar(identifier: .gregorian)
     cal.timeZone = TimeZone.current
     var comps = DateComponents()
-    comps.weekday = 1  // Sunday
+    comps.weekday = 1
     comps.hour = 2
     comps.minute = 0
     if let next = cal.nextDate(
@@ -136,5 +134,36 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
       return next
     }
     return Date().addingTimeInterval(7 * 24 * 3600)
+  }
+}
+
+// MARK: - UNUserNotificationCenterDelegate (C1: deep-link)
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+
+  nonisolated func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse,
+    withCompletionHandler completionHandler: @escaping () -> Void
+  ) {
+    let userInfo = response.notification.request.content.userInfo
+    // NotificationService пишет ключ "signal_id" в content.userInfo.
+    if let signalID = userInfo["signal_id"] as? String {
+      DispatchQueue.main.async {
+        NotificationCenter.default.post(
+          name: .openSignal,
+          object: nil,
+          userInfo: ["signalID": signalID])
+      }
+    }
+    completionHandler()
+  }
+
+  nonisolated func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    completionHandler([.banner, .sound])
   }
 }
