@@ -24,7 +24,6 @@ struct RootView: View {
 
   private var currentSnapshot: BacktestSnapshot? { snapshots.first }
 
-  // B4: матрица из журнала (строится на лету).
   private var correlationMatrix: CorrelationMatrix {
     CorrelationBuilder.build(from: journal)
   }
@@ -491,9 +490,6 @@ struct RootView: View {
     Section("Player impact (B6)") {
       Text("Применяется, когда в gameInfo есть состав (lineups) и у команды ≥ 6 игроков в истории. Отсутствие топ-8 → −5…−12% к λ.")
         .font(.caption).foregroundStyle(.secondary)
-      let withPlayers = journal.filter { !$0.home.isEmpty }
-        .prefix(1).count  // заглушка, чтобы не было пустого разделения
-      _ = withPlayers
       Text("Статус: ожидание данных от API. Ключи, которые пробуются: lineups, homeLineup/awayLineup, homePlayers/awayPlayers.")
         .font(.caption2).foregroundStyle(.secondary)
     }
