@@ -139,65 +139,13 @@ struct QuantEngine {
     return recordFromGame(game, teamID: targetID, isHome: targetID == hid)
   }
 
-  // MARK: - Model (B1: Ensemble DC + Bivariate + NB-flavoured)
+  // MARK: - Model (public API, без ratings/lineups — для backtest)
 
   func model(home: [TeamRecord], away: [TeamRecord], glicko: JSONValue? = nil) -> MatchModel? {
-    guard let base = estimateLambdas(home, away) else { return nil }
-    let ph = playerAssembly(home)
-    let pa = playerAssembly(away)
-    let player = (base.0 * ph.factor, base.1 * pa.factor)
-    let final = glickoAdjust(player, teamRatings: (nil, nil), glickoJSON: glicko)
-
-    let maxGoals = 12
-
-    let dcMatrix = QuantMath.dixonColes(
-      final.0, final.1, rho: -0.055, maxGoals: maxGoals)
-    let bivarMatrix = QuantMath.bivariatePoisson(
-      final.0, final.1, l3: 0.05, maxGoals: maxGoals)
-    let nbMatrix = QuantMath.dixonColes(
-      final.0, final.1, rho: -0.020, maxGoals: maxGoals)
-
-    let oDC = QuantMath.outcomes(dcMatrix)
-    let oBiv = QuantMath.outcomes(bivarMatrix)
-    let oNB = QuantMath.outcomes(nbMatrix)
-
-    let combined = home + away
-    let xgValues = combined.compactMap { $0.xg }
-    let avgXG: Double? = xgValues.isEmpty
-      ? nil
-      : xgValues.reduce(0, +) / Double(xgValues.count)
-
-    var wDC = 0.55
-    var wBiv = 0.25
-    var wNB = 0.20
-    if let ax = avgXG {
-      if ax < 1.0 {
-        wDC = 0.30; wBiv = 0.55; wNB = 0.15
-      } else if ax > 1.8 {
-        wDC = 0.40; wBiv = 0.10; wNB = 0.50
-      }
-    }
-    let wSum = wDC + wBiv + wNB
-    wDC /= wSum; wBiv /= wSum; wNB /= wSum
-
-    let ensembleHome = wDC * oDC.home + wBiv * oBiv.home + wNB * oNB.home
-    let ensembleDraw = wDC * oDC.draw + wBiv * oBiv.draw + wNB * oNB.draw
-    let ensembleAway = wDC * oDC.away + wBiv * oBiv.away + wNB * oNB.away
-
-    let primaryMatrix: Matrix2D
-    if wDC >= wBiv && wDC >= wNB { primaryMatrix = dcMatrix }
-    else if wBiv >= wNB { primaryMatrix = bivarMatrix }
-    else { primaryMatrix = nbMatrix }
-
-    return MatchModel(
-      lh: final.0, la: final.1,
-      baseLH: base.0, baseLA: base.1,
-      baseMatrix: dcMatrix, playerMatrix: dcMatrix, matrix: primaryMatrix,
-      outcomes: (ensembleHome, ensembleDraw, ensembleAway),
-      components: [oDC.home, oDC.draw, oDC.away, ensembleHome, ensembleDraw, ensembleAway],
-      playerHome: ph, playerAway: pa,
-      ensembleWeights: (dc: wDC, biv: wBiv, nb: wNB),
-      ensembleAvgXG: avgXG)
+    modelWithRatings(
+      home: home, away: away, glicko: glicko,
+      teamRatings: (nil, nil),
+      playerImpact: (1.0, 1.0))
   }
 
   // MARK: - Signals
@@ -207,11 +155,19 @@ struct QuantEngine {
     homeHistory: [TeamRecord], awayHistory: [TeamRecord],
     glicko: JSONValue? = nil,
     posteriorBuckets: [PosteriorBucket] = [],
-    teamRatings: (home: Double?, away: Double?) = (nil, nil)
+    teamRatings: (home: Double?, away: Double?) = (nil, nil),
+    upcomingLineups: (home: [String], away: [String])? = nil
   ) -> [BetSignal] {
-    guard let matchModel = self.modelWithRatings(
+    // B6: player impact
+    let hImpact = playerImpact(
+      history: homeHistory, expectedIDs: upcomingLineups?.home ?? [])
+    let aImpact = playerImpact(
+      history: awayHistory, expectedIDs: upcomingLineups?.away ?? [])
+
+    guard let matchModel = modelWithRatings(
       home: homeHistory, away: awayHistory, glicko: glicko,
-      teamRatings: teamRatings)
+      teamRatings: teamRatings,
+      playerImpact: (hImpact, aImpact))
     else { return [] }
 
     let quotes = parseQuotes(oddsJSON)
@@ -264,27 +220,36 @@ struct QuantEngine {
         continue
       }
 
-      if let s = finish(
+      if var s = finish(
         match: match, q: q, p: p, dcs: dcs, quotes: qs,
         sharp: sharp, modelOutcomes: matchModel.outcomes, modelName: modelName,
         sampleClass: sampleClass,
         homeSample: homeHistory.count, awaySample: awayHistory.count,
         posteriorBuckets: posteriorBuckets) {
+        if hImpact < 0.999 || aImpact < 0.999 {
+          s.playerImpactHome = hImpact
+          s.playerImpactAway = aImpact
+        }
         out.append(s)
       }
     }
     return out.sorted { $0.qcs > $1.qcs }
   }
 
-  /// Промежуточный model() с поддержкой teamRatings (не ломает публичный API).
+  // MARK: - Model with ratings & player impact
+
   private func modelWithRatings(
     home: [TeamRecord], away: [TeamRecord], glicko: JSONValue?,
-    teamRatings: (home: Double?, away: Double?)
+    teamRatings: (home: Double?, away: Double?),
+    playerImpact: (home: Double, away: Double)
   ) -> MatchModel? {
     guard let base = estimateLambdas(home, away) else { return nil }
     let ph = playerAssembly(home)
     let pa = playerAssembly(away)
-    let player = (base.0 * ph.factor, base.1 * pa.factor)
+    let player = (
+      base.0 * ph.factor * playerImpact.home,
+      base.1 * pa.factor * playerImpact.away
+    )
     let final = glickoAdjust(player, teamRatings: teamRatings, glickoJSON: glicko)
 
     let maxGoals = 12
@@ -336,6 +301,32 @@ struct QuantEngine {
       playerHome: ph, playerAway: pa,
       ensembleWeights: (dc: wDC, biv: wBiv, nb: wNB),
       ensembleAvgXG: avgXG)
+  }
+
+  // MARK: - B6: player impact
+
+  /// Возвращает множитель λ на основе отсутствия ключевых игроков.
+  /// Если данных о составах нет → 1.0.
+  private func playerImpact(
+    history: [TeamRecord], expectedIDs: [String]
+  ) -> Double {
+    guard !expectedIDs.isEmpty else { return 1.0 }
+    let pa = playerAssembly(history)
+    guard pa.playersUsed >= 6, !pa.top.isEmpty else { return 1.0 }
+
+    let expectedSet = Set(expectedIDs.map { $0.lowercased() })
+
+    var missing = 0
+    for p in pa.top {
+      let idMatch = expectedSet.contains(p.id.lowercased())
+      let nameMatch = !p.name.isEmpty && expectedSet.contains(p.name.lowercased())
+      if !idMatch && !nameMatch { missing += 1 }
+    }
+
+    if missing <= 2 { return 1.0 }
+    if missing == 3 { return 0.95 }
+    if missing == 4 { return 0.92 }
+    return 0.88
   }
 
   // MARK: - Probability calculations
@@ -526,17 +517,15 @@ struct QuantEngine {
     return "X NO BET"
   }
 
-  // MARK: - Portfolio (B5: stopLoss)
+  // MARK: - Portfolio (B4 + B5)
 
   func portfolio(
     _ signals: [BetSignal],
     excludedRules: [AutoExcludeRule] = [],
-    stopLoss: VolatilityState = .normal
+    stopLoss: VolatilityState = .normal,
+    correlationMatrix: CorrelationMatrix? = nil
   ) -> [BetSignal] {
-    // B5: пауза — никаких ставок.
-    if stopLoss.isPause {
-      return []
-    }
+    if stopLoss.isPause { return [] }
 
     var chosen: [BetSignal] = []
     var totalExposure = 0.0
@@ -557,10 +546,10 @@ struct QuantEngine {
       var maxCorr = 0.0
       var reason = ""
       for prev in chosen {
-        let c = correlation(s, prev)
+        let c = correlation(s, prev, matrix: correlationMatrix)
         if c > maxCorr {
           maxCorr = c
-          reason = correlationReason(s, prev)
+          reason = correlationReason(s, prev, corr: c, matrix: correlationMatrix)
         }
       }
       if maxCorr >= 0.65 { continue }
@@ -582,7 +571,12 @@ struct QuantEngine {
     return chosen
   }
 
-  private func correlation(_ a: BetSignal, _ b: BetSignal) -> Double {
+  /// B4: если для пары есть эмпирика (n≥20), используем её. Иначе — hardcoded.
+  private func correlation(
+    _ a: BetSignal, _ b: BetSignal,
+    matrix: CorrelationMatrix?
+  ) -> Double {
+    // Same game — жёстко, эмпирику не строим (данных мало).
     if a.gameID == b.gameID {
       if a.market == b.market { return 0.82 }
       let pair = Set([a.market, b.market])
@@ -595,14 +589,31 @@ struct QuantEngine {
         || a.away == b.home || a.away == b.away {
       return 0.20
     }
+
+    // B4: эмпирическая корреляция.
+    if let m = matrix {
+      let mk = [a.market, b.market].sorted().joined(separator: "|")
+      if let corr = m.marketPairs[mk] { return corr }
+      let lk = [a.league, b.league].sorted().joined(separator: "|")
+      if let corr = m.leaguePairs[lk] { return corr }
+    }
     return 0.03
   }
 
-  private func correlationReason(_ a: BetSignal, _ b: BetSignal) -> String {
+  private func correlationReason(
+    _ a: BetSignal, _ b: BetSignal,
+    corr: Double, matrix: CorrelationMatrix?
+  ) -> String {
     if a.gameID == b.gameID && a.market == b.market { return "same market" }
     if a.gameID == b.gameID { return "same game" }
     if a.home == b.home || a.home == b.away
         || a.away == b.home || a.away == b.away { return "shared team" }
+    if let m = matrix {
+      let mk = [a.market, b.market].sorted().joined(separator: "|")
+      if m.marketPairs[mk] != nil { return "empirical mkt (\(mk))" }
+      let lk = [a.league, b.league].sorted().joined(separator: "|")
+      if m.leaguePairs[lk] != nil { return "empirical league (\(lk))" }
+    }
     return "independent"
   }
 
@@ -648,14 +659,12 @@ struct QuantEngine {
     return (lh, la)
   }
 
-  /// B3: приоритет — teamRatings (если оба не nil), иначе glicko JSON.
   private func glickoAdjust(
     _ pair: (Double, Double),
     teamRatings: (home: Double?, away: Double?),
     glickoJSON: JSONValue?
   ) -> (Double, Double) {
     if let h = teamRatings.home, let a = teamRatings.away {
-      // Elo-формула с HFA=60.
       let diff = (h + 60) - a
       let expectedHome = 1.0 / (1.0 + pow(10.0, -diff / 400.0))
       let edge = max(-1, min(1, (expectedHome - 0.5) * 2.0))

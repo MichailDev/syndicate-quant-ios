@@ -139,14 +139,14 @@ struct BetSignal: Identifiable, Codable, Hashable {
   let selection: String
   let line: Double?
   let odds: Double
-  var probability: Double        // финальная (с posterior); var → может меняться stop-loss'ом? нет, но оставлю let
+  let probability: Double
   let fairOdds: Double
   let ev: Double
   let robustEV: Double
   let model: String
   let timestamp: Date
   let classification: String
-  var stake: Double              // B5: может быть пересчитан stop-loss'ом
+  var stake: Double
   let priceAnomaly: Bool
   let bookmakers: Int
 
@@ -173,14 +173,16 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var portfolioCorrelation: Double
   var correlationReason: String
 
-  // B2: диагностика posterior
   var probabilityRaw: Double? = nil
   var posteriorWeight: Double? = nil
   var posteriorSource: String? = nil
 
-  // B5: диагностика stop-loss
   var stopApplied: String? = nil
   var stakeBeforeStop: Double? = nil
+
+  // B6: диагностика player impact.
+  var playerImpactHome: Double? = nil
+  var playerImpactAway: Double? = nil
 }
 
 // MARK: - Team rating (B3)
@@ -323,7 +325,6 @@ enum TeamRatingService {
     return r
   }
 
-  /// Возвращает рейтинг, только если у команды достаточно матчей.
   static func usableRating(
     for teamID: String, context: ModelContext
   ) -> Double? {
@@ -332,6 +333,94 @@ enum TeamRatingService {
     guard let r = try? context.fetch(descriptor).first,
           r.matches >= minMatchesForUse else { return nil }
     return r.rating
+  }
+}
+
+// MARK: - Correlation matrix (B4)
+
+struct CorrelationMatrix: Codable, Hashable {
+  var marketPairs: [String: Double]
+  var leaguePairs: [String: Double]
+  var marketPairsN: [String: Int]
+  var leaguePairsN: [String: Int]
+  var totalPairs: Int
+  var lastUpdated: Date
+
+  static let empty = CorrelationMatrix(
+    marketPairs: [:], leaguePairs: [:],
+    marketPairsN: [:], leaguePairsN: [:],
+    totalPairs: 0, lastUpdated: Date.distantPast)
+}
+
+enum CorrelationBuilder {
+  static let minPairs = 20
+
+  static func build(from journal: [JournalEntry]) -> CorrelationMatrix {
+    let closed = journal.filter {
+      $0.status == "CLOSED" && ($0.result == "WIN" || $0.result == "LOSS")
+    }
+    guard closed.count >= minPairs else { return .empty }
+
+    let cal = Calendar(identifier: .gregorian)
+    let byDay = Dictionary(grouping: closed) {
+      cal.startOfDay(for: $0.createdAt)
+    }
+
+    var marketSum: [String: (both: Double, a: Double, b: Double, n: Int)] = [:]
+    var leagueSum: [String: (both: Double, a: Double, b: Double, n: Int)] = [:]
+    var totalPairs = 0
+
+    for (_, entries) in byDay where entries.count >= 2 {
+      for i in 0..<entries.count {
+        for j in (i+1)..<entries.count {
+          let ea = entries[i]; let eb = entries[j]
+          if ea.gameID == eb.gameID { continue }
+          let aW = ea.result == "WIN" ? 1.0 : 0.0
+          let bW = eb.result == "WIN" ? 1.0 : 0.0
+
+          let mk = [ea.market, eb.market].sorted().joined(separator: "|")
+          var m = marketSum[mk] ?? (0, 0, 0, 0)
+          m.both += aW * bW; m.a += aW; m.b += bW; m.n += 1
+          marketSum[mk] = m
+
+          let lk = [ea.league, eb.league].sorted().joined(separator: "|")
+          var l = leagueSum[lk] ?? (0, 0, 0, 0)
+          l.both += aW * bW; l.a += aW; l.b += bW; l.n += 1
+          leagueSum[lk] = l
+
+          totalPairs += 1
+        }
+      }
+    }
+
+    func toCorr(
+      _ s: [String: (both: Double, a: Double, b: Double, n: Int)]
+    ) -> ([String: Double], [String: Int]) {
+      var corr: [String: Double] = [:]
+      var ns: [String: Int] = [:]
+      for (k, v) in s where v.n >= minPairs {
+        let n = Double(v.n)
+        let pAB = v.both / n
+        let pA = v.a / n
+        let pB = v.b / n
+        let denom = sqrt(pA * (1 - pA) * pB * (1 - pB))
+        let phi = denom > 1e-9 ? (pAB - pA * pB) / denom : 0
+        corr[k] = max(-1, min(1, phi))
+        ns[k] = v.n
+      }
+      return (corr, ns)
+    }
+
+    let (mc, mn) = toCorr(marketSum)
+    let (lc, ln) = toCorr(leagueSum)
+
+    return CorrelationMatrix(
+      marketPairs: mc,
+      leaguePairs: lc,
+      marketPairsN: mn,
+      leaguePairsN: ln,
+      totalPairs: totalPairs,
+      lastUpdated: Date())
   }
 }
 
@@ -458,7 +547,7 @@ enum TeamRatingService {
   }
 }
 
-// MARK: - Backtest snapshot (Волна G)
+// MARK: - Backtest snapshot
 
 struct StoredSegmentStats: Codable, Hashable {
   var bets: Int
@@ -839,7 +928,6 @@ enum JournalService {
       entry.status = "CLOSED"
       closed += 1
 
-      // B3: обновить TeamRating после матча.
       let ids = extractTeamIDs(from: game)
       if let hID = ids.home, let aID = ids.away {
         TeamRatingService.update(
@@ -1393,7 +1481,7 @@ final class BacktestService {
   }
 }
 
-// MARK: - ScanCoordinator (B2 + B3 + B5 + G6)
+// MARK: - ScanCoordinator (B2 + B3 + B4 + B5 + B6 + G6)
 
 @MainActor
 final class ScanCoordinator {
@@ -1412,6 +1500,9 @@ final class ScanCoordinator {
     var success: Bool = false
     var lossStreak: Int = 0
     var volatilityLabel: String = "NORMAL"
+    // B4/B6 diagnostics
+    var correlationPairs: Int = 0
+    var lineupsFound: Int = 0
   }
 
   func scan(
@@ -1436,6 +1527,29 @@ final class ScanCoordinator {
 
     let container = AppDependencies.shared.container
     let ratingContext = container.map { ModelContext($0) }
+    let journalContext = container.map { ModelContext($0) }
+
+    // B4: корреляционная матрица из журнала.
+    let corrMatrix: CorrelationMatrix = {
+      guard let ctx = journalContext else { return .empty }
+      let descriptor = FetchDescriptor<JournalEntry>()
+      guard let entries = try? ctx.fetch(descriptor) else { return .empty }
+      return CorrelationBuilder.build(from: entries)
+    }()
+    summary.correlationPairs = corrMatrix.marketPairsN.count + corrMatrix.leaguePairsN.count
+
+    // B5: серия проигрышей из журнала.
+    let streak: (streak: Int, state: VolatilityState) = {
+      guard let ctx = journalContext else { return (0, .normal) }
+      let descriptor = FetchDescriptor<JournalEntry>()
+      guard let entries = try? ctx.fetch(descriptor) else { return (0, .normal) }
+      return VolatilityStop.evaluate(entries)
+    }()
+    summary.lossStreak = streak.streak
+    summary.volatilityLabel = streak.state.label
+    if streak.streak > 0 {
+      summary.notes.append("LossStreak: \(streak.streak) · \(streak.state.label)")
+    }
 
     do {
       let client = SStatsClient(settings: resolvedSettings)
@@ -1463,16 +1577,9 @@ final class ScanCoordinator {
       let excludedRules = Self.loadExcludedRules()
       let excludedCount = excludedRules.filter { $0.excluded }.count
 
-      // B5: текущая серия проигрышей из журнала.
-      let streak = Self.loadLossStreak()
-      summary.lossStreak = streak.streak
-      summary.volatilityLabel = streak.state.label
-      if streak.streak > 0 {
-        summary.notes.append("LossStreak: \(streak.streak) · \(streak.state.label)")
-      }
-
       var signalsOut: [BetSignal] = []
       var count = 0
+      var lineupsFound = 0
       for match in matches {
         guard let h = match.homeID, let a = match.awayID else { continue }
         count += 1
@@ -1490,7 +1597,7 @@ final class ScanCoordinator {
         }
         let glicko = try? await client.glicko(match.id)
 
-        // B3: локальные рейтинги (если есть).
+        // B3: локальные рейтинги.
         let ratings: (Double?, Double?) = {
           guard let ctx = ratingContext else { return (nil, nil) }
           return (
@@ -1499,12 +1606,21 @@ final class ScanCoordinator {
           )
         }()
 
+        // B6: ожидаемые составы из gameInfo (если есть).
+        let lineups = Self.parseUpcomingLineups(from: info)
+        if lineups != nil { lineupsFound += 1 }
+
         let s = engine.signals(
           match: match, info: info, oddsJSON: oddsFromInfo,
           homeHistory: hs, awayHistory: awayRecords, glicko: glicko,
           posteriorBuckets: posteriorBuckets,
-          teamRatings: (home: ratings.0, away: ratings.1))
+          teamRatings: (home: ratings.0, away: ratings.1),
+          upcomingLineups: lineups)
         signalsOut.append(contentsOf: s)
+      }
+      summary.lineupsFound = lineupsFound
+      if lineupsFound > 0 {
+        summary.notes.append("Lineups: \(lineupsFound) матчей с составом")
       }
 
       let filtered = signalsOut.filter { s in
@@ -1519,9 +1635,16 @@ final class ScanCoordinator {
         summary.notes.append("Auto-Exclude: правил \(excludedCount), попаданий 0")
       }
 
+      if summary.correlationPairs > 0 {
+        summary.notes.append("Correlation: \(summary.correlationPairs) пар из журнала")
+      }
+
       summary.scannedMatches = count
       summary.signals = engine.portfolio(
-        filtered, excludedRules: excludedRules, stopLoss: streak.state)
+        filtered,
+        excludedRules: excludedRules,
+        stopLoss: streak.state,
+        correlationMatrix: corrMatrix)
       summary.finishedAt = Date()
       summary.success = true
 
@@ -1554,16 +1677,75 @@ final class ScanCoordinator {
     return snap.decodedPosteriorBuckets()
   }
 
-  private static func loadLossStreak() -> (streak: Int, state: VolatilityState) {
-    guard let container = AppDependencies.shared.container else {
-      return (0, .normal)
+  /// B6: достаёт ожидаемый состав из gameInfo, если он там есть.
+  /// Возвращает nil, если данных нет — тогда impact не применяется.
+  private static func parseUpcomingLineups(
+    from info: JSONValue
+  ) -> (home: [String], away: [String])? {
+    let data = info.object?["data"]?.object ?? info.object ?? [:]
+
+    // Вариант 1: { lineups: { home: [...], away: [...] } }
+    if let obj = data["lineups"]?.object {
+      let h = extractIDs(obj["home"]?.array ?? obj["homeTeam"]?.array ?? [])
+      let a = extractIDs(obj["away"]?.array ?? obj["awayTeam"]?.array ?? [])
+      if !h.isEmpty || !a.isEmpty { return (h, a) }
     }
-    let context = ModelContext(container)
-    let descriptor = FetchDescriptor<JournalEntry>()
-    guard let entries = try? context.fetch(descriptor) else {
-      return (0, .normal)
+
+    // Вариант 2: { lineups: [ {teamId, players:[...]}, {teamId, players:[...]} ] }
+    if let arr = data["lineups"]?.array, arr.count >= 2 {
+      let hTeamID = data["homeTeamId"]?.string
+        ?? data["homeTeam"]?.object?["id"]?.string
+      var h: [String] = []
+      var a: [String] = []
+      for item in arr {
+        guard let obj = item.object else { continue }
+        let teamID = obj["teamId"]?.string ?? obj["team"]?.string
+        let players = extractIDs(obj["players"]?.array ?? obj["lineup"]?.array ?? [])
+        if let t = teamID, let hID = hTeamID, t == hID {
+          h = players
+        } else if let t = teamID, let hID = hTeamID, t != hID {
+          a = players
+        } else if h.isEmpty {
+          h = players
+        } else {
+          a = players
+        }
+      }
+      if !h.isEmpty || !a.isEmpty { return (h, a) }
     }
-    return VolatilityStop.evaluate(entries)
+
+    // Вариант 3: homeLineup / awayLineup
+    let hArr = data["homeLineup"]?.array
+      ?? data["homePlayers"]?.array
+      ?? data["homeSquad"]?.array
+    let aArr = data["awayLineup"]?.array
+      ?? data["awayPlayers"]?.array
+      ?? data["awaySquad"]?.array
+    if hArr != nil || aArr != nil {
+      let h = extractIDs(hArr ?? [])
+      let a = extractIDs(aArr ?? [])
+      if !h.isEmpty || !a.isEmpty { return (h, a) }
+    }
+
+    return nil
+  }
+
+  private static func extractIDs(_ arr: [JSONValue]) -> [String] {
+    var out: [String] = []
+    for v in arr {
+      guard let o = v.object else { continue }
+      if let id = o["id"]?.string, !id.isEmpty {
+        out.append(id); continue
+      }
+      if let n = o["id"]?.number { out.append(String(Int(n))); continue }
+      if let pid = o["playerId"]?.string, !pid.isEmpty {
+        out.append(pid); continue
+      }
+      if let name = o["name"]?.string, !name.isEmpty {
+        out.append(name); continue
+      }
+    }
+    return out
   }
 
   private static func isExcluded(_ m: Match) -> Bool {

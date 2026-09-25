@@ -2,8 +2,6 @@ import Foundation
 import Network
 
 // MARK: - Response Cache
-// In-memory + disk. Ключ — path + sorted query (без apikey).
-// TTL по endpoint, см. `ttl(for:)`.
 
 actor ResponseCache {
   static let shared = ResponseCache()
@@ -29,22 +27,18 @@ actor ResponseCache {
     let d = base.appendingPathComponent("SStatsCache", isDirectory: true)
     try? fm.createDirectory(at: d, withIntermediateDirectories: true)
     self.dir = d
-    // Очищаем просроченное при старте
     try? purgeExpiredOnDisk()
   }
 
   func get(key: String) -> JSONValue? {
-    // 1) Memory
     if let e = memory[key], e.expiresAt > Date() {
       return e.json
     }
-    // 2) Disk
     let url = fileURL(for: key)
     guard let data = try? Data(contentsOf: url),
           let env = try? JSONDecoder().decode(Envelope.self, from: data),
           env.expiresAt > Date()
     else {
-      // Просроченный файл сносим
       try? fm.removeItem(at: url)
       return nil
     }
@@ -62,9 +56,7 @@ actor ResponseCache {
       let data = try JSONEncoder().encode(env)
       let url = fileURL(for: key)
       try data.write(to: url, options: .atomic)
-    } catch {
-      // Кэш — best-effort, ошибки не критичны
-    }
+    } catch {}
   }
 
   func clearAll() {
@@ -104,13 +96,12 @@ actor ResponseCache {
 }
 
 // MARK: - Rate Limiter
-// Минимальный интервал между запросами + адаптивный backoff на 429.
 
 actor RateLimiter {
   static let shared = RateLimiter()
 
   private var lastRequest = Date.distantPast
-  private var minInterval: TimeInterval = 0.20  // ~5 req/sec = 300/min
+  private var minInterval: TimeInterval = 0.20
 
   func acquire() async {
     let now = Date()
@@ -123,7 +114,6 @@ actor RateLimiter {
   }
 
   func register429(retryAfter: TimeInterval?) {
-    // Увеличиваем минимальный интервал, чтобы погасить серию 429.
     let cooldown = retryAfter ?? 5.0
     minInterval = min(2.0, max(minInterval, cooldown / 10.0))
     lastRequest = Date().addingTimeInterval(cooldown)
@@ -131,13 +121,11 @@ actor RateLimiter {
   }
 
   func onSuccess() {
-    // Плавно возвращаемся к нормальному ритму
     minInterval = max(0.20, minInterval * 0.95)
   }
 }
 
 // MARK: - Request Coalescer
-// Если одинаковый запрос уже выполняется — вернём тот же Task, не дублируя сеть.
 
 actor RequestCoalescer {
   static let shared = RequestCoalescer()
@@ -165,7 +153,6 @@ actor RequestCoalescer {
 }
 
 // MARK: - Network Monitor
-// Простая проверка online/offline, чтобы не ждать timeout 25 секунд.
 
 final class NetworkMonitor: @unchecked Sendable {
   static let shared = NetworkMonitor()
@@ -216,7 +203,7 @@ final class SStatsClient {
     self.session = URLSession(configuration: cfg)
   }
 
-  // MARK: - Public API (сигнатуры не менялись)
+  // MARK: - Public API
 
   func listToday() async throws -> JSONValue {
     try await get(
@@ -300,12 +287,12 @@ final class SStatsClient {
   // MARK: - Cache policy
 
   private static func ttl(for path: String) -> TimeInterval {
-    if path.hasPrefix("/Ls/List") { return 15 * 60 }         // 15 мин (сегодня)
-    if path.hasPrefix("/Games/list") { return 6 * 3600 }     // 6 ч
-    if path.hasPrefix("/Ls/Team") { return 3600 }            // 1 ч
-    if path.hasPrefix("/Ls/GameInfo") { return 30 * 60 }     // 30 мин
-    if path.hasPrefix("/Odds/") { return 5 * 60 }            // 5 мин
-    if path.hasPrefix("/Games/glicko") { return 6 * 3600 }   // 6 ч
+    if path.hasPrefix("/Ls/List") { return 15 * 60 }
+    if path.hasPrefix("/Games/list") { return 6 * 3600 }
+    if path.hasPrefix("/Ls/Team") { return 3600 }
+    if path.hasPrefix("/Ls/GameInfo") { return 30 * 60 }
+    if path.hasPrefix("/Odds/") { return 5 * 60 }
+    if path.hasPrefix("/Games/glicko") { return 6 * 3600 }
     return 5 * 60
   }
 
@@ -325,32 +312,26 @@ final class SStatsClient {
   ) async throws -> JSONValue {
     let cacheKey = Self.makeCacheKey(path: path, query: query)
 
-    // 1. Cache hit
     if let cached = await ResponseCache.shared.get(key: cacheKey) {
       return cached
     }
 
-    // 2. Offline check
     if !NetworkMonitor.shared.isOnline {
       throw APIError.server("Нет соединения с интернетом")
     }
 
-    // 3. Coalesce identical requests
     let baseURL = self.baseURL
     let apiKey = self.apiKey
     let session = self.session
     let ttlValue = Self.ttl(for: path)
 
     return try await RequestCoalescer.shared.coalesce(key: cacheKey) {
-      // 4. Rate limit
       await RateLimiter.shared.acquire()
 
-      // 5. Perform request
       let json = try await Self.performGet(
         path: path, query: query, attempt: attempt,
         baseURL: baseURL, apiKey: apiKey, session: session)
 
-      // 6. Save to cache
       await ResponseCache.shared.set(key: cacheKey, json: json, ttl: ttlValue)
       return json
     }
@@ -378,7 +359,6 @@ final class SStatsClient {
         throw APIError.invalidResponse
       }
 
-      // 429 — читаем Retry-After, уведомляем RateLimiter, ждём и повторяем
       if http.statusCode == 429 {
         let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
           .flatMap { TimeInterval($0) }
@@ -457,10 +437,54 @@ final class SStatsClient {
         oppXg: number(stats, ["expectedGoals" + (home ? "Away" : "Home"), "opp_xg"]),
         referee: string(o, ["refereeName", "referee"]),
         isHome: home,
-        players: [])
+        players: parsePlayers(o: o, stats: stats, side: pref))
       if rec.gf != nil || rec.ga != nil { out.append(rec) }
     }
     return out
+  }
+
+  /// B6: попытка достать построчный список игроков команды из матча.
+  /// Пробует несколько ключей и структур, если ничего не находит — возвращает [].
+  private func parsePlayers(
+    o: [String: JSONValue], stats: [String: JSONValue], side: String
+  ) -> [PlayerRow] {
+    let candidates: [JSONValue?] = [
+      o[side + "Players"], o[side + "Lineup"],
+      o["players_" + side], o["lineup_" + side],
+      o["players"], o["lineups"],
+      stats[side + "Players"], stats["players"],
+    ]
+    for v in candidates {
+      guard let arr = v?.array, !arr.isEmpty else { continue }
+      let rows = arr.compactMap { parsePlayer($0, side: side) }
+      if !rows.isEmpty { return rows }
+    }
+    return []
+  }
+
+  private func parsePlayer(_ v: JSONValue, side: String) -> PlayerRow? {
+    guard let o = v.object else { return nil }
+    // Если у объекта есть поле side/team, отфильтруем несоответствующие.
+    if let team = string(o, ["side", "team", "teamSide"])?.lowercased() {
+      if team.contains("home") && side == "away" { return nil }
+      if team.contains("away") && side == "home" { return nil }
+    }
+    let id = string(o, ["id", "playerId", "player_id", "uid", "flashId"]) ?? ""
+    let name = string(o, ["name", "playerName", "shortName"]) ?? ""
+    guard !id.isEmpty || !name.isEmpty else { return nil }
+    let resolvedID = id.isEmpty ? name : id
+    return PlayerRow(
+      id: resolvedID,
+      name: name,
+      minutes: number(o, ["minutes", "min", "played", "minutesPlayed"]) ?? 0,
+      xg: number(o, ["xg", "expectedGoals", "xG"]) ?? 0,
+      xa: number(o, ["xa", "expectedAssists", "xA"]) ?? 0,
+      goals: number(o, ["goals", "g", "scored"]) ?? 0,
+      assists: number(o, ["assists", "a"]) ?? 0,
+      shots: number(o, ["shots", "totalShots", "shotsTotal"]) ?? 0,
+      sot: number(o, ["sot", "shotsOnGoal", "shotsOnTarget"]) ?? 0,
+      starts: Int(number(o, ["starts", "isStarter", "started"]) ?? 0)
+    )
   }
 
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {

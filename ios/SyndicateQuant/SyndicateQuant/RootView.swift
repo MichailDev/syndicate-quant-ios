@@ -24,6 +24,11 @@ struct RootView: View {
 
   private var currentSnapshot: BacktestSnapshot? { snapshots.first }
 
+  // B4: матрица из журнала (строится на лету).
+  private var correlationMatrix: CorrelationMatrix {
+    CorrelationBuilder.build(from: journal)
+  }
+
   var body: some View {
     TabView {
       NavigationStack { forecast }
@@ -318,11 +323,13 @@ struct RootView: View {
     List {
       Section {
         Text("Backtest Service").font(.headline)
-        Text("Собирает базу за 2 года × 8 лиг. Auto-Exclude, posterior (B2), TeamRating (B3) и stop-loss (B5) опираются на данные отсюда.")
+        Text("Auto-Exclude, posterior (B2), TeamRating (B3), корреляция (B4), stop-loss (B5) и player impact (B6) — всё это опирается на данные отсюда и из журнала.")
           .font(.caption).foregroundStyle(.secondary)
       }
 
       volatilitySection
+      correlationSection
+      playerImpactSection
 
       if let snap = currentSnapshot {
         Section("Статус") {
@@ -399,15 +406,16 @@ struct RootView: View {
       Section("Задачи Волны B") {
         Label("B1 Model Ensemble (DC+BIV+NB)", systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("B2 Bayesian posterior (0.85·p + 0.15·p_post)",
-              systemImage: "checkmark.circle.fill")
+        Label("B2 Bayesian posterior", systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
         Label("B3 Elo team strength", systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("B4 Correlation matrix из журнала", systemImage: "circle.dashed")
+        Label("B4 Correlation matrix", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
         Label("B5 Volatility stop-loss", systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("B6 Player impact в λ", systemImage: "circle.dashed")
+        Label("B6 Player impact в λ", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
       }
 
       Section("Принцип") {
@@ -436,9 +444,58 @@ struct RootView: View {
         Text("После \(VolatilityStop.capThreshold) проигрышей подряд — стейк ограничен \(Int(v * 100))%.")
           .font(.caption).foregroundStyle(.orange)
       case .pause:
-        Text("После \(VolatilityStop.pauseThreshold) проигрышей подряд — новые ставки не создаются до первой победы (WIN) в журнале.")
+        Text("После \(VolatilityStop.pauseThreshold) проигрышей подряд — новые ставки не создаются.")
           .font(.caption).foregroundStyle(.red)
       }
+    }
+  }
+
+  @ViewBuilder
+  private var correlationSection: some View {
+    let m = correlationMatrix
+    Section("Correlation matrix (B4)") {
+      if m.totalPairs == 0 {
+        Text("Нужно ≥ 20 пар закрытых записей в одном дне для эмпирики. Пока используются структурные значения.")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        LabeledContent("Пар в журнале", value: "\(m.totalPairs)")
+        LabeledContent("Market-пар (n≥20)", value: "\(m.marketPairsN.count)")
+        LabeledContent("League-пар (n≥20)", value: "\(m.leaguePairsN.count)")
+        if !m.marketPairs.isEmpty {
+          Text("Сильнейшие market-связи:").font(.caption2).foregroundStyle(.secondary)
+          let topM = m.marketPairs
+            .filter { abs($0.value) > 0.001 }
+            .sorted { abs($0.value) > abs($1.value) }
+            .prefix(5)
+          ForEach(Array(topM), id: \.key) { (k, v) in
+            HStack {
+              Text(k).font(.caption.monospacedDigit())
+              Spacer()
+              Text(String(format: "%+.2f", v))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(v > 0 ? .green : .red)
+              if let n = m.marketPairsN[k] {
+                Text("n=\(n)")
+                  .font(.caption2).foregroundStyle(.secondary)
+                  .frame(width: 52, alignment: .trailing)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var playerImpactSection: some View {
+    Section("Player impact (B6)") {
+      Text("Применяется, когда в gameInfo есть состав (lineups) и у команды ≥ 6 игроков в истории. Отсутствие топ-8 → −5…−12% к λ.")
+        .font(.caption).foregroundStyle(.secondary)
+      let withPlayers = journal.filter { !$0.home.isEmpty }
+        .prefix(1).count  // заглушка, чтобы не было пустого разделения
+      _ = withPlayers
+      Text("Статус: ожидание данных от API. Ключи, которые пробуются: lineups, homeLineup/awayLineup, homePlayers/awayPlayers.")
+        .font(.caption2).foregroundStyle(.secondary)
     }
   }
 
@@ -678,6 +735,12 @@ struct RootView: View {
         LabeledContent("Текущая серия", value: "\(ev.streak)")
         LabeledContent("Состояние", value: ev.state.label)
       }
+      Section("Correlation (B4)") {
+        let m = correlationMatrix
+        LabeledContent("Пар в журнале", value: "\(m.totalPairs)")
+        LabeledContent("Market-пар (n≥20)", value: "\(m.marketPairsN.count)")
+        LabeledContent("League-пар (n≥20)", value: "\(m.leaguePairsN.count)")
+      }
       Section("Backtest snapshot") {
         if let snap = currentSnapshot {
           LabeledContent("Status", value: snap.buildStatus)
@@ -737,6 +800,8 @@ struct RootView: View {
         Text("Ensemble DC+BIV+NB · posterior 0.15 при n≥20")
           .font(.caption).foregroundStyle(.secondary)
         Text("Stop-loss: ≥4 LOSS → CAP 5%, ≥7 → PAUSE")
+          .font(.caption).foregroundStyle(.secondary)
+        Text("Empirical correlation (n≥20) · player impact (if lineups)")
           .font(.caption).foregroundStyle(.secondary)
       }
       if !diagnostics.isEmpty {
@@ -839,6 +904,8 @@ struct RootView: View {
     }
     for n in summary.notes { diagnostics.append(n) }
     diagnostics.append("scanned=\(summary.scannedMatches)")
+    diagnostics.append("corrPairs=\(summary.correlationPairs)")
+    diagnostics.append("lineups=\(summary.lineupsFound)")
   }
 
   // MARK: - Settle
@@ -895,6 +962,9 @@ struct SignalCard: View {
         Text("\(signal.bookmakers)b")
         if signal.posteriorWeight != nil { Text("PST").foregroundStyle(.purple) }
         if signal.stopApplied != nil { Text("STOP").foregroundStyle(.red) }
+        if signal.playerImpactHome != nil || signal.playerImpactAway != nil {
+          Text("PLR").foregroundStyle(.orange)
+        }
       }
       .font(.caption2).foregroundStyle(.secondary)
     }
@@ -1011,6 +1081,21 @@ struct SignalDetailView: View {
                            value: String(format: "%.3f%%", signal.stake * 100))
           }
           Text("Серия проигрышей ≥4 → ограничение стейка до 5%. ≥7 → пауза.")
+            .font(.caption2).foregroundStyle(.secondary)
+        }
+      }
+
+      if signal.playerImpactHome != nil || signal.playerImpactAway != nil {
+        Section("Player impact (B6)") {
+          if let hi = signal.playerImpactHome {
+            LabeledContent("Дом. λ-множитель",
+                           value: String(format: "%.2f", hi))
+          }
+          if let ai = signal.playerImpactAway {
+            LabeledContent("Гост. λ-множитель",
+                           value: String(format: "%.2f", ai))
+          }
+          Text("Сравнение ожидаемого состава с типичным топ-8 команды.")
             .font(.caption2).foregroundStyle(.secondary)
         }
       }
