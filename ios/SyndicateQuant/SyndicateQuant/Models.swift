@@ -1916,13 +1916,33 @@ final class ScanCoordinator {
         }()
         if lineups != nil { lineupsFound += 1 }
 
-        let s = engine.signals(
+        var s = engine.signals(
           match: match, info: info, oddsJSON: oddsFromInfo,
           homeHistory: hs, awayHistory: awayRecords, glicko: glicko,
           posteriorBuckets: posteriorBuckets,
           posteriorWeight: tuning.posteriorWeight,
           teamRatings: (home: ratings.0, away: ratings.1),
           upcomingLineups: lineups)
+
+        // Волна D (D2): sharp money из LiveMonitor (ScanCoordinator @MainActor).
+        s = s.map { sig in
+          var x = sig
+          let liveKey = "\(x.market)|\(x.selection.lowercased())|\(x.line.map { String($0) } ?? "")"
+          if let cur = LiveMonitor.shared.snapshots[x.gameID],
+             let prev = LiveMonitor.shared.previousSnapshotForDebug(matchID: x.gameID),
+             let curAvg = cur.avg(forKey: liveKey),
+             let prevAvg = prev.avg(forKey: liveKey),
+             prevAvg > 1 {
+            let delta = (curAvg - prevAvg) / prevAvg
+            x.liveMovement = delta
+            let moving = cur.booksMoving(forKey: liveKey, vs: prev, threshold: 0.01)
+            if moving.count >= 3 && abs(delta) > 0.02 {
+              x.sharpMoney = true
+              x.sharpMovement = delta
+            }
+          }
+          return x
+        }
         signalsOut.append(contentsOf: s)
       }
       summary.lineupsFound = lineupsFound
