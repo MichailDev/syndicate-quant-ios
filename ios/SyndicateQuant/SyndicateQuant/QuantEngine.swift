@@ -195,15 +195,22 @@ struct QuantEngine {
     for (_, qs) in grouped {
       guard !qs.isEmpty else { continue }
       guard let median = QuantMath.median(qs.map { $0.odds }) else { continue }
-      // Волна D (D4): лучшая цена.
       guard let q = qs.max(by: { $0.odds < $1.odds }) else { continue }
       let sharp = sharpGuard(qs, median: median)
 
       let p: Double
       let modelName: String
+      // Волна D (D3): голоса моделей.
+      var voteCount: Int? = nil
+      var voteDetail: String? = nil
+
       if q.market == "1X2" {
         p = compute1X2Probability(q: q, model: matchModel, n: 20000, seed: 17)
         modelName = "ENSEMBLE(DC+BIV+NB)+MC"
+        let marketProb = QuantMath.median(qs.map { 1.0 / max($0.odds, 1.01) }) ?? 0.5
+        let v = vote1X2(q: q, model: matchModel, market: marketProb)
+        voteCount = v.count
+        voteDetail = v.detail
       } else if q.market == "GOALS" {
         p = totalProbabilityFromDistribution(q, dist: totalDist)
         modelName = "ENSEMBLE(DC/BIV/NB)+MC"
@@ -227,18 +234,18 @@ struct QuantEngine {
         sampleClass: sampleClass,
         homeSample: homeHistory.count, awaySample: awayHistory.count,
         posteriorBuckets: posteriorBuckets,
-        posteriorWeight: posteriorWeight) {
+        posteriorWeight: posteriorWeight,
+        modelVote: voteCount) {
         if hImpact < 0.999 || aImpact < 0.999 {
           s.playerImpactHome = hImpact
           s.playerImpactAway = aImpact
         }
+        s.modelVote = voteCount
+        s.modelVoteDetail = voteDetail
         out.append(s)
       }
     }
 
-    // Волна D (D2): sharp money приоритетнее при равном QCS.
-    // Поля sharpMoney/sharpMovement/liveMovement заполняются в ScanCoordinator
-    // (см. Models.swift), т.к. LiveMonitor — @MainActor, а signals() — нет.
     return out.sorted { a, b in
       if a.sharpMoney == true && b.sharpMoney != true { return true }
       if b.sharpMoney == true && a.sharpMoney != true { return false }
@@ -310,8 +317,46 @@ struct QuantEngine {
       components: [oDC.home, oDC.draw, oDC.away, ensembleHome, ensembleDraw, ensembleAway],
       playerHome: ph, playerAway: pa,
       ensembleWeights: (dc: wDC, biv: wBiv, nb: wNB),
-      ensembleAvgXG: avgXG)
+      ensembleAvgXG: avgXG,
+      outcomesDC: (oDC.home, oDC.draw, oDC.away),
+      outcomesBIV: (oBiv.home, oBiv.draw, oBiv.away),
+      outcomesNB: (oNB.home, oNB.draw, oNB.away))
   }
+
+  // MARK: - Vote (Волна D: D3)
+
+  /// Считает голоса 4 моделей: DC, BIV, NB, Ensemble.
+  /// Голос "за" = p(side) > market + 1% (модель видит value на выбранной стороне).
+  private func vote1X2(
+    q: Quote, model: MatchModel, market: Double
+  ) -> (count: Int, detail: String) {
+    let threshold = 0.01
+    let side = q.selectionKey
+
+    func pick(_ t: (home: Double, draw: Double, away: Double)) -> Double {
+      switch side {
+      case "1": return t.home
+      case "X": return t.draw
+      default:  return t.away
+      }
+    }
+
+    let pDC  = pick(model.outcomesDC)
+    let pBIV = pick(model.outcomesBIV)
+    let pNB  = pick(model.outcomesNB)
+    let pENS = pick(model.outcomes)
+
+    var hits: [String] = []
+    var misses: [String] = []
+    for (name, p) in [("DC", pDC), ("BIV", pBIV), ("NB", pNB), ("ENS", pENS)] {
+      if p > market + threshold { hits.append(name) }
+      else { misses.append(name) }
+    }
+    let detail = "\(hits.joined(separator: " ")) | \(misses.joined(separator: " "))"
+    return (hits.count, detail.isEmpty ? nil_dummy() : detail)
+  }
+
+  private func nil_dummy() -> String { "" }
 
   // MARK: - Player impact
 
@@ -389,7 +434,8 @@ struct QuantEngine {
     modelName: String, sampleClass: SampleClass,
     homeSample: Int, awaySample: Int,
     posteriorBuckets: [PosteriorBucket],
-    posteriorWeight: Double
+    posteriorWeight: Double,
+    modelVote: Int? = nil
   ) -> BetSignal? {
 
     let pRaw = p
@@ -415,7 +461,6 @@ struct QuantEngine {
     let marketProbability = QuantMath.median(quoteProbs) ?? 0.0
     let marketMAD = QuantMath.mad(quoteProbs.map { $0 * 100 }) ?? 0.0
 
-    // Волна D (D4): best/worst/avg по всем книгам.
     let oddsList = quotes.map { $0.odds }
     let bestQuote = quotes.max(by: { $0.odds < $1.odds })
     let worstQuote = quotes.min(by: { $0.odds < $1.odds })
@@ -456,7 +501,8 @@ struct QuantEngine {
 
     let classification = classify(
       ev: ev, robustEV: robustEV, qcs: qcs, ms: ms, dcs: dcs,
-      anomaly: anomaly, extreme: extreme, conflict: conflict)
+      anomaly: anomaly, extreme: extreme, conflict: conflict,
+      modelVote: modelVote)
 
     guard classification != "X NO BET" else { return nil }
 
@@ -523,17 +569,32 @@ struct QuantEngine {
     return max(0, min(100, raw))
   }
 
-  // MARK: - Classification
+  // MARK: - Classification (с учётом голосов D3)
 
   private func classify(
     ev: Double, robustEV: Double, qcs: Double, ms: Double, dcs: Double,
-    anomaly: Bool, extreme: Bool, conflict: Bool
+    anomaly: Bool, extreme: Bool, conflict: Bool,
+    modelVote: Int? = nil
   ) -> String {
     if anomaly || extreme || conflict { return "X NO BET" }
-    if robustEV > 0 && ev >= 0.07 && qcs >= 85 && ms >= 50 && dcs >= 60 {
+
+    // Волна D (D3): блокируем S/A BET при недостаточном согласии моделей.
+    // S BET требует 4/4, A BET требует ≥3/4.
+    // При 2/4 — максимум B LEAN, при <2 — максимум C WATCH.
+    let canS: Bool
+    let canA: Bool
+    if let v = modelVote {
+      canS = (v >= 4)
+      canA = (v >= 3)
+    } else {
+      canS = true
+      canA = true
+    }
+
+    if canS && robustEV > 0 && ev >= 0.07 && qcs >= 85 && ms >= 50 && dcs >= 60 {
       return "S BET"
     }
-    if robustEV > 0 && ev >= 0.05 && qcs >= 78 && ms >= 50 && dcs >= 60 {
+    if canA && robustEV > 0 && ev >= 0.05 && qcs >= 78 && ms >= 50 && dcs >= 60 {
       return "A BET"
     }
     if ev >= 0.03 && robustEV > 0 { return "B LEAN" }
@@ -566,7 +627,6 @@ struct QuantEngine {
           league: $0.league, market: $0.market, rules: excludedRules)
       }
       .sorted { a, b in
-        // Волна D (D2): sharp money приоритетнее при прочих равных.
         if a.sharpMoney == true && b.sharpMoney != true { return true }
         if b.sharpMoney == true && a.sharpMoney != true { return false }
         return a.robustEV > b.robustEV
@@ -1003,6 +1063,11 @@ struct MatchModel {
   var playerAway: PlayerAssembly
   var ensembleWeights: (dc: Double, biv: Double, nb: Double) = (0, 0, 0)
   var ensembleAvgXG: Double? = nil
+
+  // Волна D (D3): отдельные выходы моделей для голосования.
+  var outcomesDC: (home: Double, draw: Double, away: Double) = (0, 0, 0)
+  var outcomesBIV: (home: Double, draw: Double, away: Double) = (0, 0, 0)
+  var outcomesNB: (home: Double, draw: Double, away: Double) = (0, 0, 0)
 }
 struct PlayerAssembly {
   var factor: Double
