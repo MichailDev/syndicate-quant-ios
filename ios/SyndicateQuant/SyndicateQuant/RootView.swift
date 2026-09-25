@@ -1433,12 +1433,12 @@ struct SignalDetailView: View {
   private func formBadge(_ r: TeamRecord) -> some View {
     let gf = r.gf ?? 0
     let ga = r.ga ?? 0
-    let resultChar: String
-    let color: Color
-    if gf > ga { resultChar = "В"; color = .green }
-    else if gf == ga { resultChar = "Н"; color = .orange }
-    else { resultChar = "П"; color = .red }
-    VStack(spacing: 1) {
+    let (resultChar, color): (String, Color) = {
+      if gf > ga { return ("В", .green) }
+      if gf == ga { return ("Н", .orange) }
+      return ("П", .red)
+    }()
+    return VStack(spacing: 1) {
       Text(resultChar)
         .font(.caption2.bold())
       Text("\(Int(gf)):\(Int(ga))")
