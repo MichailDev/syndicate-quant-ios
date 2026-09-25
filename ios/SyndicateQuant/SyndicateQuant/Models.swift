@@ -1,5 +1,6 @@
 import Foundation
 import SwiftData
+import SwiftUI
 
 // MARK: - League whitelist
 
@@ -2066,6 +2067,15 @@ enum AppColorScheme: String, CaseIterable, Identifiable {
     case .system: return "Система"
     case .light: return "Светлая"
     case .dark: return "Тёмная"
+    }
+  }
+
+  /// Маппинг на SwiftUI ColorScheme. nil = системная.
+  var toColorScheme: SwiftUI.ColorScheme? {
+    switch self {
+    case .system: return nil
+    case .light: return .light
+    case .dark: return .dark
     }
   }
 }
