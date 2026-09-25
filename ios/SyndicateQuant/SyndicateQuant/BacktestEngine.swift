@@ -25,7 +25,7 @@ struct BetRecord: Codable, Hashable {
   var probabilityLow: Double
   var probabilityHigh: Double
   var ev: Double
-  var actual: Double   // WIN=1, PUSH=0.5, LOSS=0
+  var actual: Double
 }
 
 // MARK: - Full report
@@ -63,7 +63,6 @@ struct WalkForwardReport {
   var byOddsBand: [String: SegmentStats] = [:]
   var byWeek: [String: SegmentStats] = [:]
 
-  // G8: сырые записи для posterior buckets.
   var betRecords: [BetRecord] = []
 
   var roi: Double { staked > 0 ? profit / staked : 0 }
@@ -153,7 +152,6 @@ struct WalkForwardBacktester {
         r.brierSum += (predicted - actualVal) * (predicted - actualVal)
         r.logLossSum += QuantMath.logLoss(predicted: predicted, actual: actualVal)
 
-        // G8: сырая запись для posterior.
         r.betRecords.append(BetRecord(
           probability: predicted,
           probabilityLow: s.probabilityLow,
@@ -277,6 +275,96 @@ struct WalkForwardBacktester {
     let isOver = signal.selection.lowercased().contains("over")
       || signal.selection.lowercased().hasPrefix("o")
     return QuantMath.settleAsianTotal(total: total, line: line, isOver: isOver)
+  }
+}
+
+// MARK: - Волна E (E5): сравнение 4 моделей
+
+struct MultiModelBacktester {
+
+  /// Максимум матчей для оценки — чтобы не гонять всё 2-летнее полотно.
+  static let maxMatches = 1500
+
+  func run(
+    matches: [Match], histories: [String: [TeamRecord]]
+  ) -> [ModelComparison] {
+    let engine = QuantEngine()
+    let configs = ["DC", "BIV", "NB", "ENS"]
+
+    // Равномерная выборка по всей базе, а не только последние.
+    let sorted = matches.sorted {
+      ($0.start ?? .distantPast) < ($1.start ?? .distantPast)
+    }
+    let step = max(1, sorted.count / Self.maxMatches)
+    let sampled = sorted.enumerated().compactMap { (i, m) -> Match? in
+      i % step == 0 ? m : nil
+    }
+
+    var brierSum: [String: Double] = [:]
+    var logLossSum: [String: Double] = [:]
+    var counts: [String: Int] = [:]
+    var homePSum: [String: Double] = [:]
+    var drawPSum: [String: Double] = [:]
+    var awayPSum: [String: Double] = [:]
+
+    for match in sampled {
+      guard let h = match.homeID, let a = match.awayID,
+            let hFT = match.homeFT, let aFT = match.awayFT
+      else { continue }
+
+      let matchStart = match.start ?? .distantFuture
+      let hs = (histories[h] ?? []).filter {
+        ($0.date ?? .distantPast) < matchStart
+      }
+      let as_ = (histories[a] ?? []).filter {
+        ($0.date ?? .distantPast) < matchStart
+      }
+      guard let model = engine.model(home: hs, away: as_) else { continue }
+
+      let actualIdx: Int = hFT > aFT ? 0 : (hFT == aFT ? 1 : 2)
+      let outs: [String: (Double, Double, Double)] = [
+        "DC":  (model.outcomesDC.home, model.outcomesDC.draw, model.outcomesDC.away),
+        "BIV": (model.outcomesBIV.home, model.outcomesBIV.draw, model.outcomesBIV.away),
+        "NB":  (model.outcomesNB.home, model.outcomesNB.draw, model.outcomesNB.away),
+        "ENS": (model.outcomes.home, model.outcomes.draw, model.outcomes.away),
+      ]
+
+      for name in configs {
+        guard let o = outs[name] else { continue }
+        let ps = [o.0, o.1, o.2]
+        let sumP = ps.reduce(0, +)
+        guard sumP > 0 else { continue }
+        let nps = ps.map { $0 / sumP }
+
+        var brier = 0.0
+        for i in 0..<3 {
+          let y = (i == actualIdx) ? 1.0 : 0.0
+          brier += (nps[i] - y) * (nps[i] - y)
+        }
+        brierSum[name, default: 0] += brier
+
+        let eps = 1e-9
+        let p = min(1 - eps, max(eps, nps[actualIdx]))
+        logLossSum[name, default: 0] += -log(p)
+
+        counts[name, default: 0] += 1
+        homePSum[name, default: 0] += nps[0]
+        drawPSum[name, default: 0] += nps[1]
+        awayPSum[name, default: 0] += nps[2]
+      }
+    }
+
+    return configs.map { name in
+      let n = max(1, counts[name] ?? 0)
+      return ModelComparison(
+        name: name,
+        matches: counts[name] ?? 0,
+        brier: (brierSum[name] ?? 0) / Double(n),
+        logLoss: (logLossSum[name] ?? 0) / Double(n),
+        avgHomeP: (homePSum[name] ?? 0) / Double(n),
+        avgDrawP: (drawPSum[name] ?? 0) / Double(n),
+        avgAwayP: (awayPSum[name] ?? 0) / Double(n))
+    }
   }
 }
 

@@ -476,3 +476,123 @@ enum QuantMath {
 
   static func normalCDF(_ x: Double) -> Double { 0.5 * (1 + erf(x / sqrt(2))) }
 }
+
+// MARK: - Волна E (E4): встроенные unit-тесты для QuantMath
+
+enum QuantMathSelfTest {
+
+  struct Check: Identifiable {
+    var id: String { name }
+    var name: String
+    var pass: Bool
+    var note: String
+  }
+
+  static func runAll() -> [Check] {
+    var out: [Check] = []
+
+    // 1. Медиана нечётная длина
+    do {
+      let m = QuantMath.median([1.0, 2.0, 3.0]) ?? -1
+      out.append(Check(name: "median нечётная",
+                       pass: abs(m - 2.0) < 1e-9,
+                       note: String(format: "median = %.4f", m)))
+    }
+
+    // 2. Медиана чётная длина
+    do {
+      let m = QuantMath.median([1.0, 2.0, 3.0, 4.0]) ?? -1
+      out.append(Check(name: "median чётная",
+                       pass: abs(m - 2.5) < 1e-9,
+                       note: String(format: "median = %.4f", m)))
+    }
+
+    // 3. MAD (median absolute deviation)
+    do {
+      let v = QuantMath.mad([1.0, 2.0, 3.0, 4.0, 5.0]) ?? -1
+      out.append(Check(name: "MAD вокруг медианы",
+                       pass: abs(v - 1.0) < 1e-9,
+                       note: String(format: "mad = %.4f", v)))
+    }
+
+    // 4. EV 50% × 2.00 = 0
+    do {
+      let e = QuantMath.ev(p: 0.5, odds: 2.0)
+      out.append(Check(name: "EV 50% × 2.00 = 0",
+                       pass: abs(e) < 1e-9,
+                       note: String(format: "ev = %.6f", e)))
+    }
+
+    // 5. EV 60% × 2.00 = 0.2
+    do {
+      let e = QuantMath.ev(p: 0.6, odds: 2.0)
+      out.append(Check(name: "EV 60% × 2.00 = 0.2",
+                       pass: abs(e - 0.2) < 1e-9,
+                       note: String(format: "ev = %.6f", e)))
+    }
+
+    // 6. Kelly при EV=0 → 0
+    do {
+      let k = QuantMath.kelly(p: 0.5, odds: 2.0)
+      out.append(Check(name: "Kelly при EV=0 → 0",
+                       pass: abs(k) < 1e-9,
+                       note: String(format: "kelly = %.6f", k)))
+    }
+
+    // 7. Kelly 60% × 2.00 = 0.2
+    do {
+      let k = QuantMath.kelly(p: 0.6, odds: 2.0)
+      out.append(Check(name: "Kelly 60% × 2.00 = 0.2",
+                       pass: abs(k - 0.2) < 1e-9,
+                       note: String(format: "kelly = %.6f", k)))
+    }
+
+    // 8. Dixon–Coles: home + draw + away ≈ 1
+    do {
+      let m = QuantMath.dixonColes(1.4, 1.1, rho: -0.05, maxGoals: 10)
+      let o = QuantMath.outcomes(m)
+      let s = o.home + o.draw + o.away
+      out.append(Check(name: "DC: home+draw+away ≈ 1",
+                       pass: abs(s - 1.0) < 0.02,
+                       note: String(format: "sum = %.4f", s)))
+    }
+
+    // 9. Bivariate Poisson: home + draw + away ≈ 1
+    do {
+      let m = QuantMath.bivariatePoisson(1.2, 1.0, l3: 0.05, maxGoals: 10)
+      let o = QuantMath.outcomes(m)
+      let s = o.home + o.draw + o.away
+      out.append(Check(name: "BIV: home+draw+away ≈ 1",
+                       pass: abs(s - 1.0) < 0.02,
+                       note: String(format: "sum = %.4f", s)))
+    }
+
+    // 10. split 2.75 → [2.5, 3.0]
+    do {
+      let s = QuantMath.splitQuarterLine(2.75)
+      let ok = s.count == 2 && abs(s[0] - 2.5) < 1e-9 && abs(s[1] - 3.0) < 1e-9
+      out.append(Check(name: "split 2.75 → [2.5, 3.0]", pass: ok, note: "\(s)"))
+    }
+
+    // 11. BetaShrink в [0, 1]
+    do {
+      let b = QuantMath.betaShrink(10, 20, priorMean: 0.5, priorStrength: 10)
+      out.append(Check(name: "BetaShrink в [0, 1]",
+                       pass: b >= 0 && b <= 1,
+                       note: String(format: "b = %.4f", b)))
+    }
+
+    // 12. NB PMF сумма 0..20 ≈ 1
+    do {
+      var total = 0.0
+      for i in 0...20 {
+        total += QuantMath.negativeBinomialPMF(i, mean: 3.0, variance: 5.0)
+      }
+      out.append(Check(name: "NB PMF сумма 0..20 ≈ 1",
+                       pass: abs(total - 1.0) < 0.05,
+                       note: String(format: "sum = %.4f", total)))
+    }
+
+    return out
+  }
+}
