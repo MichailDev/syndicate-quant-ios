@@ -192,10 +192,14 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var worstBook: String? = nil
   var avgOdds: Double? = nil
 
-  // Волна D (D1 + D2)
+    // Волна D (D1 + D2)
   var sharpMoney: Bool? = nil
   var sharpMovement: Double? = nil
   var liveMovement: Double? = nil
+
+  // Волна D (D3)
+  var modelVote: Int? = nil
+  var modelVoteDetail: String? = nil
 }
 
 // MARK: - Team rating (B3)
