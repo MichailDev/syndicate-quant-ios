@@ -1271,7 +1271,6 @@ struct SignalDetailView: View {
 
 struct SelfTuningView: View {
   @Environment(\.modelContext) private var context
-  @Environment(\.dismiss) private var dismiss
   @Query private var configs: [TuningConfig]
   @Query(sort: \TuningEvent.createdAt, order: .reverse) private var events: [TuningEvent]
   @Query(sort: \JournalEntry.createdAt, order: .reverse) private var journal: [JournalEntry]
@@ -1311,7 +1310,7 @@ struct SelfTuningView: View {
     }
   }
 
-  // MARK: - Раздел 1: Активные механизмы
+  // MARK: - Активные механизмы
 
   @ViewBuilder
   private func decisionsSection(_ cfg: TuningConfig) -> some View {
@@ -1379,7 +1378,7 @@ struct SelfTuningView: View {
     }
   }
 
-  // MARK: - Раздел 2: Пороги
+  // MARK: - Пороги
 
   @ViewBuilder
   private func thresholdsSection(_ cfg: TuningConfig) -> some View {
@@ -1387,70 +1386,59 @@ struct SelfTuningView: View {
       thresholdRow(
         "posteriorWeight",
         label: "Вес posterior",
-        value: String(format: "%.2f", cfg.posteriorWeight),
-        before: { String(format: "%.2f", cfg.posteriorWeight) },
-        after: { newStr in
-          if let v = Double(newStr) {
-            cfg.posteriorWeight = max(0.0, min(0.5, v))
-          }
+        formattedValue: String(format: "%.2f", cfg.posteriorWeight),
+        onDelta: { d in
+          cfg.posteriorWeight = max(0.0, min(0.5, cfg.posteriorWeight + d))
         },
-        delta: { cfg.posteriorWeight = max(0.0, min(0.5, cfg.posteriorWeight + $0)) },
+        currentString: { String(format: "%.4f", cfg.posteriorWeight) },
         step: 0.05,
         rangeLabel: "0.00 – 0.50")
 
       thresholdRow(
         "autoExcludeMinROI",
         label: "Auto-Exclude min ROI",
-        value: String(format: "%.1f%%", cfg.autoExcludeMinROI * 100),
-        before: { String(format: "%.4f", cfg.autoExcludeMinROI) },
-        after: { newStr in
-          if let v = Double(newStr) {
-            cfg.autoExcludeMinROI = max(-0.5, min(0.0, v))
-          }
+        formattedValue: String(format: "%.1f%%", cfg.autoExcludeMinROI * 100),
+        onDelta: { d in
+          cfg.autoExcludeMinROI = max(-0.5, min(0.0, cfg.autoExcludeMinROI + d))
         },
-        delta: { cfg.autoExcludeMinROI = max(-0.5, min(0.0, cfg.autoExcludeMinROI + $0)) },
+        currentString: { String(format: "%.4f", cfg.autoExcludeMinROI) },
         step: 0.005,
         rangeLabel: "−50% … 0%")
 
       thresholdRow(
         "autoExcludeMinBets",
         label: "Auto-Exclude min n",
-        value: "\(cfg.autoExcludeMinBets)",
-        before: { "\(cfg.autoExcludeMinBets)" },
-        after: { newStr in
-          if let v = Int(newStr) {
-            cfg.autoExcludeMinBets = max(5, min(200, v))
-          }
+        formattedValue: "\(cfg.autoExcludeMinBets)",
+        onDelta: { d in
+          let v = cfg.autoExcludeMinBets + Int(d.rounded())
+          cfg.autoExcludeMinBets = max(5, min(200, v))
         },
-        delta: { cfg.autoExcludeMinBets = max(5, min(200, cfg.autoExcludeMinBets + $0)) },
+        currentString: { "\(cfg.autoExcludeMinBets)" },
         step: 5,
         rangeLabel: "5 – 200")
 
       thresholdRow(
         "stopLossCapStreak",
         label: "Stop-loss: cap после N LOSS",
-        value: "\(cfg.stopLossCapStreak)",
-        before: { "\(cfg.stopLossCapStreak)" },
-        after: { newStr in
-          if let v = Int(newStr) {
-            cfg.stopLossCapStreak = max(2, min(10, v))
-          }
+        formattedValue: "\(cfg.stopLossCapStreak)",
+        onDelta: { d in
+          let v = cfg.stopLossCapStreak + Int(d.rounded())
+          cfg.stopLossCapStreak = max(2, min(10, v))
         },
-        delta: { cfg.stopLossCapStreak = max(2, min(10, cfg.stopLossCapStreak + $0)) },
+        currentString: { "\(cfg.stopLossCapStreak)" },
         step: 1,
         rangeLabel: "2 – 10")
 
       thresholdRow(
         "stopLossPauseStreak",
         label: "Stop-loss: pause после N LOSS",
-        value: "\(cfg.stopLossPauseStreak)",
-        before: { "\(cfg.stopLossPauseStreak)" },
-        after: { newStr in
-          if let v = Int(newStr) {
-            cfg.stopLossPauseStreak = max(cfg.stopLossCapStreak + 1, min(15, v))
-          }
+        formattedValue: "\(cfg.stopLossPauseStreak)",
+        onDelta: { d in
+          let v = cfg.stopLossPauseStreak + Int(d.rounded())
+          let lower = cfg.stopLossCapStreak + 1
+          cfg.stopLossPauseStreak = max(lower, min(15, v))
         },
-        delta: { cfg.stopLossPauseStreak = max(cfg.stopLossCapStreak + 1, min(15, cfg.stopLossPauseStreak + $0)) },
+        currentString: { "\(cfg.stopLossPauseStreak)" },
         step: 1,
         rangeLabel: "> cap · … · 15")
     } header: {
@@ -1464,64 +1452,44 @@ struct SelfTuningView: View {
   private func thresholdRow(
     _ key: String,
     label: String,
-    value: String,
-    before: @escaping () -> String,
-    after: @escaping (String) -> Void,
-    delta: @escaping (Int) -> Void,
+    formattedValue: String,
+    onDelta: @escaping (Double) -> Void,
+    currentString: @escaping () -> String,
     step: Double,
     rangeLabel: String
   ) -> some View {
-    let intStep = Int(step)
     VStack(alignment: .leading, spacing: 6) {
       HStack {
         Text(label).font(.subheadline)
         Spacer()
-        Text(value)
+        Text(formattedValue)
           .font(.subheadline.monospacedDigit().bold())
           .foregroundStyle(.blue)
       }
       HStack(spacing: 8) {
         Button {
-          let b = before()
-          if step < 1 {
-            delta(-1)
-            after(String(format: "%.4f", currentNumber(key) - step))
-          } else {
-            delta(-max(1, intStep))
-          }
-          let a = String(format: "%.4f", currentNumber(key))
+          let b = currentString()
+          onDelta(-step)
+          let a = currentString()
           TuningService.log(
             context: context,
-            kind: "threshold",
-            target: key,
-            before: b,
-            after: a,
-            note: label)
+            kind: "threshold", target: key,
+            before: b, after: a, note: label)
         } label: {
-          Image(systemName: "minus.circle.fill")
-            .foregroundStyle(.blue)
+          Image(systemName: "minus.circle.fill").foregroundStyle(.blue)
         }
         .buttonStyle(.plain)
 
         Button {
-          let b = before()
-          if step < 1 {
-            delta(1)
-            after(String(format: "%.4f", currentNumber(key) + step))
-          } else {
-            delta(max(1, intStep))
-          }
-          let a = String(format: "%.4f", currentNumber(key))
+          let b = currentString()
+          onDelta(step)
+          let a = currentString()
           TuningService.log(
             context: context,
-            kind: "threshold",
-            target: key,
-            before: b,
-            after: a,
-            note: label)
+            kind: "threshold", target: key,
+            before: b, after: a, note: label)
         } label: {
-          Image(systemName: "plus.circle.fill")
-            .foregroundStyle(.blue)
+          Image(systemName: "plus.circle.fill").foregroundStyle(.blue)
         }
         .buttonStyle(.plain)
 
@@ -1532,19 +1500,7 @@ struct SelfTuningView: View {
     .padding(.vertical, 2)
   }
 
-  private func currentNumber(_ key: String) -> Double {
-    guard let cfg = config else { return 0 }
-    switch key {
-    case "posteriorWeight": return cfg.posteriorWeight
-    case "autoExcludeMinROI": return cfg.autoExcludeMinROI
-    case "autoExcludeMinBets": return Double(cfg.autoExcludeMinBets)
-    case "stopLossCapStreak": return Double(cfg.stopLossCapStreak)
-    case "stopLossPauseStreak": return Double(cfg.stopLossPauseStreak)
-    default: return 0
-    }
-  }
-
-  // MARK: - Раздел 3: Журнал изменений
+  // MARK: - Журнал изменений
 
   @ViewBuilder
   private var eventsSection: some View {
@@ -1553,7 +1509,7 @@ struct SelfTuningView: View {
         if let rb = TuningService.rollbackLastThreshold(in: context) {
           rollbackMessage = "Откат: \(rb.target) → \(rb.beforeValue)"
         } else {
-          rollbackMessage = "Нет изменений для откатa"
+          rollbackMessage = "Нет изменений для отката"
         }
       } label: {
         Label("Откатить последнее изменение", systemImage: "arrow.uturn.backward")
@@ -1631,7 +1587,7 @@ struct SelfTuningView: View {
     }
   }
 
-  // MARK: - Раздел 4: Сброс
+  // MARK: - Сброс
 
   @ViewBuilder
   private var resetSection: some View {
