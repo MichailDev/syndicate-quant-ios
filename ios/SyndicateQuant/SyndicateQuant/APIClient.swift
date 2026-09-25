@@ -144,6 +144,75 @@ final class NetworkMonitor: @unchecked Sendable {
   }
 }
 
+// MARK: - [7.3] Market ID constants
+// SStats.net: подтверждено на /Odds/{id} и /Games/{id} (2026-09).
+// 1X2 (1) сохранён как константа для settle исторических записей журнала,
+// но в генерации новых сигналов не используется.
+
+enum MarketID {
+  static let matchWinner   = 1   // 1X2 (только для settle старых записей)
+  static let goals         = 5   // Total Goals (основной)
+  static let goalsHome     = 16  // Total - Home
+  static let goalsAway     = 17  // Total - Away
+  static let totalCorners  = 45  // Corners Over Under
+  static let totalCards    = 80  // Cards Over/Under (только Betano)
+}
+
+// MARK: - [7.1] Bookmaker models for `/Odds/{id}`
+
+struct RawPrice: Codable, Hashable {
+  let name: String
+  let value: Double
+}
+
+struct RawMarket: Codable, Hashable {
+  let marketId: Int
+  let marketName: String?
+  let odds: [RawPrice]
+}
+
+struct BookmakerOdds: Codable, Hashable, Identifiable {
+  var id: Int { bookmakerId }
+  let bookmakerId: Int
+  let bookmakerName: String
+  let odds: [RawMarket]
+}
+
+// MARK: - [7.2] Odds lookup helpers
+
+enum OddsQuery {
+  /// Найти цену в одном букмекере по (marketId, selection, line).
+  /// selection сравнивается по вхождению в name (case-insensitive).
+  /// line — если задана, из name извлекается число и сверяется.
+  static func find(marketId: Int,
+                   selection: String,
+                   line: Double?,
+                   in bookmaker: BookmakerOdds) -> Double? {
+    guard let market = bookmaker.odds.first(where: { $0.marketId == marketId })
+    else { return nil }
+    let target = selection.lowercased()
+    for p in market.odds {
+      let name = p.name.lowercased()
+      if !(name == target || name.contains(target) || target.contains(name)) { continue }
+      if let need = line {
+        guard let got = extractLine(from: p.name) else { continue }
+        if abs(got - need) > 0.01 { continue }
+      }
+      return p.value
+    }
+    return nil
+  }
+
+  static func extractLine(from s: String) -> Double? {
+    let regex = try? NSRegularExpression(pattern: "([0-9]+(?:\\.[0-9]+)?)")
+    if let m = regex?.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+       let r = Range(m.range(at: 1), in: s) {
+      return Double(s[r])
+    }
+    return nil
+  }
+}
+
 // MARK: - SStatsClient (SStats.net actual API)
 
 final class SStatsClient {
@@ -236,14 +305,101 @@ final class SStatsClient {
     try await get("/Games/glicko/\(id)", query: [:])
   }
 
-  /// Коэффициенты: в SStats.net НЕ отдельный эндпоинт. Все odds внутри `/Games/{id}`.
-  /// Возвращаем gameInfo — парсер сам достанет odds.
-  func odds(numericID: Int) async throws -> JSONValue {
-    try await get("/Games/\(numericID)", query: ["TimeZone": "3"])
+  /// [7.4] Полные котировки по букмекерам: `/Odds/{gameId}`.
+  /// Возвращает массив `BookmakerOdds` (bookmakerId, bookmakerName, odds[]).
+  /// Обновлено: этот эндпоинт существует и отдаёт ВСЕ рынки,
+  /// включая углы (45) и карточки (80), которых НЕТ в /Games/{id}.
+  func fullOdds(gameId: Int) async throws -> [BookmakerOdds] {
+    let json = try await get("/Odds/\(gameId)", query: [:])
+    return Self.parseBookmakers(from: json)
   }
+
+  /// Парсер ответа `/Odds/{id}`. Структура:
+  /// { "status": "OK", "count": N, "data": [ { "bookmakerId":..,"bookmakerName":"..","odds":[{marketId,marketName,odds:[{name,value}]}] } ] }
+  static func parseBookmakers(from json: JSONValue) -> [BookmakerOdds] {
+    let arr = json.object?["data"]?.array ?? json.array ?? []
+    var out: [BookmakerOdds] = []
+    for bv in arr {
+      guard let b = bv.object,
+            let bid = b["bookmakerId"]?.number,
+            let bname = b["bookmakerName"]?.string,
+            let markets = b["odds"]?.array
+      else { continue }
+      var rawMarkets: [RawMarket] = []
+      for mv in markets {
+        guard let m = mv.object,
+              let mid = m["marketId"]?.number,
+              let prices = m["odds"]?.array
+        else { continue }
+        let mname = m["marketName"]?.string
+        var rawPrices: [RawPrice] = []
+        for pv in prices {
+          guard let p = pv.object,
+                let name = p["name"]?.string,
+                let value = p["value"]?.number
+          else { continue }
+          rawPrices.append(RawPrice(name: name, value: value))
+        }
+        rawMarkets.append(RawMarket(marketId: Int(mid),
+                                     marketName: mname,
+                                     odds: rawPrices))
+      }
+      out.append(BookmakerOdds(bookmakerId: Int(bid),
+                                bookmakerName: bname,
+                                odds: rawMarkets))
+    }
+    return out
+  }
+
+  /// [7.5] Best available price по всем букмекерам.
+  /// Возвращает (value, bookmakerName) или nil.
+  static func bestPrice(marketId: Int,
+                        selection: String,
+                        line: Double?,
+                        across books: [BookmakerOdds]) -> (value: Double, bookmaker: String)? {
+    var best: (value: Double, bookmaker: String)? = nil
+    for b in books {
+      if let v = OddsQuery.find(marketId: marketId,
+                                 selection: selection,
+                                 line: line,
+                                 in: b),
+         v > 1 {
+        if best == nil || v > best!.value {
+          best = (v, b.bookmakerName)
+        }
+      }
+    }
+    return best
+  }
+
+  /// [7.6] Цена конкретного букмекера (например, Pinnacle id=4) — для sharp-line.
+  static func sharpPrice(marketId: Int,
+                         selection: String,
+                         line: Double?,
+                         bookmakerId: Int,
+                         across books: [BookmakerOdds]) -> (value: Double, bookmaker: String)? {
+    guard let b = books.first(where: { $0.bookmakerId == bookmakerId }),
+          let v = OddsQuery.find(marketId: marketId,
+                                  selection: selection,
+                                  line: line,
+                                  in: b),
+          v > 1
+    else { return nil }
+    return (v, b.bookmakerName)
+  }
+
+  /// ID Pinnacle в SStats.net — 4 (подтверждено /Odds/1183255).
+  static let pinnacleBookmakerId = 4
 
   /// Live: в SStats.net не поддерживается. nil → fallback на odds(numericID:).
   func oddsLive(numericID: Int) async throws -> JSONValue? { return nil }
+
+  /// Коэффициенты: /Games/{id} содержит marketId 1, 2, 5, 12, 16, 17.
+  /// Для углов (45) и карточек (80) используйте `fullOdds(gameId:)`.
+  /// Метод оставлен для обратной совместимости с существующим кодом.
+  func odds(numericID: Int) async throws -> JSONValue {
+    try await get("/Games/\(numericID)", query: ["TimeZone": "3"])
+  }
 
   // MARK: - Team history
 
@@ -273,6 +429,7 @@ final class SStatsClient {
   private static func ttl(for path: String) -> TimeInterval {
     if path.hasPrefix("/Games/list") { return 15 * 60 }
     if path.hasPrefix("/Games/glicko") { return 6 * 3600 }
+    if path.hasPrefix("/Odds/") { return 30 * 60 }   // [7.7]
     if path.hasPrefix("/Games/") { return 30 * 60 }
     return 5 * 60
   }

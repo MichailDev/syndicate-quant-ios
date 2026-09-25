@@ -111,6 +111,10 @@ enum UncertaintyBand {
 }
 
 // MARK: - Match
+// [7.8] Добавлены опциональные поля для settle углов/карточек.
+// Заполняются в QuantEngine при парсинге `statistics` из /Games/{id}.
+// Все поля — опциональные с default nil: старые записи и текущий код,
+// который их не заполняет, продолжат работать.
 
 struct Match: Identifiable, Codable, Hashable {
   let id: String
@@ -125,6 +129,14 @@ struct Match: Identifiable, Codable, Hashable {
   var oddsJSON: JSONValue?
   var numericID: Int?
   var status: Int? = nil
+
+  // Settlement data для углов и карточек (из `statistics` в /Games/{id})
+  var homeCorners: Int? = nil
+  var awayCorners: Int? = nil
+  var homeYellows: Int? = nil
+  var awayYellows: Int? = nil
+  var homeReds: Int? = nil
+  var awayReds: Int? = nil
 }
 
 struct Quote: Codable, Hashable {
@@ -204,6 +216,10 @@ struct BetSignal: Identifiable, Codable, Hashable {
 
   var modelVote: Int? = nil
   var modelVoteDetail: String? = nil
+
+  // [7.14] Источник котировки для углов/карточек:
+  // "Pinnacle" для углов (edge vs sharp), "Best (Betano)" для карточек.
+  var oddsSource: String? = nil
 }
 
 // MARK: - Team rating
@@ -966,6 +982,10 @@ enum Metrics {
 }
 
 // MARK: - JournalService
+// [7.9] settleOpenEntries переписан:
+//   • для 1X2/GOALS — как было, через homeFTResult/awayFTResult
+//   • для CORNERS/CARDS — читаем statistics из /Games/{id} и closing odds из /Odds/{id}
+//   • TeamRating обновляется только для 1X2/GOALS (углы/ЖК не влияют на Elo)
 
 enum JournalService {
   @MainActor
@@ -980,36 +1000,58 @@ enum JournalService {
       guard let info = try? await client.gameInfo(entry.gameID) else {
         failed += 1; continue
       }
-      // /Games/{id} → {data: {game: {...}}} либо {data: {...}}
+      // /Games/{id} → {data: {game: {...}, statistics: {...}, ...}}
       let data = info.object?["data"]?.object ?? info.object ?? [:]
       let game = data["game"]?.object ?? data
+      let stats = data["statistics"]?.object ?? game["statistics"]?.object ?? [:]
 
-      guard let hFT = number(game, ["homeFTResult", "homeResult"]),
-            let aFT = number(game, ["awayFTResult", "awayResult"])
+      // [7.10] Единый resolve результата
+      guard let result = resolveResult(entry: entry, game: game, stats: stats)
       else { continue }
 
-      let result = evaluateResult(entry: entry, home: hFT, away: aFT)
       entry.result = result
       entry.profit = computeProfit(result: result, odds: entry.odds, stake: entry.stake)
 
-      if let closingOdds = extractClosingOdds(data: data, entry: entry),
-         closingOdds > 1 {
-        entry.closingOdds = closingOdds
-        entry.clv = entry.odds / closingOdds - 1
-        if let openOdds = entry.openingOdds, openOdds > 1 {
-          entry.movement = openOdds / closingOdds - 1
+      // Closing odds:
+      //   • 1X2/GOALS — из `data.odds` в /Games/{id}
+      //   • CORNERS/CARDS — из /Odds/{id} через bestPrice (best available)
+      if entry.market == "CORNERS" || entry.market == "CARDS" {
+        if let nid = Int(entry.gameID),
+           let books = try? await client.fullOdds(gameId: nid),
+           let closing = findClosingInBookmakers(entry: entry, books: books),
+           closing > 1 {
+          entry.closingOdds = closing
+          entry.clv = entry.odds / closing - 1
+          if let openOdds = entry.openingOdds, openOdds > 1 {
+            entry.movement = openOdds / closing - 1
+          }
+        }
+      } else {
+        if let closingOdds = extractClosingOdds(data: data, entry: entry),
+           closingOdds > 1 {
+          entry.closingOdds = closingOdds
+          entry.clv = entry.odds / closingOdds - 1
+          if let openOdds = entry.openingOdds, openOdds > 1 {
+            entry.movement = openOdds / closingOdds - 1
+          }
         }
       }
 
       entry.status = "CLOSED"
       closed += 1
 
-      let ids = extractTeamIDs(from: game)
-      if let hID = ids.home, let aID = ids.away {
-        TeamRatingService.update(context: context,
-          homeTeamID: hID, homeName: entry.home,
-          awayTeamID: aID, awayName: entry.away,
-          homeGoals: hFT, awayGoals: aFT)
+      // TeamRating: только для 1X2/GOALS
+      if entry.market == "1X2" || entry.market == "GOALS" {
+        if let hFT = number(game, ["homeFTResult", "homeResult"]),
+           let aFT = number(game, ["awayFTResult", "awayResult"]) {
+          let ids = extractTeamIDs(from: game)
+          if let hID = ids.home, let aID = ids.away {
+            TeamRatingService.update(context: context,
+              homeTeamID: hID, homeName: entry.home,
+              awayTeamID: aID, awayName: entry.away,
+              homeGoals: hFT, awayGoals: aFT)
+          }
+        }
       }
       try? await Task.sleep(for: .milliseconds(300))
     }
@@ -1017,6 +1059,31 @@ enum JournalService {
     return (closed, failed)
   }
 
+  // [7.10] Единый резолвер: возвращает WIN/LOSS/PUSH или nil (данных нет).
+  private static func resolveResult(entry: JournalEntry,
+                                    game: [String: JSONValue],
+                                    stats: [String: JSONValue]) -> String? {
+    switch entry.market {
+    case "1X2", "GOALS":
+      guard let h = number(game, ["homeFTResult", "homeResult"]),
+            let a = number(game, ["awayFTResult", "awayResult"]) else { return nil }
+      return evaluateResult(entry: entry, home: h, away: a)
+    case "CORNERS":
+      guard let hc = number(stats, ["cornerKicksHome"]),
+            let ac = number(stats, ["cornerKicksAway"]) else { return nil }
+      return evaluateResult(entry: entry, home: hc, away: ac)
+    case "CARDS":
+      guard let hy = number(stats, ["yellowCardsHome"]),
+            let ay = number(stats, ["yellowCardsAway"]) else { return nil }
+      let hr = number(stats, ["redCardsHome"]) ?? 0
+      let ar = number(stats, ["redCardsAway"]) ?? 0
+      return evaluateResult(entry: entry, home: hy + hr, away: ay + ar)
+    default:
+      return nil
+    }
+  }
+
+  // [7.11] evaluateResult расширен: CORNERS/CARDS используют ту же логику Over/Under.
   private static func evaluateResult(entry: JournalEntry,
                                      home: Double, away: Double) -> String {
     let sel = entry.selection.lowercased()
@@ -1027,7 +1094,7 @@ enum JournalService {
       else { win = away > home }
       return win ? "WIN" : "LOSS"
     }
-    if entry.market == "GOALS" {
+    if entry.market == "GOALS" || entry.market == "CORNERS" || entry.market == "CARDS" {
       guard let line = entry.line else { return "VOID" }
       let total = home + away
       let isOver = sel.contains("over") || sel.hasPrefix("o")
@@ -1087,19 +1154,42 @@ enum JournalService {
     return nil
   }
 
+  // [7.13] Closing odds для CORNERS/CARDS из /Odds/{id}.
+  // Для углов — best available (edge vs best после закрытия).
+  // Для карточек — то же, потому что букмекер всего один (Betano).
+  private static func findClosingInBookmakers(entry: JournalEntry,
+                                              books: [BookmakerOdds]) -> Double? {
+    let marketId: Int
+    switch entry.market {
+    case "CORNERS": marketId = MarketID.totalCorners
+    case "CARDS":   marketId = MarketID.totalCards
+    default: return nil
+    }
+    return SStatsClient.bestPrice(marketId: marketId,
+                                  selection: entry.selection,
+                                  line: entry.line,
+                                  across: books)?.value
+  }
+
+  // [7.12] Расширен на marketId 45 (corners) и 80 (cards).
   private static func normalizeMarketByIDAndName(_ id: Int?, _ name: String) -> String {
     if let id {
       switch id {
-      case 1: return "1X2"
-      case 5, 16, 17: return "GOALS"
-      default: return ""
+      case MarketID.matchWinner:    return "1X2"
+      case MarketID.goals,
+           MarketID.goalsHome,
+           MarketID.goalsAway:      return "GOALS"
+      case MarketID.totalCorners:   return "CORNERS"
+      case MarketID.totalCards:     return "CARDS"
+      default:                      return ""
       }
     }
-    if name.contains("corner") { return "CORNERS" }
-    if name.contains("card") || name.contains("yellow") { return "CARDS" }
-    if name.contains("goal") || name.contains("total")
-        || name.contains("over") || name.contains("under") { return "GOALS" }
-    if name.contains("1x2") || name.contains("winner") { return "1X2" }
+    let n = name.lowercased()
+    if n.contains("corner") { return "CORNERS" }
+    if n.contains("card") || n.contains("yellow") { return "CARDS" }
+    if n.contains("goal") || n.contains("total")
+        || n.contains("over") || n.contains("under") { return "GOALS" }
+    if n.contains("1x2") || n.contains("winner") { return "1X2" }
     return ""
   }
 
@@ -2031,8 +2121,12 @@ final class LiveMonitor: ObservableObject {
   private static func normalizeLiveMarket(_ id: Int?, _ name: String, _ sel: String) -> String {
     if let id {
       switch id {
-      case 1: return "1X2"
-      case 5, 16, 17: return "GOALS"
+      case MarketID.matchWinner: return "1X2"
+      case MarketID.goals,
+           MarketID.goalsHome,
+           MarketID.goalsAway: return "GOALS"
+      case MarketID.totalCorners: return "CORNERS"
+      case MarketID.totalCards: return "CARDS"
       default: break
       }
     }

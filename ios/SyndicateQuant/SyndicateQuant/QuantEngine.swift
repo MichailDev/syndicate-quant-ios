@@ -96,12 +96,15 @@ struct QuantEngine {
     var out: [String: [TeamRecord]] = [:]
     for item in items {
       guard let o = item.object else { continue }
+      // [7.20] Список не содержит statistics, но если вдруг передали полный
+      // /Games/{id} — извлекаем.
+      let stats = o["statistics"]?.object ?? [:]
       if let hid = teamID(o, "home"),
-         let rec = recordFromGame(o, teamID: hid, isHome: true) {
+         let rec = recordFromGame(o, statistics: stats, teamID: hid, isHome: true) {
         out[hid, default: []].append(rec)
       }
       if let aid = teamID(o, "away"),
-         let rec = recordFromGame(o, teamID: aid, isHome: false) {
+         let rec = recordFromGame(o, statistics: stats, teamID: aid, isHome: false) {
         out[aid, default: []].append(rec)
       }
     }
@@ -111,20 +114,38 @@ struct QuantEngine {
     return out
   }
 
+  // [7.20] Извлекаем corners / cards / fouls / xg из statistics.
+  // Если statistics пустой (например из /Games/list) — поля остаются nil.
   private func recordFromGame(
-    _ o: [String: JSONValue], teamID: String, isHome: Bool
+    _ o: [String: JSONValue],
+    statistics: [String: JSONValue] = [:],
+    teamID: String, isHome: Bool
   ) -> TeamRecord? {
     let pref = isHome ? "home" : "away"
     let opp = isHome ? "away" : "home"
     let gf = number(o, [pref + "FTResult", pref + "Result"])
     let ga = number(o, [opp + "FTResult", opp + "Result"])
     guard gf != nil || ga != nil else { return nil }
+
+    let Pref = pref.capitalized   // "Home" / "Away"
+    let Opp  = opp.capitalized
+
     return TeamRecord(
       id: string(o, ["id"]) ?? UUID().uuidString,
       date: date(o), gf: gf, ga: ga,
-      corners: nil, oppCorners: nil, cards: nil, oppCards: nil,
-      fouls: nil, oppFouls: nil, shots: nil, sot: nil,
-      possession: nil, xg: nil, oppXg: nil,
+      corners:    number(statistics, ["cornerKicks" + Pref]),
+      oppCorners: number(statistics, ["cornerKicks" + Opp]),
+      cards:      number(statistics, ["yellowCards" + Pref]),
+      oppCards:   number(statistics, ["yellowCards" + Opp]),
+      fouls:      number(statistics, ["fouls" + Pref]),
+      oppFouls:   number(statistics, ["fouls" + Opp]),
+      shots:      number(statistics, ["totalShots" + Pref]),
+      sot:        number(statistics, ["shotsOnGoal" + Pref]),
+      possession: number(statistics, ["ballPossession" + Pref]),
+      xg:         number(statistics, ["expectedGoals" + Pref])
+                    ?? number(statistics, ["calculatedXg" + Pref]),
+      oppXg:      number(statistics, ["expectedGoals" + Opp])
+                    ?? number(statistics, ["calculatedXg" + Opp]),
       referee: string(o, ["refereeName", "referee"]),
       isHome: isHome, players: [])
   }
@@ -132,10 +153,12 @@ struct QuantEngine {
   func teamRecord(from payload: JSONValue, targetID: String) -> TeamRecord? {
     let g = fullGame(payload)
     let game = g["game"]?.object ?? g
+    let stats = g["statistics"]?.object ?? [:]
     let hid = teamID(game, "home")
     let aid = teamID(game, "away")
     guard targetID == hid || targetID == aid else { return nil }
-    return recordFromGame(game, teamID: targetID, isHome: targetID == hid)
+    return recordFromGame(game, statistics: stats, teamID: targetID,
+                          isHome: targetID == hid)
   }
 
   func model(home: [TeamRecord], away: [TeamRecord], glicko: JSONValue? = nil) -> MatchModel? {
@@ -143,8 +166,12 @@ struct QuantEngine {
                      teamRatings: (nil, nil), playerImpact: (1.0, 1.0))
   }
 
+  // [7.16] Новый параметр fullOdds — котировки из /Odds/{id}.
+  // Default [] — старые вызовы продолжают работать, но углы/карточки
+  // не генерируются.
   func signals(
     match: Match, info: JSONValue, oddsJSON: JSONValue,
+    fullOdds: [BookmakerOdds] = [],
     homeHistory: [TeamRecord], awayHistory: [TeamRecord],
     glicko: JSONValue? = nil,
     posteriorBuckets: [PosteriorBucket] = [],
@@ -162,7 +189,12 @@ struct QuantEngine {
       teamRatings: teamRatings, playerImpact: (hImpact, aImpact))
     else { return [] }
 
-    let quotes = parseQuotes(oddsJSON)
+    // [7.17] Собираем котировки из двух источников:
+    //   • oddsJSON — /Games/{id}, только Goals/1X2 (1X2 теперь отфильтрован)
+    //   • fullOdds — /Odds/{id}, углы (Pinnacle) и карточки (best available)
+    var quotes = parseQuotes(oddsJSON)
+    quotes.append(contentsOf: parseCornersCardsQuotes(fullOdds))
+
     var out: [BetSignal] = []
     let grouped = Dictionary(grouping: quotes, by: { key($0) })
     let refereeName = string(info.allObjects().first ?? [:], ["refereeName", "referee"])
@@ -192,24 +224,23 @@ struct QuantEngine {
       var voteCount: Int? = nil
       var voteDetail: String? = nil
 
-      if q.market == "1X2" {
-        p = compute1X2Probability(q: q, model: matchModel, n: 20000, seed: 17)
-        modelName = "ENSEMBLE(DC+BIV+NB)+MC"
-        let marketProb = QuantMath.median(qs.map { 1.0 / max($0.odds, 1.01) }) ?? 0.5
-        let v = vote1X2(q: q, model: matchModel, market: marketProb)
-        voteCount = v.count
-        voteDetail = v.detail
-      } else if q.market == "GOALS" {
+      if q.market == "GOALS" {
         p = totalProbabilityFromDistribution(q, dist: totalDist)
         modelName = "ENSEMBLE(DC/BIV/NB)+MC"
       } else if q.market == "CARDS" {
         p = computeCardsProbability(q: q, records: homeHistory + awayHistory, ref: ref)
-        modelName = "POISSON/NB+REFEREE+RSI"
+        modelName = "NB+REFEREE+RSI"
       } else if q.market == "CORNERS" {
-        let mean = meanCount(homeHistory + awayHistory, \.corners) ?? 10.0
-        p = totalProbability(q, mean: mean,
-          variance: countVariance(homeHistory + awayHistory, \.corners))
-        modelName = "POISSON/NB+PRESSURE"
+        // [7.18] Total corners = сумма (corners + oppCorners) по всем матчам.
+        let totals = (homeHistory + awayHistory).compactMap { r -> Double? in
+          guard let c = r.corners, let oc = r.oppCorners else { return nil }
+          return c + oc
+        }
+        let mean = QuantMath.shrink(totals, baseline: nil, k: 8) ?? 10.5
+        let nbVar = mean + (mean * mean) / QuantMath.nbCornersR
+        let variance = QuantMath.variance(totals) ?? nbVar
+        p = totalProbability(q, mean: mean, variance: variance)
+        modelName = "NB+PRESSURE"
       } else { continue }
 
       if var s = finish(
@@ -291,34 +322,6 @@ struct QuantEngine {
       outcomesNB: (oNB.home, oNB.draw, oNB.away))
   }
 
-  private func vote1X2(q: Quote, model: MatchModel, market: Double)
-    -> (count: Int, detail: String) {
-    let threshold = 0.01
-    let side = q.selectionKey
-    func pick(_ t: (home: Double, draw: Double, away: Double)) -> Double {
-      switch side {
-      case "1": return t.home
-      case "X": return t.draw
-      default: return t.away
-      }
-    }
-    let hits = [
-      ("DC", pick(model.outcomesDC)),
-      ("BIV", pick(model.outcomesBIV)),
-      ("NB", pick(model.outcomesNB)),
-      ("ENS", pick(model.outcomes))
-    ].filter { $0.1 > market + threshold }.map { $0.0 }
-
-    let misses = [
-      ("DC", pick(model.outcomesDC)),
-      ("BIV", pick(model.outcomesBIV)),
-      ("NB", pick(model.outcomesNB)),
-      ("ENS", pick(model.outcomes))
-    ].filter { $0.1 <= market + threshold }.map { $0.0 }
-
-    return (hits.count, "\(hits.joined(separator: " ")) | \(misses.joined(separator: " "))")
-  }
-
   private func playerImpact(history: [TeamRecord], expectedIDs: [String]) -> Double {
     guard !expectedIDs.isEmpty else { return 1.0 }
     let pa = playerAssembly(history)
@@ -336,24 +339,6 @@ struct QuantEngine {
     return 0.88
   }
 
-  private func compute1X2Probability(q: Quote, model: MatchModel,
-                                     n: Int, seed: UInt64) -> Double {
-    let mc = QuantMath.monteCarloOutcome(model.matrix, n: n, seed: seed)
-    let modelSide: Double
-    switch q.selectionKey {
-    case "1": modelSide = model.outcomes.home
-    case "X": modelSide = model.outcomes.draw
-    default:  modelSide = model.outcomes.away
-    }
-    let mcSide: Double
-    switch q.selectionKey {
-    case "1": mcSide = mc.0
-    case "X": mcSide = mc.1
-    default:  mcSide = mc.2
-    }
-    return 0.80 * modelSide + 0.20 * mcSide
-  }
-
   private func totalProbabilityFromDistribution(_ q: Quote, dist: [Double]) -> Double {
     guard let line = q.line else { return 0.5 }
     let s = q.selection.lowercased()
@@ -365,13 +350,20 @@ struct QuantEngine {
     }
   }
 
+  // [7.19] Считаем total cards = cards + oppCards по всем матчам.
   private func computeCardsProbability(q: Quote, records: [TeamRecord],
                                        ref: RefProfile) -> Double {
-    var mean = meanCount(records, \.cards) ?? 4.0
+    let totals = records.compactMap { r -> Double? in
+      guard let c = r.cards, let oc = r.oppCards else { return nil }
+      return c + oc
+    }
+    var mean = QuantMath.shrink(totals, baseline: nil, k: 8) ?? 4.0
     if ref.n >= 6, let rv = ref.cards {
       mean = blendRef(base: mean, ref: rv, n: ref.n)
     }
-    return totalProbability(q, mean: mean, variance: countVariance(records, \.cards))
+    let nbVar = mean + (mean * mean) / QuantMath.nbCardsR
+    let variance = QuantMath.variance(totals) ?? nbVar
+    return totalProbability(q, mean: mean, variance: variance)
   }
 
   private func finish(
@@ -474,6 +466,13 @@ struct QuantEngine {
     signal.worstOdds = worstQuote?.odds
     signal.worstBook = worstQuote?.bookmaker
     signal.avgOdds = avgOdds
+
+    // [7.21] Источник котировки для углов / карточек.
+    if q.market == "CORNERS" {
+      signal.oddsSource = "Pinnacle (sharp)"
+    } else if q.market == "CARDS" {
+      signal.oddsSource = "Best (\(q.bookmaker))"
+    }
     return signal
   }
 
@@ -481,16 +480,7 @@ struct QuantEngine {
                           modelOutcomes: (home: Double, draw: Double, away: Double)) -> Double {
     let edge = max(0, ev)
     let robustBonus: Double = robustEV > 0 ? 15 : 0
-    let agreementBonus: Double
-    if q.market == "1X2" {
-      let modelSelected: Double
-      switch q.selectionKey {
-      case "1": modelSelected = modelOutcomes.home
-      case "X": modelSelected = modelOutcomes.draw
-      default:  modelSelected = modelOutcomes.away
-      }
-      agreementBonus = max(0, 1 - abs(p - modelSelected)) * 25
-    } else { agreementBonus = 15 }
+    let agreementBonus: Double = 15
     return max(0, min(100, 30 + edge * 500 + robustBonus + agreementBonus))
   }
 
@@ -709,10 +699,6 @@ struct QuantEngine {
     return max(0.1, base * (1 - w) + ref * w)
   }
 
-  private func meanCount(_ r: [TeamRecord], _ kp: (TeamRecord) -> Double?) -> Double? {
-    QuantMath.shrink(r.compactMap(kp), baseline: nil, k: 8)
-  }
-
   private func countVariance(_ r: [TeamRecord],
                              _ kp: (TeamRecord) -> Double?) -> Double {
     let x = r.compactMap(kp)
@@ -780,7 +766,6 @@ struct QuantEngine {
       let marketId = m["marketId"]?.number.map { Int($0) }
       let marketName = string(m, ["marketName", "market", "market_name"]) ?? ""
 
-      // marketId имеет приоритет (marketName может быть null)
       let marketFromId = Self.marketFromId(marketId)
 
       guard let prices = m["odds"]?.array else { continue }
@@ -808,11 +793,58 @@ struct QuantEngine {
     return out
   }
 
+  // [7.22] Парсит /Odds/{id} → котировки углов и карточек.
+  //   • Углы (marketId 45): только Pinnacle (bookmakerId = 4), т.к.
+  //     edge считаем против sharp-линии.
+  //   • Карточки (marketId 80): best available по всем букмекерам
+  //     (в реальных ответах их 1 — Betano).
+  private func parseCornersCardsQuotes(_ books: [BookmakerOdds]) -> [Quote] {
+    guard !books.isEmpty else { return [] }
+    var out: [Quote] = []
+
+    // Corners: только Pinnacle
+    if let pin = books.first(where: { $0.bookmakerId == SStatsClient.pinnacleBookmakerId }),
+       let market = pin.odds.first(where: { $0.marketId == MarketID.totalCorners }) {
+      for p in market.odds {
+        out.append(Quote(market: "CORNERS",
+                         selection: p.name,
+                         line: extractLine(p.name),
+                         odds: p.value,
+                         bookmaker: pin.bookmakerName))
+      }
+    }
+
+    // Cards: best available по (name + line)
+    var best: [String: (value: Double, name: String, line: Double?, book: String)] = [:]
+    for b in books {
+      guard let market = b.odds.first(where: { $0.marketId == MarketID.totalCards })
+      else { continue }
+      for p in market.odds {
+        let line = extractLine(p.name)
+        let k = "\(p.name.lowercased())|\(line.map { String($0) } ?? "")"
+        if let cur = best[k], cur.value >= p.value { continue }
+        best[k] = (p.value, p.name, line, b.bookmakerName)
+      }
+    }
+    for (_, v) in best {
+      out.append(Quote(market: "CARDS", selection: v.name,
+                       line: v.line, odds: v.value, bookmaker: v.book))
+    }
+
+    return out
+  }
+
+  // [7.17] 1X2 (marketId 1) намеренно исключён — этот рынок больше
+  // не генерирует сигналов. Существующие записи в журнале с market=1X2
+  // продолжат settle-иться через JournalService.
   static func marketFromId(_ id: Int?) -> String {
     guard let id else { return "" }
     switch id {
-    case 1: return "1X2"
-    case 5, 16, 17: return "GOALS"
+    case MarketID.goals,
+         MarketID.goalsHome,
+         MarketID.goalsAway: return "GOALS"
+    case MarketID.totalCorners: return "CORNERS"
+    case MarketID.totalCards:   return "CARDS"
     default: return ""
     }
   }
@@ -845,18 +877,14 @@ struct QuantEngine {
                       disagreement: dis, sharpClose: sm, sharpOpen: nil)
   }
 
+  // [7.17] Убран "1X2" из fallback — там был "home/draw/away", что давало
+  // ложные срабатывания. Теперь только GOALS/CORNERS/CARDS.
   private func normalizeMarket(_ x: String) -> String {
     let s = x.lowercased()
     if s.contains("corner") { return "CORNERS" }
     if s.contains("card") || s.contains("yellow") { return "CARDS" }
     if s.contains("goal") || s.contains("total")
         || s.contains("over") || s.contains("under") { return "GOALS" }
-    let trimmed = s.trimmingCharacters(in: .whitespaces)
-    if s.contains("1x2") || s.contains("winner")
-        || s.contains("home") || s.contains("draw") || s.contains("away")
-        || trimmed == "1" || trimmed == "x" || trimmed == "2" {
-      return "1X2"
-    }
     return ""
   }
 

@@ -50,6 +50,13 @@ enum AsianOutcome: String {
 
 enum QuantMath {
 
+  // MARK: - [7.15] NB parameters for corners / cards
+  // Fixed-r overdispersion. var = mean + mean²/r.
+  // Corners: mean total ≈ 10.5, SD ≈ 4  →  r = 20
+  // Cards:   mean total ≈ 4.0,  SD ≈ 2.45  →  r = 8
+  static let nbCornersR = 20.0
+  static let nbCardsR   = 8.0
+
   // MARK: - Basic
 
   static func clamp(_ x: Double, _ lo: Double = 1e-9, _ hi: Double = 1 - 1e-9) -> Double {
@@ -91,7 +98,6 @@ enum QuantMath {
     return clamp(0.5 + (clamp(p) - 0.5) * c)
   }
 
-  /// Wilson score 95% CI для вероятности (n = размер выборки, k = успехов)
   static func wilsonInterval(successes k: Int, trials n: Int, z: Double = 1.96)
     -> (low: Double, high: Double)
   {
@@ -103,7 +109,6 @@ enum QuantMath {
     return (max(0, centre - margin), min(1, centre + margin))
   }
 
-  /// Beta-сжатие: сглаживает вероятность маленьких выборок к prior
   static func betaShrink(_ successes: Int, _ n: Int, priorMean: Double = 0.5,
                           priorStrength: Double = 4) -> Double {
     let s = Double(successes) + priorMean * priorStrength
@@ -113,14 +118,12 @@ enum QuantMath {
 
   // MARK: - Weighting & shrinkage
 
-  /// Экспоненциальный decay с tunable half-life.
   static func weightedRecent(_ xs: [Double], halfLife: Double = 0.5) -> Double? {
     guard !xs.isEmpty else { return nil }
     var sw = 0.0
     var sx = 0.0
     let n = xs.count
     for (i, x) in xs.enumerated() {
-      // Экспоненциальный decay: newest → weight=1, oldest → weight=halfLife^n
       let age = Double(n - 1 - i)
       let w = pow(halfLife, age)
       sw += w
@@ -171,7 +174,6 @@ enum QuantMath {
     return m
   }
 
-  /// Bivariate Poisson с общей компонентой λ3 (для низких счётов)
   static func bivariatePoisson(_ lh: Double, _ la: Double, l3: Double = 0.05,
                                maxGoals: Int = 12) -> Matrix2D {
     let l1 = max(1e-8, lh - l3)
@@ -180,7 +182,6 @@ enum QuantMath {
     var m = Matrix2D(n: maxGoals + 1)
     for i in 0...maxGoals {
       for j in 0...maxGoals {
-        // Сумма по общей компоненте k
         var p = 0.0
         for k in 0...min(i, j) {
           let kd = Double(k)
@@ -222,7 +223,6 @@ enum QuantMath {
     return p
   }
 
-  /// Возвращает полную дистрибуцию тотала: P(total = k) для k = 0..maxGoals*2
   static func totalDistribution(_ m: Matrix2D) -> [Double] {
     let maxTotal = (m.n - 1) * 2
     var dist = Array(repeating: 0.0, count: maxTotal + 1)
@@ -248,35 +248,46 @@ enum QuantMath {
     return prob * pow(p, r)
   }
 
+  // MARK: - [7.15] NB direct probability for fixed r
+
+  /// P(total > line) для NB с фиксированным r.
+  /// line может быть .5 (обычно) или целым (тогда P(X > line) = P(X >= line+1)).
+  static func nbCornersOver(mean: Double, line: Double) -> Double {
+    nbFixedROver(mean: mean, r: nbCornersR, line: line)
+  }
+  static func nbCardsOver(mean: Double, line: Double) -> Double {
+    nbFixedROver(mean: mean, r: nbCardsR, line: line)
+  }
+  static func nbFixedROver(mean: Double, r: Double, line: Double) -> Double {
+    let variance = mean + (mean * mean) / max(0.1, r)
+    let k = Int(floor(line))
+    var cdf = 0.0
+    if k >= 0 {
+      for i in 0...k {
+        cdf += negativeBinomialPMF(i, mean: mean, variance: variance)
+      }
+    }
+    return max(0, min(1, 1 - cdf))
+  }
+
   // MARK: - Asian / quarter lines
 
-  /// Разбивает линию на список "обычных" линий.
-  /// Over 9.25 → [Over 9.0, Over 9.5]
-  /// Over 9.0  → [Over 9.0]
-  /// Over 9.5  → [Over 9.5]
-  /// Over 9.75 → [Over 9.5, Over 10.0]
   static func splitQuarterLine(_ line: Double) -> [Double] {
     let frac = abs(line) - floor(abs(line))
     let sign: Double = line < 0 ? -1 : 1
     let base = floor(abs(line))
-    // .0 или .5 → одна линия
     if abs(frac) < 0.001 || abs(frac - 0.5) < 0.001 {
       return [line]
     }
-    // .25 или .75 → две линии
     if abs(frac - 0.25) < 0.001 {
-      // 9.25 → 9.0 и 9.5
       return [sign * base, sign * (base + 0.5)]
     }
     if abs(frac - 0.75) < 0.001 {
-      // 9.75 → 9.5 и 10.0
       return [sign * (base + 0.5), sign * (base + 1.0)]
     }
-    // Прочие дробные — не азиатская, вернём как есть
     return [line]
   }
 
-  /// Вероятность Over при азиатской линии: 0.5 * P(over line1) + 0.5 * P(over line2)
   static func overAsianProbability(
     _ dist: [Double], line: Double
   ) -> (over: Double, push: Double) {
@@ -287,7 +298,6 @@ enum QuantMath {
       let exact = probTotalEqual(dist, l)
       return (over, exact)
     }
-    // Quarter line: две линии, вес 0.5 каждая
     let l1 = lines[0]
     let l2 = lines[1]
     let over1 = probTotalGreater(dist, l1)
@@ -297,7 +307,6 @@ enum QuantMath {
     return (0.5 * over1 + 0.5 * over2, 0.5 * push1 + 0.5 * push2)
   }
 
-  /// Вероятность Under при азиатской линии
   static func underAsianProbability(
     _ dist: [Double], line: Double
   ) -> (under: Double, push: Double) {
@@ -336,7 +345,6 @@ enum QuantMath {
     return dist[k]
   }
 
-  /// Settlement азиатской линии при known total goals
   static func settleAsianTotal(
     total: Int, line: Double, isOver: Bool
   ) -> AsianOutcome {
@@ -347,8 +355,7 @@ enum QuantMath {
       weight += 1.0
       if isOver {
         if Double(total) > l { score += 1 }
-        else if Double(total) == l { score += 0.5 }  // push
-        // иначе 0
+        else if Double(total) == l { score += 0.5 }
       } else {
         if Double(total) < l { score += 1 }
         else if Double(total) == l { score += 0.5 }
@@ -366,7 +373,6 @@ enum QuantMath {
 
   static func ev(p: Double, odds: Double) -> Double { p * odds - 1 }
 
-  /// Full Kelly (без урезаний — модификаторы в QuantEngine)
   static func kelly(p: Double, odds: Double) -> Double {
     let b = odds - 1
     let q = 1 - p
@@ -374,7 +380,6 @@ enum QuantMath {
     return max(0, (b * p - q) / b)
   }
 
-  /// Fractional Kelly с явным fraction (0.25 для quarter Kelly)
   static func fractionalKelly(p: Double, odds: Double, fraction: Double = 0.25) -> Double {
     fraction * kelly(p: p, odds: odds)
   }
@@ -426,7 +431,7 @@ enum QuantMath {
     return Double(hits) / Double(max(n, 1))
   }
 
-  // MARK: - Statistical metrics (для Metrics / BacktestEngine)
+  // MARK: - Statistical metrics
 
   static func logLoss(predicted: Double, actual: Double) -> Double {
     let eps = 1e-9
@@ -462,12 +467,9 @@ enum QuantMath {
 
   // MARK: - Referee RSI
 
-  /// RSI-подобный индекс судьи. >50 — жёсткий, <50 — мягкий.
-  /// cardsPerGame = среднее карточек за игру, n = размер выборки.
   static func refereeRSI(cardsPerGame: Double, leagueMean: Double, n: Int) -> Double {
     guard n >= 3, leagueMean > 0 else { return 50 }
     let ratio = cardsPerGame / leagueMean
-    // Маппим ratio [0.5..1.5] → RSI [0..100]
     let rsi = 50 + (ratio - 1.0) * 100
     return max(0, min(100, rsi))
   }
@@ -507,7 +509,7 @@ enum QuantMathSelfTest {
                        note: String(format: "median = %.4f", m)))
     }
 
-    // 3. MAD (median absolute deviation)
+    // 3. MAD
     do {
       let v = QuantMath.mad([1.0, 2.0, 3.0, 4.0, 5.0]) ?? -1
       out.append(Check(name: "MAD вокруг медианы",
@@ -591,6 +593,30 @@ enum QuantMathSelfTest {
       out.append(Check(name: "NB PMF сумма 0..20 ≈ 1",
                        pass: abs(total - 1.0) < 0.05,
                        note: String(format: "sum = %.4f", total)))
+    }
+
+    // 13. NB corners P(Over 9.5 | mean=10.5) ∈ [0, 1]
+    do {
+      let p = QuantMath.nbCornersOver(mean: 10.5, line: 9.5)
+      out.append(Check(name: "NB corners P ∈ [0,1]",
+                       pass: p >= 0 && p <= 1,
+                       note: String(format: "p = %.4f", p)))
+    }
+
+    // 14. NB corners mean=10.5 → P(Over 9.5) в разумных границах (0.5 … 0.75)
+    do {
+      let p = QuantMath.nbCornersOver(mean: 10.5, line: 9.5)
+      out.append(Check(name: "NB corners mean=10.5 → P(Over 9.5) ≈ 0.6",
+                       pass: p > 0.50 && p < 0.75,
+                       note: String(format: "p = %.4f", p)))
+    }
+
+    // 15. NB cards P(Over 4.5 | mean=4.0) ∈ [0, 1]
+    do {
+      let p = QuantMath.nbCardsOver(mean: 4.0, line: 4.5)
+      out.append(Check(name: "NB cards P ∈ [0,1]",
+                       pass: p >= 0 && p <= 1,
+                       note: String(format: "p = %.4f", p)))
     }
 
     return out

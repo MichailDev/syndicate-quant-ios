@@ -558,12 +558,14 @@ struct RootView: View {
     return n
   }
 
+  // [7.26] Heatmap: 1X2-колонка убрана, добавлены CORNERS и CARDS.
+  // Данные появятся после пересборки базы (нужен патч Models.swift).
   @ViewBuilder
   private var leagueMarketHeatmapSection: some View {
     let stats = currentSnapshot?.decodedLeagueMarketStats() ?? [:]
     if !stats.isEmpty {
       let leagues = LeaguePool.pool.map { $0.name }
-      let markets = ["1X2", "GOALS", "CARDS", "CORNERS"]
+      let markets = ["GOALS", "CARDS", "CORNERS"]
       Section("Лиги × Рынки (ROI)") {
         Text("Цвет: зелёный — плюс, красный — минус. Точки: n ставок.")
           .font(.caption2).foregroundStyle(.secondary)
@@ -943,7 +945,7 @@ struct RootView: View {
             }
           }
         } else {
-          Text("Нажмите кнопку — 12 проверок QuantMath.")
+          Text("Нажмите кнопку — 15 проверок QuantMath.")
             .font(.caption2).foregroundStyle(.secondary)
         }
       }
@@ -1134,7 +1136,7 @@ struct RootView: View {
           Stepper("Интервал: \(settings.liveMonitorIntervalSec) сек",
                   value: $settings.liveMonitorIntervalSec, in: 30...300, step: 30)
         }
-        Text("Опрашивает /Odds/live/{id}. Если эндпоинт недоступен — использует /Odds/{id}.")
+        Text("Опрашивает /Odds/{id}. Для углов и карточек — те же котировки.")
           .font(.caption2).foregroundStyle(.secondary)
       }
       Section("Автообновление") {
@@ -1243,6 +1245,10 @@ struct SignalCard: View {
         Text("MS \(String(format: "%.0f", signal.ms))")
         Text("Sample \(signal.sampleClass)")
         Text("\(signal.bookmakers)b")
+        // [7.28] Источник котировки для углов/карточек
+        if let src = signal.oddsSource {
+          Text(src).foregroundStyle(.blue)
+        }
         if signal.posteriorWeight != nil { Text("PST").foregroundStyle(.purple) }
         if signal.stopApplied != nil { Text("STOP").foregroundStyle(.red) }
         if signal.playerImpactHome != nil || signal.playerImpactAway != nil {
@@ -1259,9 +1265,14 @@ struct SignalCard: View {
     .padding(.vertical, 6)
   }
 
+  // [7.27] В marketLine добавлен источник котировки для углов/карточек.
   private var marketLine: String {
     let linePart: String = signal.line.map { " \($0)" } ?? ""
-    return "\(signal.league) · \(signal.market) · \(signal.selection)\(linePart)"
+    var base = "\(signal.league) · \(signal.market) · \(signal.selection)\(linePart)"
+    if let src = signal.oddsSource {
+      base += " · \(src)"
+    }
+    return base
   }
 
   @ViewBuilder
@@ -1315,6 +1326,20 @@ struct SignalDetailView: View {
       }
 
       matchPreviewSection
+
+      // [7.29] Источник котировки для углов и карточек
+      if let src = signal.oddsSource {
+        Section("Источник котировки") {
+          LabeledContent("Источник", value: src)
+          if signal.market == "CORNERS" {
+            Text("Edge считается против sharp-линии Pinnacle (bookmakerId=4).")
+              .font(.caption2).foregroundStyle(.secondary)
+          } else if signal.market == "CARDS" {
+            Text("Edge считается против лучшей доступной котировки среди букмекеров. В реальных ответах SStats карточки часто только у Betano.")
+              .font(.caption2).foregroundStyle(.secondary)
+          }
+        }
+      }
 
       Section("Классификация") {
         HStack {

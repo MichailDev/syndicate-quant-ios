@@ -94,6 +94,17 @@ struct WalkForwardReport {
 }
 
 // MARK: - Backtester
+//
+// [7.25] ВАЖНО про углы и карточки:
+//   Для того, чтобы walk-forward смог settle-ить CORNERS/CARDS, каждый Match
+//   должен иметь заполненные `homeCorners / awayCorners / homeYellows / awayYellows`
+//   (и опционально `homeReds / awayReds`). Это делает BacktestService,
+//   догружая /Games/{id} для завершённых матчей. Если поля nil —
+//   сигнал будет создан, но settle вернёт nil и ставка не попадёт в отчёт.
+//
+//   Котировки углов (marketId=45) и карточек (marketId=80) приходят из
+//   /Odds/{id}. BacktestService объединяет их с /Games/{id} в Match.oddsJSON
+//   перед вызовом run(...).
 
 struct WalkForwardBacktester {
 
@@ -127,6 +138,10 @@ struct WalkForwardBacktester {
         "awayFTResult": .number(aFT),
       ])
 
+      // fullOdds передаётся пустым: предполагается, что BacktestService уже
+      // вложил углы/карточки в oddsJSON (комбинированная структура).
+      // parseQuotes умеет читать оба ключа: "data" (от /Games/{id})
+      // и "bookmakers" (от /Odds/{id}) — см. Models.swift после патча.
       let signals = engine.portfolio(
         engine.signals(
           match: match, info: infoJSON, oddsJSON: oddsJSON,
@@ -258,23 +273,58 @@ struct WalkForwardBacktester {
     return "Odds 5.0+"
   }
 
+  // [7.23] settle расширен на 4 рынка.
+  // Для углов и карточек используем total = свои + чужие (либо карточки + красные).
+  // Если у Match не заполнены corners/yellows/reds — возвращаем nil,
+  // и ставка не попадёт в отчёт (без падения).
   private func settle(match: Match, signal: BetSignal) -> AsianOutcome? {
-    guard let h = match.homeFT, let a = match.awayFT else { return nil }
+    switch signal.market {
 
-    if signal.market == "1X2" {
+    // [7.24] 1X2 сохранён: старые записи в снапшотах могут иметь market="1X2".
+    // Новые сигналы по 1X2 не создаются (QuantEngine), но если что-то попало —
+    // settlement работает корректно.
+    case "1X2":
+      guard let h = match.homeFT, let a = match.awayFT else { return nil }
       let sel = signal.selection.lowercased()
       let win: Bool
       if sel.contains("home") || sel == "1" { win = h > a }
       else if sel.contains("draw") || sel == "x" { win = h == a }
       else { win = a > h }
       return win ? .win : .loss
-    }
 
-    guard let line = signal.line else { return nil }
-    let total = Int(h + a)
-    let isOver = signal.selection.lowercased().contains("over")
-      || signal.selection.lowercased().hasPrefix("o")
-    return QuantMath.settleAsianTotal(total: total, line: line, isOver: isOver)
+    case "GOALS":
+      guard let line = signal.line,
+            let h = match.homeFT, let a = match.awayFT else { return nil }
+      let total = Int(h + a)
+      return QuantMath.settleAsianTotal(
+        total: total, line: line, isOver: isOverSignal(signal))
+
+    case "CORNERS":
+      guard let line = signal.line,
+            let hc = match.homeCorners, let ac = match.awayCorners
+      else { return nil }
+      let total = hc + ac
+      return QuantMath.settleAsianTotal(
+        total: total, line: line, isOver: isOverSignal(signal))
+
+    case "CARDS":
+      guard let line = signal.line,
+            let hy = match.homeYellows, let ay = match.awayYellows
+      else { return nil }
+      let hr = match.homeReds ?? 0
+      let ar = match.awayReds ?? 0
+      let total = hy + ay + hr + ar
+      return QuantMath.settleAsianTotal(
+        total: total, line: line, isOver: isOverSignal(signal))
+
+    default:
+      return nil
+    }
+  }
+
+  private func isOverSignal(_ signal: BetSignal) -> Bool {
+    let s = signal.selection.lowercased()
+    return s.contains("over") || s.hasPrefix("o")
   }
 }
 
@@ -291,7 +341,6 @@ struct MultiModelBacktester {
     let engine = QuantEngine()
     let configs = ["DC", "BIV", "NB", "ENS"]
 
-    // Равномерная выборка по всей базе, а не только последние.
     let sorted = matches.sorted {
       ($0.start ?? .distantPast) < ($1.start ?? .distantPast)
     }
