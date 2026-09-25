@@ -18,7 +18,7 @@ enum LeaguePool {
   static func name(for id: Int) -> String? { pool.first(where: { $0.id == id })?.name }
 }
 
-// MARK: - League baselines (Волна A, A4)
+// MARK: - League baselines
 
 struct LeagueBaseline: Identifiable, Hashable {
   let id: Int
@@ -247,7 +247,7 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
-// MARK: - BacktestRun (legacy, не используется в UI с G5, оставлен для совместимости)
+// MARK: - BacktestRun (legacy, не в UI)
 
 @Model final class BacktestRun {
   @Attribute(.unique) var id: String
@@ -361,7 +361,7 @@ struct AutoExcludeRule: Codable, Hashable, Identifiable {
   var totalMatches: Int
   var totalBets: Int
   var buildProgress: Double
-  var buildStatus: String       // idle | building | ready | failed
+  var buildStatus: String
   var lastError: String?
 
   var perLeagueJSON: Data?
@@ -439,7 +439,7 @@ extension BacktestSnapshot {
   }
 }
 
-// MARK: - Волна G: Auto-Exclude
+// MARK: - Auto-Exclude
 
 enum AutoExclude {
   static let minBets = 20
@@ -459,13 +459,18 @@ enum AutoExclude {
     }.sorted { $0.roi < $1.roi }
   }
 
+  /// True если сигнал попал под Auto-Exclude.
+  /// Матчинг «мягкий»: одна строка содержится в другой (caseInsensitive),
+  /// чтобы «England Premier League» в API и «Premier League» в снапшоте сходились.
   static func isExcluded(
     league: String, market: String, rules: [AutoExcludeRule]
   ) -> Bool {
     rules.contains { r in
-      r.excluded
-        && r.league.caseInsensitiveCompare(league) == .orderedSame
-        && r.market.caseInsensitiveCompare(market) == .orderedSame
+      guard r.excluded else { return false }
+      guard market.caseInsensitiveCompare(r.market) == .orderedSame else { return false }
+      let a = league.lowercased()
+      let b = r.league.lowercased()
+      return a == b || a.contains(b) || b.contains(a)
     }
   }
 }
@@ -801,7 +806,7 @@ final class AppDependencies {
   private init() {}
 }
 
-// MARK: - BacktestService (Волна G: G2 + G3)
+// MARK: - BacktestService (Волна G: G2 + G3 + G8)
 
 @MainActor
 final class BacktestService {
@@ -844,7 +849,6 @@ final class BacktestService {
       return false
     }
 
-    // Сброс состояния для нового сбора.
     snapshot.buildStatus = "building"
     snapshot.buildProgress = 0
     snapshot.lastError = nil
@@ -878,7 +882,6 @@ final class BacktestService {
     var monthIndex = 0
     var lastSaved = Date()
 
-    // Сбор по месячным окнам (7 — на этот этап, 0.15 — odds, 0.15 — walk-forward)
     while cursor < toDate {
       guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
       let periodEnd = min(nextMonth, toDate)
@@ -913,7 +916,6 @@ final class BacktestService {
       cursor = nextMonth
       monthIndex += 1
 
-      // Периодически сохраняем прогресс (не теряется при падении).
       if Date().timeIntervalSince(lastSaved) > 25 {
         snapshot.buildProgress = monthProgress
         try? context.save()
@@ -921,14 +923,12 @@ final class BacktestService {
       }
     }
 
-    // Сортировка историй по дате.
     for (k, v) in allHistories {
       allHistories[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
     }
 
     progress(0.70, "Матчей собрано: \(allMatches.count). Дотягиваю odds…")
 
-    // Дотягивание odds: сначала те, у которых есть inline, потом остальные (limit).
     var prepared: [Match] = allMatches.filter { ($0.oddsJSON?.array?.isEmpty == false) }
     let needOdds = allMatches.filter { ($0.oddsJSON?.array?.isEmpty != false) }
     let cap = min(needOdds.count, Self.oddsFetchCap)
@@ -986,6 +986,9 @@ final class BacktestService {
       report.byOddsBand.mapValues { Self.toStored($0) })
     snapshot.classificationJSON = try? encoder.encode(
       report.byClassification.mapValues { Self.toStored($0) })
+    // G8: posterior buckets из betRecords.
+    snapshot.posteriorJSON = try? encoder.encode(
+      Self.buildPosteriorBuckets(from: report.betRecords))
 
     snapshot.buildStatus = "ready"
     snapshot.buildProgress = 1.0
@@ -999,10 +1002,7 @@ final class BacktestService {
   // MARK: - G3: докачка за неделю с merge
 
   func updateIncremental() async -> Bool {
-    guard !isBuilding else {
-      print("[BT] updateIncremental: занято сбором")
-      return false
-    }
+    guard !isBuilding else { return false }
     isBuilding = true
     defer { isBuilding = false }
 
@@ -1030,12 +1030,11 @@ final class BacktestService {
       let json = try await client.listGamesRange(
         from: fromDate, to: toDate, limit: Self.gamesPerRequest)
 
-      var newMatches = engine.matches(from: json)
+      let newMatches = engine.matches(from: json)
         .filter { !Self.isExcluded($0) }
         .filter { Self.isInPool($0.league) }
         .filter { $0.homeFT != nil && $0.awayFT != nil }
 
-      // Дотягиваем odds для новых матчей.
       var prepared: [Match] = []
       for m in newMatches {
         var mm = m
@@ -1055,10 +1054,6 @@ final class BacktestService {
         return true
       }
 
-      // Упрощение: histories за окно докачки.
-      // Для полной корректности нужно хранить histories за все 2 года
-      // (в снапшоте места не хватит). См. G-3 roadmap — при необходимости
-      // можно переключиться на хранение compacted TeamRecord.
       let records = engine.allRecords(from: json)
       var sortedRecords = records
       for (k, v) in sortedRecords {
@@ -1067,7 +1062,6 @@ final class BacktestService {
 
       let delta = backtester.run(matches: prepared, histories: sortedRecords)
 
-      // Merge дельты в снапшот.
       let encoder = JSONEncoder()
 
       let oldLeagues = snapshot.decodedLeagueStats()
@@ -1093,14 +1087,15 @@ final class BacktestService {
       snapshot.oddsBucketsJSON = try? encoder.encode(newOdds)
       snapshot.classificationJSON = try? encoder.encode(newClass)
 
-      // Пересчёт глобальных агрегатов (приближённо — через новые merge).
+      // Мержим posterior buckets.
+      let oldPosterior = snapshot.decodedPosteriorBuckets()
+      let newPosterior = Self.mergePosterior(
+        old: oldPosterior,
+        delta: Self.buildPosteriorBuckets(from: delta.betRecords))
+      snapshot.posteriorJSON = try? encoder.encode(newPosterior)
+
       snapshot.totalMatches += delta.matches
       snapshot.totalBets += delta.bets
-      // avgROI: пересчёт по merged-данным пока не делаем — приближённо через дельту.
-      // Точный пересчёт будет в G-3 при полном merge.
-      if let last = snapshot.builtAt {
-        _ = last
-      }
       snapshot.toDate = toDate
       snapshot.builtAt = Date()
       try? context.save()
@@ -1163,6 +1158,51 @@ final class BacktestService {
       profit: newProfit, staked: newStaked, avgOdds: newAvgOdds)
   }
 
+  // G8: 10 полос по probability, внутри каждой — факт. hit rate.
+  static func buildPosteriorBuckets(from bets: [BetRecord]) -> [PosteriorBucket] {
+    var buckets: [PosteriorBucket] = []
+    for i in 0..<10 {
+      let lo = Double(i) / 10.0
+      let hi = Double(i + 1) / 10.0
+      let inBucket = bets.filter { b in
+        let idx = min(9, max(0, Int(b.probability * 10.0)))
+        return idx == i
+      }
+      let n = inBucket.count
+      let hitRate = n > 0
+        ? inBucket.reduce(0.0) { $0 + $1.actual } / Double(n)
+        : 0
+      buckets.append(PosteriorBucket(
+        probabilityLow: lo, probabilityHigh: hi,
+        n: n, factHitRate: hitRate))
+    }
+    return buckets
+  }
+
+  static func mergePosterior(
+    old: [PosteriorBucket], delta: [PosteriorBucket]
+  ) -> [PosteriorBucket] {
+    var out: [PosteriorBucket] = []
+    for i in 0..<max(old.count, delta.count) {
+      let o = i < old.count ? old[i] : PosteriorBucket(
+        probabilityLow: Double(i) / 10.0,
+        probabilityHigh: Double(i + 1) / 10.0,
+        n: 0, factHitRate: 0)
+      let d = i < delta.count ? delta[i] : PosteriorBucket(
+        probabilityLow: Double(i) / 10.0,
+        probabilityHigh: Double(i + 1) / 10.0,
+        n: 0, factHitRate: 0)
+      let newN = o.n + d.n
+      let weightedSum = o.factHitRate * Double(o.n) + d.factHitRate * Double(d.n)
+      let newHit = newN > 0 ? weightedSum / Double(newN) : 0
+      out.append(PosteriorBucket(
+        probabilityLow: o.probabilityLow,
+        probabilityHigh: o.probabilityHigh,
+        n: newN, factHitRate: newHit))
+    }
+    return out
+  }
+
   private static func isExcluded(_ m: Match) -> Bool {
     let x = "\(m.league) \(m.home) \(m.away)".lowercased()
     let bad = ["friendly", "women", "женщ", "u19 women", "u20 women"]
@@ -1176,7 +1216,7 @@ final class BacktestService {
   }
 }
 
-// MARK: - ScanCoordinator
+// MARK: - ScanCoordinator (G6: читает снапшот, применяет Auto-Exclude)
 
 @MainActor
 final class ScanCoordinator {
@@ -1254,8 +1294,24 @@ final class ScanCoordinator {
         signalsOut.append(contentsOf: s)
       }
 
+      // G6: читаем снапшот, строим Auto-Exclude.
+      let excludedRules = Self.loadExcludedRules()
+      let excludedCount = excludedRules.filter { $0.excluded }.count
+
+      let filtered = signalsOut.filter { s in
+        !AutoExclude.isExcluded(
+          league: s.league, market: s.market, rules: excludedRules)
+      }
+      let removed = signalsOut.count - filtered.count
+      if removed > 0 {
+        summary.notes.append(
+          "Auto-Exclude: убрано \(removed) из \(signalsOut.count) (правил: \(excludedCount))")
+      } else if excludedCount > 0 {
+        summary.notes.append("Auto-Exclude: правил \(excludedCount), попаданий 0")
+      }
+
       summary.scannedMatches = count
-      summary.signals = engine.portfolio(signalsOut)
+      summary.signals = engine.portfolio(filtered, excludedRules: excludedRules)
       summary.finishedAt = Date()
       summary.success = true
 
@@ -1272,6 +1328,14 @@ final class ScanCoordinator {
   func scanInBackground() async -> Bool {
     let result = await scan(settings: nil)
     return result.success
+  }
+
+  /// Читает снапшот и возвращает правила Auto-Exclude.
+  private static func loadExcludedRules() -> [AutoExcludeRule] {
+    guard let container = AppDependencies.shared.container else { return [] }
+    let context = ModelContext(container)
+    let snap = BacktestService.fetchOrCreate(in: context)
+    return AutoExclude.rules(from: snap)
   }
 
   private static func isExcluded(_ m: Match) -> Bool {

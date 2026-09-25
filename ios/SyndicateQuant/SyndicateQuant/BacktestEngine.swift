@@ -18,6 +18,16 @@ struct SegmentStats {
   var expectancy: Double { bets > 0 ? profit / Double(bets) : 0 }
 }
 
+// MARK: - BetRecord (Волна G, G8)
+
+struct BetRecord: Codable, Hashable {
+  var probability: Double
+  var probabilityLow: Double
+  var probabilityHigh: Double
+  var ev: Double
+  var actual: Double   // WIN=1, PUSH=0.5, LOSS=0
+}
+
 // MARK: - Full report
 
 struct WalkForwardReport {
@@ -52,6 +62,9 @@ struct WalkForwardReport {
   var byClassification: [String: SegmentStats] = [:]
   var byOddsBand: [String: SegmentStats] = [:]
   var byWeek: [String: SegmentStats] = [:]
+
+  // G8: сырые записи для posterior buckets.
+  var betRecords: [BetRecord] = []
 
   var roi: Double { staked > 0 ? profit / staked : 0 }
   var yieldPct: Double { roi }
@@ -135,13 +148,19 @@ struct WalkForwardBacktester {
 
         guard let outcome = settle(match: match, signal: s) else { continue }
 
-        // probabilityValue: WIN=1, PUSH=0.5, LOSS=0
         let actualVal = outcome.probabilityValue
         let predicted = s.probability
         r.brierSum += (predicted - actualVal) * (predicted - actualVal)
         r.logLossSum += QuantMath.logLoss(predicted: predicted, actual: actualVal)
 
-        // PnL через multiplier
+        // G8: сырая запись для posterior.
+        r.betRecords.append(BetRecord(
+          probability: predicted,
+          probabilityLow: s.probabilityLow,
+          probabilityHigh: s.probabilityHigh,
+          ev: s.ev,
+          actual: actualVal))
+
         let pnlMultiplier = outcome.pnlMultiplier(odds: s.odds)
         let pnl = s.stake * pnlMultiplier
 
@@ -241,7 +260,6 @@ struct WalkForwardBacktester {
     return "Odds 5.0+"
   }
 
-  /// Правильный settlement через AsianOutcome.
   private func settle(match: Match, signal: BetSignal) -> AsianOutcome? {
     guard let h = match.homeFT, let a = match.awayFT else { return nil }
 

@@ -311,13 +311,13 @@ struct RootView: View {
     }
   }
 
-  // MARK: - Авто (G2/G3/G5)
+  // MARK: - Авто
 
   private var autoView: some View {
     List {
       Section {
         Text("Backtest Service").font(.headline)
-        Text("Собирает базу за 2 года × 8 лиг в фоне. Используется для авто-исключений и корректировки порогов.")
+        Text("Собирает базу за 2 года × 8 лиг. Служит источником для Auto-Exclude и калибровочных поправок.")
           .font(.caption).foregroundStyle(.secondary)
       }
 
@@ -383,66 +383,16 @@ struct RootView: View {
             .font(.caption.monospaced())
             .foregroundStyle(.secondary)
         }
-
-        Text("Полный сбор идёт в фореграунде — не сворачивайте приложение до конца. iOS может прервать работу; прогресс сохраняется каждые ~25 сек.")
-          .font(.caption2).foregroundStyle(.secondary)
       }
 
       if let snap = currentSnapshot {
-        let leagues = snap.decodedLeagueStats()
-        if !leagues.isEmpty {
-          Section("Лиги (ROI)") {
-            ForEach(leagues.keys.sorted(), id: \.self) { lg in
-              if let s = leagues[lg] {
-                segmentRow(name: lg, s: s)
-              }
-            }
-          }
-        }
-
-        let markets = snap.decodedMarketStats()
-        if !markets.isEmpty {
-          Section("Рынки (ROI)") {
-            ForEach(markets.keys.sorted(), id: \.self) { mk in
-              if let s = markets[mk] {
-                segmentRow(name: mk, s: s)
-              }
-            }
-          }
-        }
-
-        let evB = snap.decodedEVBuckets()
-        if !evB.isEmpty {
-          Section("EV buckets") {
-            ForEach(evB.keys.sorted(), id: \.self) { k in
-              if let s = evB[k] {
-                segmentRow(name: k, s: s)
-              }
-            }
-          }
-        }
-
-        let oddsB = snap.decodedOddsBuckets()
-        if !oddsB.isEmpty {
-          Section("Odds bands") {
-            ForEach(oddsB.keys.sorted(), id: \.self) { k in
-              if let s = oddsB[k] {
-                segmentRow(name: k, s: s)
-              }
-            }
-          }
-        }
-
-        let clB = snap.decodedClassification()
-        if !clB.isEmpty {
-          Section("Классы") {
-            ForEach(clB.keys.sorted(), id: \.self) { k in
-              if let s = clB[k] {
-                segmentRow(name: k, s: s)
-              }
-            }
-          }
-        }
+        autoExcludeSection(snap)
+        posteriorSection(snap)
+        leagueSection(snap)
+        marketSection(snap)
+        evSection(snap)
+        oddsSection(snap)
+        classSection(snap)
       }
 
       Section("Задачи Волны G") {
@@ -454,11 +404,14 @@ struct RootView: View {
           .foregroundStyle(.green)
         Label("G4 BGProcessingTask", systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("G5 Удалить Backtest, расширить Авто", systemImage: "checkmark.circle.fill")
+        Label("G5 Backtest → Авто", systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("G6 Фильтр мёртвых комбинаций в ScanCoordinator", systemImage: "circle.dashed")
-        Label("G7 Auto-Exclude (ROI < −5%, n≥20)", systemImage: "circle.dashed")
-        Label("G8 Posterior buckets", systemImage: "circle.dashed")
+        Label("G6 Фильтр мёртвых комбинаций", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+        Label("G7 Auto-Exclude (ROI < −5%, n≥20)", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+        Label("G8 Posterior buckets", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
       }
 
       Section("Принцип") {
@@ -471,6 +424,123 @@ struct RootView: View {
     .listStyle(.insetGrouped)
     .navigationTitle("Авто")
     .navigationBarTitleDisplayMode(.large)
+  }
+
+  @ViewBuilder
+  private func autoExcludeSection(_ snap: BacktestSnapshot) -> some View {
+    let rules = AutoExclude.rules(from: snap)
+    let excluded = rules.filter { $0.excluded }
+    Section("Auto-Exclude (ROI < −5%, n≥20)") {
+      if rules.isEmpty {
+        Text("Нет данных по лига+рынок (соберите базу)")
+          .font(.caption).foregroundStyle(.secondary)
+      } else if excluded.isEmpty {
+        Text("Пока не исключено ни одной комбинации")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        Text("\(excluded.count) комбинаций будут отфильтрованы в сканере")
+          .font(.caption2).foregroundStyle(.secondary)
+        ForEach(excluded) { r in
+          HStack {
+            VStack(alignment: .leading, spacing: 2) {
+              Text("\(r.league) · \(r.market)").font(.subheadline)
+              Text("n=\(r.bets)").font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(String(format: "%+.1f%%", r.roi * 100))
+              .font(.subheadline.monospacedDigit())
+              .foregroundStyle(.red)
+          }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func posteriorSection(_ snap: BacktestSnapshot) -> some View {
+    let buckets = snap.decodedPosteriorBuckets()
+    let nonEmpty = buckets.filter { $0.n > 0 }
+    Section("Posterior buckets (факт. hit rate)") {
+      if nonEmpty.isEmpty {
+        Text("Нет данных (соберите базу)")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        ForEach(nonEmpty) { b in
+          HStack {
+            Text(String(format: "P %.0f–%.0f%%",
+                        b.probabilityLow * 100, b.probabilityHigh * 100))
+              .font(.caption.monospacedDigit())
+            Spacer()
+            Text(String(format: "act %.0f%%", b.factHitRate * 100))
+              .font(.caption.monospacedDigit())
+              .foregroundStyle(.primary)
+            Text("n=\(b.n)")
+              .font(.caption2).foregroundStyle(.secondary)
+              .frame(width: 52, alignment: .trailing)
+          }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func leagueSection(_ snap: BacktestSnapshot) -> some View {
+    let stats = snap.decodedLeagueStats()
+    if !stats.isEmpty {
+      Section("Лиги (ROI)") {
+        ForEach(stats.keys.sorted(), id: \.self) { lg in
+          if let s = stats[lg] { segmentRow(name: lg, s: s) }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func marketSection(_ snap: BacktestSnapshot) -> some View {
+    let stats = snap.decodedMarketStats()
+    if !stats.isEmpty {
+      Section("Рынки (ROI)") {
+        ForEach(stats.keys.sorted(), id: \.self) { mk in
+          if let s = stats[mk] { segmentRow(name: mk, s: s) }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func evSection(_ snap: BacktestSnapshot) -> some View {
+    let stats = snap.decodedEVBuckets()
+    if !stats.isEmpty {
+      Section("EV buckets") {
+        ForEach(stats.keys.sorted(), id: \.self) { k in
+          if let s = stats[k] { segmentRow(name: k, s: s) }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func oddsSection(_ snap: BacktestSnapshot) -> some View {
+    let stats = snap.decodedOddsBuckets()
+    if !stats.isEmpty {
+      Section("Odds bands") {
+        ForEach(stats.keys.sorted(), id: \.self) { k in
+          if let s = stats[k] { segmentRow(name: k, s: s) }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func classSection(_ snap: BacktestSnapshot) -> some View {
+    let stats = snap.decodedClassification()
+    if !stats.isEmpty {
+      Section("Классы") {
+        ForEach(stats.keys.sorted(), id: \.self) { k in
+          if let s = stats[k] { segmentRow(name: k, s: s) }
+        }
+      }
+    }
   }
 
   private func segmentRow(name: String, s: StoredSegmentStats) -> some View {
@@ -563,6 +633,10 @@ struct RootView: View {
             LabeledContent("Sharpe",
                            value: String(format: "%.2f", snap.sharpe))
           }
+          let rules = AutoExclude.rules(from: snap)
+          let excludedCount = rules.filter { $0.excluded }.count
+          LabeledContent("Auto-Exclude (активных)",
+                         value: "\(excludedCount)")
           if let err = snap.lastError {
             Text(err).font(.caption).foregroundStyle(.red)
           }
