@@ -139,7 +139,7 @@ struct BetSignal: Identifiable, Codable, Hashable {
   let selection: String
   let line: Double?
   let odds: Double
-  let probability: Double
+  let probability: Double        // финальная (с posterior)
   let fairOdds: Double
   let ev: Double
   let robustEV: Double
@@ -172,6 +172,11 @@ struct BetSignal: Identifiable, Codable, Hashable {
   let stakeCap: Double
   var portfolioCorrelation: Double
   var correlationReason: String
+
+  // B2: диагностика posterior
+  var probabilityRaw: Double? = nil      // p_model до posterior
+  var posteriorWeight: Double? = nil     // применённый вес (0 если не применялся)
+  var posteriorSource: String? = nil     // текстовое описание бакета
 }
 
 // MARK: - Journal
@@ -247,7 +252,7 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
-// MARK: - BacktestRun (legacy, не в UI)
+// MARK: - BacktestRun (legacy)
 
 @Model final class BacktestRun {
   @Attribute(.unique) var id: String
@@ -297,7 +302,7 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
-// MARK: - Волна G: Backtest snapshot
+// MARK: - Backtest snapshot
 
 struct StoredSegmentStats: Codable, Hashable {
   var bets: Int
@@ -459,9 +464,6 @@ enum AutoExclude {
     }.sorted { $0.roi < $1.roi }
   }
 
-  /// True если сигнал попал под Auto-Exclude.
-  /// Матчинг «мягкий»: одна строка содержится в другой (caseInsensitive),
-  /// чтобы «England Premier League» в API и «Premier League» в снапшоте сходились.
   static func isExcluded(
     league: String, market: String, rules: [AutoExcludeRule]
   ) -> Bool {
@@ -806,7 +808,7 @@ final class AppDependencies {
   private init() {}
 }
 
-// MARK: - BacktestService (Волна G: G2 + G3 + G8)
+// MARK: - BacktestService (G2 + G3 + G8)
 
 @MainActor
 final class BacktestService {
@@ -819,8 +821,6 @@ final class BacktestService {
   static let gamesPerRequest = 2000
 
   private var isBuilding = false
-
-  // MARK: - G2: полный сбор 2 года × 8 лиг
 
   func buildFullBase(
     progress: @MainActor @escaping (Double, String) -> Void
@@ -986,7 +986,6 @@ final class BacktestService {
       report.byOddsBand.mapValues { Self.toStored($0) })
     snapshot.classificationJSON = try? encoder.encode(
       report.byClassification.mapValues { Self.toStored($0) })
-    // G8: posterior buckets из betRecords.
     snapshot.posteriorJSON = try? encoder.encode(
       Self.buildPosteriorBuckets(from: report.betRecords))
 
@@ -998,8 +997,6 @@ final class BacktestService {
     progress(1.0, "Готово: \(report.matches) матчей, \(report.bets) ставок")
     return true
   }
-
-  // MARK: - G3: докачка за неделю с merge
 
   func updateIncremental() async -> Bool {
     guard !isBuilding else { return false }
@@ -1087,7 +1084,6 @@ final class BacktestService {
       snapshot.oddsBucketsJSON = try? encoder.encode(newOdds)
       snapshot.classificationJSON = try? encoder.encode(newClass)
 
-      // Мержим posterior buckets.
       let oldPosterior = snapshot.decodedPosteriorBuckets()
       let newPosterior = Self.mergePosterior(
         old: oldPosterior,
@@ -1158,7 +1154,6 @@ final class BacktestService {
       profit: newProfit, staked: newStaked, avgOdds: newAvgOdds)
   }
 
-  // G8: 10 полос по probability, внутри каждой — факт. hit rate.
   static func buildPosteriorBuckets(from bets: [BetRecord]) -> [PosteriorBucket] {
     var buckets: [PosteriorBucket] = []
     for i in 0..<10 {
@@ -1216,7 +1211,7 @@ final class BacktestService {
   }
 }
 
-// MARK: - ScanCoordinator (G6: читает снапшот, применяет Auto-Exclude)
+// MARK: - ScanCoordinator (B2: posterior передаётся в engine)
 
 @MainActor
 final class ScanCoordinator {
@@ -1270,6 +1265,17 @@ final class ScanCoordinator {
       }
       let matches = all.prefix(resolvedSettings.scanMatches)
 
+      // B2: posterior buckets из снапшота.
+      let posteriorBuckets = Self.loadPosteriorBuckets()
+      let usableBuckets = posteriorBuckets.filter { $0.n >= 20 }.count
+      if usableBuckets > 0 {
+        summary.notes.append("Posterior: \(usableBuckets) надёжных бакетов")
+      }
+
+      // G6: Auto-Exclude
+      let excludedRules = Self.loadExcludedRules()
+      let excludedCount = excludedRules.filter { $0.excluded }.count
+
       var signalsOut: [BetSignal] = []
       var count = 0
       for match in matches {
@@ -1290,13 +1296,10 @@ final class ScanCoordinator {
         let glicko = try? await client.glicko(match.id)
         let s = engine.signals(
           match: match, info: info, oddsJSON: oddsFromInfo,
-          homeHistory: hs, awayHistory: awayRecords, glicko: glicko)
+          homeHistory: hs, awayHistory: awayRecords, glicko: glicko,
+          posteriorBuckets: posteriorBuckets)
         signalsOut.append(contentsOf: s)
       }
-
-      // G6: читаем снапшот, строим Auto-Exclude.
-      let excludedRules = Self.loadExcludedRules()
-      let excludedCount = excludedRules.filter { $0.excluded }.count
 
       let filtered = signalsOut.filter { s in
         !AutoExclude.isExcluded(
@@ -1330,12 +1333,18 @@ final class ScanCoordinator {
     return result.success
   }
 
-  /// Читает снапшот и возвращает правила Auto-Exclude.
   private static func loadExcludedRules() -> [AutoExcludeRule] {
     guard let container = AppDependencies.shared.container else { return [] }
     let context = ModelContext(container)
     let snap = BacktestService.fetchOrCreate(in: context)
     return AutoExclude.rules(from: snap)
+  }
+
+  private static func loadPosteriorBuckets() -> [PosteriorBucket] {
+    guard let container = AppDependencies.shared.container else { return [] }
+    let context = ModelContext(container)
+    let snap = BacktestService.fetchOrCreate(in: context)
+    return snap.decodedPosteriorBuckets()
   }
 
   private static func isExcluded(_ m: Match) -> Bool {

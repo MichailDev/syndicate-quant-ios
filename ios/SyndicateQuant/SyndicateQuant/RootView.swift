@@ -317,7 +317,7 @@ struct RootView: View {
     List {
       Section {
         Text("Backtest Service").font(.headline)
-        Text("Собирает базу за 2 года × 8 лиг. Служит источником для Auto-Exclude и калибровочных поправок.")
+        Text("Собирает базу за 2 года × 8 лиг. Служит источником для Auto-Exclude и калибровочных поправок (B2 posterior).")
           .font(.caption).foregroundStyle(.secondary)
       }
 
@@ -395,23 +395,16 @@ struct RootView: View {
         classSection(snap)
       }
 
-      Section("Задачи Волны G") {
-        Label("G1 BacktestSnapshot", systemImage: "checkmark.circle.fill")
+      Section("Задачи Волны B") {
+        Label("B1 Model Ensemble (DC+BIV+NB)", systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("G2 buildFullBase", systemImage: "checkmark.circle.fill")
+        Label("B2 Bayesian posterior (p_adj = 0.85·p + 0.15·p_post)",
+              systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("G3 updateIncremental", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("G4 BGProcessingTask", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("G5 Backtest → Авто", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("G6 Фильтр мёртвых комбинаций", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("G7 Auto-Exclude (ROI < −5%, n≥20)", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("G8 Posterior buckets", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
+        Label("B3 Elo/Glicko team strength", systemImage: "circle.dashed")
+        Label("B4 Correlation matrix из журнала", systemImage: "circle.dashed")
+        Label("B5 Volatility stop-loss (lossStreak)", systemImage: "circle.dashed")
+        Label("B6 Player impact в λ", systemImage: "circle.dashed")
       }
 
       Section("Принцип") {
@@ -460,11 +453,14 @@ struct RootView: View {
   private func posteriorSection(_ snap: BacktestSnapshot) -> some View {
     let buckets = snap.decodedPosteriorBuckets()
     let nonEmpty = buckets.filter { $0.n > 0 }
-    Section("Posterior buckets (факт. hit rate)") {
+    let usable = nonEmpty.filter { $0.n >= 20 }.count
+    Section("Posterior buckets (B2)") {
       if nonEmpty.isEmpty {
         Text("Нет данных (соберите базу)")
           .font(.caption).foregroundStyle(.secondary)
       } else {
+        Text("Применяются бакеты с n ≥ 20. Сейчас: \(usable) из \(nonEmpty.count)")
+          .font(.caption2).foregroundStyle(.secondary)
         ForEach(nonEmpty) { b in
           HStack {
             Text(String(format: "P %.0f–%.0f%%",
@@ -473,7 +469,7 @@ struct RootView: View {
             Spacer()
             Text(String(format: "act %.0f%%", b.factHitRate * 100))
               .font(.caption.monospacedDigit())
-              .foregroundStyle(.primary)
+              .foregroundStyle(b.n >= 20 ? .primary : .secondary)
             Text("n=\(b.n)")
               .font(.caption2).foregroundStyle(.secondary)
               .frame(width: 52, alignment: .trailing)
@@ -637,6 +633,10 @@ struct RootView: View {
           let excludedCount = rules.filter { $0.excluded }.count
           LabeledContent("Auto-Exclude (активных)",
                          value: "\(excludedCount)")
+          let buckets = snap.decodedPosteriorBuckets()
+          let usableBuckets = buckets.filter { $0.n >= 20 }.count
+          LabeledContent("Posterior (n≥20)",
+                         value: "\(usableBuckets)")
           if let err = snap.lastError {
             Text(err).font(.caption).foregroundStyle(.red)
           }
@@ -672,7 +672,7 @@ struct RootView: View {
           .font(.caption).foregroundStyle(.secondary)
         Text("Portfolio cap 10% bankroll в день")
           .font(.caption).foregroundStyle(.secondary)
-        Text("BGAppRefreshTask ≥ 30 мин · BGProcessingTask — воскресенье 02:00")
+        Text("Ensemble: DC + BIV + NB-flavoured; posterior 0.15 при n≥20")
           .font(.caption).foregroundStyle(.secondary)
       }
       if !diagnostics.isEmpty {
@@ -829,6 +829,9 @@ struct SignalCard: View {
         Text("MS \(String(format: "%.0f", signal.ms))")
         Text("Sample \(signal.sampleClass)")
         Text("\(signal.bookmakers)b")
+        if signal.posteriorWeight != nil {
+          Text("PST").foregroundStyle(.purple)
+        }
       }
       .font(.caption2).foregroundStyle(.secondary)
     }
@@ -900,14 +903,37 @@ struct SignalDetailView: View {
         LabeledContent("Odds", value: String(format: "%.3f", signal.odds))
         LabeledContent("Fair odds",
                        value: String(format: "%.3f", signal.fairOdds))
-        LabeledContent("P (модель)",
+        LabeledContent("P (финальная)",
                        value: String(format: "%.2f%%", signal.probability * 100))
+        if let raw = signal.probabilityRaw, raw != signal.probability {
+          LabeledContent("P (модель)",
+                         value: String(format: "%.2f%%", raw * 100))
+        }
         LabeledContent("P (рынок)",
                        value: String(format: "%.2f%%", signal.marketProbability * 100))
         LabeledContent("EV",
                        value: String(format: "%+.2f%%", signal.ev * 100))
         LabeledContent("Robust EV",
                        value: String(format: "%+.2f%%", signal.robustEV * 100))
+      }
+
+      if let w = signal.posteriorWeight {
+        Section("Posterior correction (B2)") {
+          Text("p_adj = (1 − w)·p_model + w·p_posterior")
+            .font(.caption2).foregroundStyle(.secondary)
+          LabeledContent("Вес w", value: String(format: "%.2f", w))
+          if let src = signal.posteriorSource {
+            LabeledContent("Бакет", value: src)
+          }
+          if let raw = signal.probabilityRaw {
+            LabeledContent("p_model",
+                           value: String(format: "%.2f%%", raw * 100))
+            LabeledContent("p_adj",
+                           value: String(format: "%.2f%%", signal.probability * 100))
+            let delta = (signal.probability - raw) * 100
+            LabeledContent("Δ", value: String(format: "%+.2f п.п.", delta))
+          }
+        }
       }
 
       Section("Интервал неопределённости") {
