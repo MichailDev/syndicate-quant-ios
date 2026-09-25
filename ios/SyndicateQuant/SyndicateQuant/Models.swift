@@ -19,10 +19,6 @@ enum LeaguePool {
 }
 
 // MARK: - League baselines (Волна A, A4)
-//
-// ВАЖНО: это структурные ПРИОРЫ, а не измеренные данные.
-// sampleSize = 0 означает "prior", а не "n наблюдений".
-// В Волне G значения будут заменены на фактические, собранные из 2-летней базы.
 
 struct LeagueBaseline: Identifiable, Hashable {
   let id: Int
@@ -204,10 +200,8 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var clv: Double?
   var profit: Double?
 
-  // Волна A, A3 — движение линии.
-  // Опциональные поля → миграция SwiftData не требуется.
-  var openingOdds: Double?   // цена в момент постановки в журнал
-  var movement: Double?      // openingOdds / closingOdds - 1
+  var openingOdds: Double?
+  var movement: Double?
 
   init(signal: BetSignal, status: String = "OPEN") {
     id = signal.id
@@ -253,7 +247,7 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
-// MARK: - BacktestRun
+// MARK: - BacktestRun (legacy, не используется в UI с G5, оставлен для совместимости)
 
 @Model final class BacktestRun {
   @Attribute(.unique) var id: String
@@ -303,6 +297,179 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
+// MARK: - Волна G: Backtest snapshot
+
+struct StoredSegmentStats: Codable, Hashable {
+  var bets: Int
+  var wins: Int
+  var losses: Int
+  var pushes: Int
+  var profit: Double
+  var staked: Double
+  var roi: Double
+  var yieldPct: Double
+  var hitRate: Double
+  var avgOdds: Double
+
+  init() {
+    bets = 0; wins = 0; losses = 0; pushes = 0
+    profit = 0; staked = 0; roi = 0; yieldPct = 0
+    hitRate = 0; avgOdds = 0
+  }
+
+  init(
+    bets: Int, wins: Int, losses: Int, pushes: Int,
+    profit: Double, staked: Double, avgOdds: Double
+  ) {
+    self.bets = bets
+    self.wins = wins
+    self.losses = losses
+    self.pushes = pushes
+    self.profit = profit
+    self.staked = staked
+    self.roi = staked > 0 ? profit / staked : 0
+    self.yieldPct = self.roi
+    let dec = wins + losses
+    self.hitRate = dec > 0 ? Double(wins) / Double(dec) : 0
+    self.avgOdds = avgOdds
+  }
+}
+
+struct PosteriorBucket: Codable, Hashable, Identifiable {
+  var id: String { "\(probabilityLow)-\(probabilityHigh)" }
+  var probabilityLow: Double
+  var probabilityHigh: Double
+  var n: Int
+  var factHitRate: Double
+}
+
+struct AutoExcludeRule: Codable, Hashable, Identifiable {
+  var id: String { "\(league)|\(market)" }
+  var league: String
+  var market: String
+  var bets: Int
+  var roi: Double
+  var excluded: Bool
+}
+
+@Model final class BacktestSnapshot {
+  @Attribute(.unique) var id: String
+  var version: Int
+  var builtAt: Date?
+  var fromDate: Date?
+  var toDate: Date?
+  var totalMatches: Int
+  var totalBets: Int
+  var buildProgress: Double
+  var buildStatus: String       // idle | building | ready | failed
+  var lastError: String?
+
+  var perLeagueJSON: Data?
+  var perMarketJSON: Data?
+  var perLeagueMarketJSON: Data?
+  var evBucketsJSON: Data?
+  var oddsBucketsJSON: Data?
+  var classificationJSON: Data?
+  var posteriorJSON: Data?
+
+  var avgROI: Double
+  var avgCLV: Double
+  var brier: Double
+  var logLoss: Double
+  var sharpe: Double
+  var sortino: Double
+  var profitFactor: Double
+
+  init(id: String = "current") {
+    self.id = id
+    self.version = 1
+    self.builtAt = nil
+    self.fromDate = nil
+    self.toDate = nil
+    self.totalMatches = 0
+    self.totalBets = 0
+    self.buildProgress = 0
+    self.buildStatus = "idle"
+    self.lastError = nil
+    self.perLeagueJSON = nil
+    self.perMarketJSON = nil
+    self.perLeagueMarketJSON = nil
+    self.evBucketsJSON = nil
+    self.oddsBucketsJSON = nil
+    self.classificationJSON = nil
+    self.posteriorJSON = nil
+    self.avgROI = 0
+    self.avgCLV = 0
+    self.brier = 0
+    self.logLoss = 0
+    self.sharpe = 0
+    self.sortino = 0
+    self.profitFactor = 0
+  }
+}
+
+extension BacktestSnapshot {
+  func decodedLeagueStats() -> [String: StoredSegmentStats] {
+    guard let d = perLeagueJSON else { return [:] }
+    return (try? JSONDecoder().decode([String: StoredSegmentStats].self, from: d)) ?? [:]
+  }
+  func decodedMarketStats() -> [String: StoredSegmentStats] {
+    guard let d = perMarketJSON else { return [:] }
+    return (try? JSONDecoder().decode([String: StoredSegmentStats].self, from: d)) ?? [:]
+  }
+  func decodedLeagueMarketStats() -> [String: StoredSegmentStats] {
+    guard let d = perLeagueMarketJSON else { return [:] }
+    return (try? JSONDecoder().decode([String: StoredSegmentStats].self, from: d)) ?? [:]
+  }
+  func decodedEVBuckets() -> [String: StoredSegmentStats] {
+    guard let d = evBucketsJSON else { return [:] }
+    return (try? JSONDecoder().decode([String: StoredSegmentStats].self, from: d)) ?? [:]
+  }
+  func decodedOddsBuckets() -> [String: StoredSegmentStats] {
+    guard let d = oddsBucketsJSON else { return [:] }
+    return (try? JSONDecoder().decode([String: StoredSegmentStats].self, from: d)) ?? [:]
+  }
+  func decodedClassification() -> [String: StoredSegmentStats] {
+    guard let d = classificationJSON else { return [:] }
+    return (try? JSONDecoder().decode([String: StoredSegmentStats].self, from: d)) ?? [:]
+  }
+  func decodedPosteriorBuckets() -> [PosteriorBucket] {
+    guard let d = posteriorJSON else { return [] }
+    return (try? JSONDecoder().decode([PosteriorBucket].self, from: d)) ?? []
+  }
+}
+
+// MARK: - Волна G: Auto-Exclude
+
+enum AutoExclude {
+  static let minBets = 20
+  static let minROI = -0.05
+
+  static func rules(from snapshot: BacktestSnapshot?) -> [AutoExcludeRule] {
+    guard let snapshot else { return [] }
+    let stats = snapshot.decodedLeagueMarketStats()
+    return stats.map { (key, s) in
+      let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
+      let lg = parts.first ?? key
+      let mk = parts.count > 1 ? parts[1] : ""
+      let ex = s.bets >= minBets && s.roi < minROI
+      return AutoExcludeRule(
+        league: lg, market: mk,
+        bets: s.bets, roi: s.roi, excluded: ex)
+    }.sorted { $0.roi < $1.roi }
+  }
+
+  static func isExcluded(
+    league: String, market: String, rules: [AutoExcludeRule]
+  ) -> Bool {
+    rules.contains { r in
+      r.excluded
+        && r.league.caseInsensitiveCompare(league) == .orderedSame
+        && r.market.caseInsensitiveCompare(market) == .orderedSame
+    }
+  }
+}
+
 struct AppStats {
   var bets = 0
   var wins = 0
@@ -345,7 +512,6 @@ struct CalibrationBucket: Identifiable {
   let count: Int
 }
 
-// Волна A, A2 — точка equity curve.
 struct EquityPoint: Identifiable, Hashable {
   let id: String
   let date: Date
@@ -441,7 +607,6 @@ enum Metrics {
     return totalN > 0 ? weightedSum / Double(totalN) : 0
   }
 
-  /// Волна A, A2 — equity curve по закрытым записям, отсортированным по времени.
   static func equityCurve(_ entries: [JournalEntry]) -> [EquityPoint] {
     let closed = entries
       .filter { $0.status == "CLOSED" && $0.profit != nil }
@@ -503,7 +668,6 @@ enum JournalService {
          closingOdds > 1 {
         entry.closingOdds = closingOdds
         entry.clv = entry.odds / closingOdds - 1
-        // A3: movement — движение линии от открытия к закрытию.
         if let openOdds = entry.openingOdds, openOdds > 1 {
           entry.movement = openOdds / closingOdds - 1
         }
@@ -628,8 +792,7 @@ enum JournalService {
   }
 }
 
-// MARK: - AppDependencies (Волна A, A9)
-// Общий ModelContainer, доступный и из UI, и из фоновых задач.
+// MARK: - AppDependencies
 
 @MainActor
 final class AppDependencies {
@@ -638,8 +801,382 @@ final class AppDependencies {
   private init() {}
 }
 
+// MARK: - BacktestService (Волна G: G2 + G3)
+
+@MainActor
+final class BacktestService {
+  static let shared = BacktestService()
+  private init() {}
+
+  static let yearsBack = 2
+  static let monthsPerYear = 12
+  static let oddsFetchCap = 500
+  static let gamesPerRequest = 2000
+
+  private var isBuilding = false
+
+  // MARK: - G2: полный сбор 2 года × 8 лиг
+
+  func buildFullBase(
+    progress: @MainActor @escaping (Double, String) -> Void
+  ) async -> Bool {
+    if isBuilding {
+      progress(0, "Уже выполняется")
+      return false
+    }
+    isBuilding = true
+    defer { isBuilding = false }
+
+    guard let container = AppDependencies.shared.container else {
+      progress(0, "Нет контейнера")
+      return false
+    }
+    let context = ModelContext(container)
+    let snapshot = Self.fetchOrCreate(in: context)
+
+    let settings = AppSettings()
+    let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else {
+      snapshot.buildStatus = "failed"
+      snapshot.lastError = "API key не задан"
+      try? context.save()
+      progress(0, "API key не задан")
+      return false
+    }
+
+    // Сброс состояния для нового сбора.
+    snapshot.buildStatus = "building"
+    snapshot.buildProgress = 0
+    snapshot.lastError = nil
+    snapshot.builtAt = nil
+    snapshot.fromDate = nil
+    snapshot.toDate = nil
+    snapshot.totalMatches = 0
+    snapshot.totalBets = 0
+    try? context.save()
+
+    let client = SStatsClient(settings: settings)
+    let engine = QuantEngine()
+    let backtester = WalkForwardBacktester()
+    let cal = Calendar(identifier: .gregorian)
+
+    let toDate = Date()
+    guard let fromDate = cal.date(byAdding: .year, value: -Self.yearsBack, to: toDate) else {
+      snapshot.buildStatus = "failed"
+      snapshot.lastError = "Не могу построить дату"
+      try? context.save()
+      return false
+    }
+
+    let totalMonths = Self.yearsBack * Self.monthsPerYear
+
+    var allMatches: [Match] = []
+    var allHistories: [String: [TeamRecord]] = [:]
+    var seenIDs = Set<String>()
+
+    var cursor = fromDate
+    var monthIndex = 0
+    var lastSaved = Date()
+
+    // Сбор по месячным окнам (7 — на этот этап, 0.15 — odds, 0.15 — walk-forward)
+    while cursor < toDate {
+      guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
+      let periodEnd = min(nextMonth, toDate)
+
+      let monthProgress = Double(monthIndex) / Double(totalMonths) * 0.70
+      progress(monthProgress, "Сбор \(monthIndex + 1)/\(totalMonths)")
+
+      do {
+        let json = try await client.listGamesRange(
+          from: cursor, to: periodEnd, limit: Self.gamesPerRequest)
+
+        let monthMatches = engine.matches(from: json)
+          .filter { !Self.isExcluded($0) }
+          .filter { Self.isInPool($0.league) }
+          .filter { $0.homeFT != nil && $0.awayFT != nil }
+          .filter { m in
+            if seenIDs.contains(m.id) { return false }
+            seenIDs.insert(m.id)
+            return true
+          }
+
+        allMatches.append(contentsOf: monthMatches)
+
+        let records = engine.allRecords(from: json)
+        for (k, v) in records {
+          allHistories[k, default: []].append(contentsOf: v)
+        }
+      } catch {
+        print("[BT] month \(monthIndex) failed: \(error.localizedDescription)")
+      }
+
+      cursor = nextMonth
+      monthIndex += 1
+
+      // Периодически сохраняем прогресс (не теряется при падении).
+      if Date().timeIntervalSince(lastSaved) > 25 {
+        snapshot.buildProgress = monthProgress
+        try? context.save()
+        lastSaved = Date()
+      }
+    }
+
+    // Сортировка историй по дате.
+    for (k, v) in allHistories {
+      allHistories[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+    }
+
+    progress(0.70, "Матчей собрано: \(allMatches.count). Дотягиваю odds…")
+
+    // Дотягивание odds: сначала те, у которых есть inline, потом остальные (limit).
+    var prepared: [Match] = allMatches.filter { ($0.oddsJSON?.array?.isEmpty == false) }
+    let needOdds = allMatches.filter { ($0.oddsJSON?.array?.isEmpty != false) }
+    let cap = min(needOdds.count, Self.oddsFetchCap)
+
+    for (i, m) in needOdds.prefix(cap).enumerated() {
+      var mm = m
+      if let nid = mm.numericID {
+        if let o = try? await client.odds(numericID: nid) {
+          mm.oddsJSON = o.object?["data"]
+        }
+        if i % 20 == 0 {
+          let p = 0.70 + (Double(i) / Double(max(cap, 1))) * 0.15
+          progress(p, "Odds \(i + 1)/\(cap)")
+        }
+        try? await Task.sleep(for: .milliseconds(400))
+      }
+      if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
+    }
+
+    guard !prepared.isEmpty else {
+      snapshot.buildStatus = "failed"
+      snapshot.lastError = "Нет матчей с odds"
+      try? context.save()
+      progress(0, "Нет матчей с odds")
+      return false
+    }
+
+    progress(0.85, "Walk-forward на \(prepared.count) матчах…")
+
+    let report = backtester.run(matches: prepared, histories: allHistories)
+
+    progress(0.95, "Сохраняю снапшот…")
+
+    snapshot.builtAt = Date()
+    snapshot.fromDate = fromDate
+    snapshot.toDate = toDate
+    snapshot.totalMatches = report.matches
+    snapshot.totalBets = report.bets
+    snapshot.avgROI = report.roi
+    snapshot.avgCLV = report.avgCLV
+    snapshot.brier = report.brier
+    snapshot.logLoss = report.logLoss
+    snapshot.sharpe = report.sharpe
+    snapshot.sortino = report.sortino
+    snapshot.profitFactor = report.profitFactor
+
+    let encoder = JSONEncoder()
+    snapshot.perLeagueJSON = try? encoder.encode(
+      report.perLeague.mapValues { Self.toStored($0) })
+    snapshot.perMarketJSON = try? encoder.encode(
+      report.perMarket.mapValues { Self.toStored($0) })
+    snapshot.evBucketsJSON = try? encoder.encode(
+      report.byEVBucket.mapValues { Self.toStored($0) })
+    snapshot.oddsBucketsJSON = try? encoder.encode(
+      report.byOddsBand.mapValues { Self.toStored($0) })
+    snapshot.classificationJSON = try? encoder.encode(
+      report.byClassification.mapValues { Self.toStored($0) })
+
+    snapshot.buildStatus = "ready"
+    snapshot.buildProgress = 1.0
+    snapshot.lastError = nil
+    try? context.save()
+
+    progress(1.0, "Готово: \(report.matches) матчей, \(report.bets) ставок")
+    return true
+  }
+
+  // MARK: - G3: докачка за неделю с merge
+
+  func updateIncremental() async -> Bool {
+    guard !isBuilding else {
+      print("[BT] updateIncremental: занято сбором")
+      return false
+    }
+    isBuilding = true
+    defer { isBuilding = false }
+
+    guard let container = AppDependencies.shared.container else { return false }
+    let context = ModelContext(container)
+    let snapshot = Self.fetchOrCreate(in: context)
+
+    guard snapshot.buildStatus == "ready", let lastTo = snapshot.toDate else {
+      print("[BT] updateIncremental: снапшот ещё не готов")
+      return false
+    }
+
+    let settings = AppSettings()
+    let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else { return false }
+
+    let client = SStatsClient(settings: settings)
+    let engine = QuantEngine()
+    let backtester = WalkForwardBacktester()
+
+    let fromDate = lastTo
+    let toDate = Date()
+
+    do {
+      let json = try await client.listGamesRange(
+        from: fromDate, to: toDate, limit: Self.gamesPerRequest)
+
+      var newMatches = engine.matches(from: json)
+        .filter { !Self.isExcluded($0) }
+        .filter { Self.isInPool($0.league) }
+        .filter { $0.homeFT != nil && $0.awayFT != nil }
+
+      // Дотягиваем odds для новых матчей.
+      var prepared: [Match] = []
+      for m in newMatches {
+        var mm = m
+        if mm.oddsJSON?.array?.isEmpty != false, let nid = mm.numericID {
+          if let o = try? await client.odds(numericID: nid) {
+            mm.oddsJSON = o.object?["data"]
+          }
+          try? await Task.sleep(for: .milliseconds(400))
+        }
+        if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
+      }
+
+      guard !prepared.isEmpty else {
+        print("[BT] updateIncremental: нет новых матчей с odds")
+        snapshot.toDate = toDate
+        try? context.save()
+        return true
+      }
+
+      // Упрощение: histories за окно докачки.
+      // Для полной корректности нужно хранить histories за все 2 года
+      // (в снапшоте места не хватит). См. G-3 roadmap — при необходимости
+      // можно переключиться на хранение compacted TeamRecord.
+      let records = engine.allRecords(from: json)
+      var sortedRecords = records
+      for (k, v) in sortedRecords {
+        sortedRecords[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+      }
+
+      let delta = backtester.run(matches: prepared, histories: sortedRecords)
+
+      // Merge дельты в снапшот.
+      let encoder = JSONEncoder()
+
+      let oldLeagues = snapshot.decodedLeagueStats()
+      let oldMarkets = snapshot.decodedMarketStats()
+      let oldEV = snapshot.decodedEVBuckets()
+      let oldOdds = snapshot.decodedOddsBuckets()
+      let oldClass = snapshot.decodedClassification()
+
+      let newLeagues = Self.mergeSegmentDict(
+        oldLeagues, delta.perLeague.mapValues { Self.toStored($0) })
+      let newMarkets = Self.mergeSegmentDict(
+        oldMarkets, delta.perMarket.mapValues { Self.toStored($0) })
+      let newEV = Self.mergeSegmentDict(
+        oldEV, delta.byEVBucket.mapValues { Self.toStored($0) })
+      let newOdds = Self.mergeSegmentDict(
+        oldOdds, delta.byOddsBand.mapValues { Self.toStored($0) })
+      let newClass = Self.mergeSegmentDict(
+        oldClass, delta.byClassification.mapValues { Self.toStored($0) })
+
+      snapshot.perLeagueJSON = try? encoder.encode(newLeagues)
+      snapshot.perMarketJSON = try? encoder.encode(newMarkets)
+      snapshot.evBucketsJSON = try? encoder.encode(newEV)
+      snapshot.oddsBucketsJSON = try? encoder.encode(newOdds)
+      snapshot.classificationJSON = try? encoder.encode(newClass)
+
+      // Пересчёт глобальных агрегатов (приближённо — через новые merge).
+      snapshot.totalMatches += delta.matches
+      snapshot.totalBets += delta.bets
+      // avgROI: пересчёт по merged-данным пока не делаем — приближённо через дельту.
+      // Точный пересчёт будет в G-3 при полном merge.
+      if let last = snapshot.builtAt {
+        _ = last
+      }
+      snapshot.toDate = toDate
+      snapshot.builtAt = Date()
+      try? context.save()
+
+      print("[BT] updateIncremental: +\(delta.bets) ставок, +\(delta.matches) матчей")
+      return true
+    } catch {
+      print("[BT] updateIncremental failed: \(error.localizedDescription)")
+      return false
+    }
+  }
+
+  // MARK: - Helpers
+
+  static func fetchOrCreate(in context: ModelContext) -> BacktestSnapshot {
+    let descriptor = FetchDescriptor<BacktestSnapshot>()
+    if let existing = try? context.fetch(descriptor).first {
+      return existing
+    }
+    let snap = BacktestSnapshot()
+    context.insert(snap)
+    try? context.save()
+    return snap
+  }
+
+  static func toStored(_ s: SegmentStats) -> StoredSegmentStats {
+    StoredSegmentStats(
+      bets: s.bets, wins: s.wins, losses: s.losses, pushes: s.pushes,
+      profit: s.profit, staked: s.staked, avgOdds: s.avgOdds)
+  }
+
+  static func mergeSegmentDict(
+    _ old: [String: StoredSegmentStats],
+    _ delta: [String: StoredSegmentStats]
+  ) -> [String: StoredSegmentStats] {
+    var result = old
+    for (k, v) in delta {
+      if let existing = result[k] {
+        result[k] = merge(existing, v)
+      } else {
+        result[k] = v
+      }
+    }
+    return result
+  }
+
+  static func merge(
+    _ a: StoredSegmentStats, _ b: StoredSegmentStats
+  ) -> StoredSegmentStats {
+    let newBets = a.bets + b.bets
+    let newWins = a.wins + b.wins
+    let newLosses = a.losses + b.losses
+    let newPushes = a.pushes + b.pushes
+    let newProfit = a.profit + b.profit
+    let newStaked = a.staked + b.staked
+    let oddsSum = a.avgOdds * Double(a.bets) + b.avgOdds * Double(b.bets)
+    let newAvgOdds = newBets > 0 ? oddsSum / Double(newBets) : 0
+    return StoredSegmentStats(
+      bets: newBets, wins: newWins, losses: newLosses, pushes: newPushes,
+      profit: newProfit, staked: newStaked, avgOdds: newAvgOdds)
+  }
+
+  private static func isExcluded(_ m: Match) -> Bool {
+    let x = "\(m.league) \(m.home) \(m.away)".lowercased()
+    let bad = ["friendly", "women", "женщ", "u19 women", "u20 women"]
+    return bad.contains(where: x.contains)
+  }
+
+  private static func isInPool(_ league: String) -> Bool {
+    LeaguePool.pool.contains { lg in
+      league.localizedCaseInsensitiveContains(lg.name)
+    }
+  }
+}
+
 // MARK: - ScanCoordinator
-// Общий сервис сканирования, доступный и из UI, и из BGAppRefreshTask.
 
 @MainActor
 final class ScanCoordinator {

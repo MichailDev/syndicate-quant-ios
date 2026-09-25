@@ -6,18 +6,22 @@ struct RootView: View {
   @EnvironmentObject var settings: AppSettings
   @Environment(\.modelContext) private var context
   @Query(sort: \JournalEntry.createdAt, order: .reverse) private var journal: [JournalEntry]
-  @Query(sort: \BacktestRun.createdAt, order: .reverse) private var backtests: [BacktestRun]
+  @Query private var snapshots: [BacktestSnapshot]
+
   @State private var signals: [BetSignal] = []
   @State private var status = "Готов"
   @State private var busy = false
   @State private var lastRefresh: Date?
   @State private var diagnostics: [String] = []
-  @State private var backtestStatus = "Не запускался"
   @State private var selectedLeague: String = "Все"
 
   @State private var apiReachable: String = "—"
   @State private var apiKeyState: String = "—"
   @State private var lastSettleStatus: String = "—"
+
+  @State private var btProgressText = ""
+
+  private var currentSnapshot: BacktestSnapshot? { snapshots.first }
 
   var body: some View {
     TabView {
@@ -25,8 +29,6 @@ struct RootView: View {
         .tabItem { Label("Прогноз", systemImage: "sparkles") }
       NavigationStack { journalView }
         .tabItem { Label("Журнал", systemImage: "list.bullet.rectangle") }
-      NavigationStack { backtestView }
-        .tabItem { Label("Backtest", systemImage: "chart.xyaxis.line") }
       NavigationStack { autoView }
         .tabItem { Label("Авто", systemImage: "gearshape.2") }
       NavigationStack { diagnosticsView }
@@ -35,10 +37,13 @@ struct RootView: View {
         .tabItem { Label("Настройки", systemImage: "gearshape") }
     }
     .tint(.blue)
-    .task { await refresh() }
+    .task {
+      _ = BacktestService.fetchOrCreate(in: context)
+      await refresh()
+    }
   }
 
-  // MARK: - Прогноз (A5: NavigationLink → SignalDetailView)
+  // MARK: - Прогноз
 
   private var forecast: some View {
     List {
@@ -92,7 +97,6 @@ struct RootView: View {
     .refreshable { await refresh() }
   }
 
-  /// Первое открытие карточки сигнала → запись в журнал.
   private func autoJournal(_ s: BetSignal) {
     if !journal.contains(where: { $0.id == s.id }) {
       context.insert(JournalEntry(signal: s))
@@ -100,7 +104,7 @@ struct RootView: View {
     }
   }
 
-  // MARK: - Журнал (A2: Equity chart, A3: movement)
+  // MARK: - Журнал
 
   private var journalView: some View {
     List {
@@ -307,129 +311,154 @@ struct RootView: View {
     }
   }
 
-  // MARK: - Backtest (A7: ROI heatmap лиг)
-
-  private var backtestView: some View {
-    List {
-      Section("Walk-forward") {
-        Text("Локальный backtest использует только данные, доступные ДО даты каждого матча.")
-          .font(.caption).foregroundStyle(.secondary)
-        Text(backtestStatus)
-          .font(.caption.monospaced())
-          .fixedSize(horizontal: false, vertical: true)
-          .textSelection(.enabled)
-        Button {
-          Task { await runBacktest() }
-        } label: {
-          Label("Запустить на 45 днях", systemImage: "play.fill")
-        }
-        .disabled(busy)
-      }
-      leagueHeatmapSection
-      if !backtests.isEmpty {
-        Section("История") {
-          ForEach(backtests) { b in
-            backtestRow(b)
-          }
-        }
-      }
-      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
-    }
-    .listStyle(.insetGrouped)
-    .navigationTitle("Backtest")
-    .navigationBarTitleDisplayMode(.large)
-  }
-
-  @ViewBuilder
-  private var leagueHeatmapSection: some View {
-    let cells = leagueROICells
-    Section("Лиги — ROI heatmap") {
-      if cells.isEmpty {
-        Text("Закрытых записей журнала пока нет")
-          .font(.caption).foregroundStyle(.secondary)
-      } else {
-        Text("ROI по закрытым записям журнала, сгруппированным по лиге.")
-          .font(.caption2).foregroundStyle(.secondary)
-        LazyVGrid(
-          columns: [GridItem(.adaptive(minimum: 100), spacing: 8)],
-          spacing: 8
-        ) {
-          ForEach(cells) { c in
-            VStack(spacing: 3) {
-              Text(c.league)
-                .font(.caption2).lineLimit(2)
-                .multilineTextAlignment(.center)
-              Text(String(format: "%+.1f%%", c.roi * 100))
-                .font(.caption.monospacedDigit().bold())
-              Text("n=\(c.bets)")
-                .font(.caption2).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, minHeight: 62)
-            .padding(6)
-            .background(c.color.opacity(0.28))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-          }
-        }
-        .padding(.vertical, 4)
-      }
-    }
-  }
-
-  private var leagueROICells: [LeagueROICell] {
-    let closed = journal.filter { $0.status == "CLOSED" }
-    let grouped = Dictionary(grouping: closed, by: { $0.league })
-    return grouped.map { (lg, entries) in
-      let stake = entries.reduce(0.0) { $0 + $1.stake }
-      let profit = entries.reduce(0.0) { $0 + ($1.profit ?? 0) }
-      let roi = stake > 0 ? profit / stake : 0
-      return LeagueROICell(id: lg, league: lg, bets: entries.count, roi: roi)
-    }.sorted { $0.bets > $1.bets }
-  }
-
-  private func backtestRow(_ b: BacktestRun) -> some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Text(b.createdAt.formatted(date: .abbreviated, time: .shortened))
-        .font(.headline)
-      Text("Matches \(b.matches) · Bets \(b.bets) · W/L/P \(b.wins)/\(b.losses)/\(b.pushes)")
-        .font(.subheadline)
-      Text("ROI \(b.roi * 100, specifier: "%+.2f")% · Yield \(b.yieldPct * 100, specifier: "%+.2f")% · Hit \(b.hitRate * 100, specifier: "%.1f")%")
-        .font(.caption)
-      Text("DD \(b.maxDrawdown, specifier: "%.3f") · Sharpe \(b.sharpe, specifier: "%.2f") · Brier \(b.brier, specifier: "%.3f") · LL \(b.logLoss, specifier: "%.3f")")
-        .font(.caption).foregroundStyle(.secondary)
-    }.padding(.vertical, 2)
-  }
-
-  // MARK: - Авто (A8: заглушка под Волну G)
+  // MARK: - Авто (G2/G3/G5)
 
   private var autoView: some View {
     List {
       Section {
-        Text("Волна G — Backtest Service")
-          .font(.headline)
-        Text("Приложение само собирает базу за 2 года × 8 лиг и обновляет её по воскресеньям в фоне. Результаты используются для авто-отключения «мёртвых» комбинаций (лига+рынок) и корректировки порогов.")
+        Text("Backtest Service").font(.headline)
+        Text("Собирает базу за 2 года × 8 лиг в фоне. Используется для авто-исключений и корректировки порогов.")
           .font(.caption).foregroundStyle(.secondary)
       }
 
-      Section("В работе (Волна G)") {
-        Label("BacktestSnapshot @Model", systemImage: "cylinder")
-        Label("buildFullBase (2 года, прогресс, возобновление)", systemImage: "arrow.down.circle")
-        Label("updateIncremental (докачка за неделю)", systemImage: "arrow.triangle.2.circlepath")
-        Label("BGProcessingTask по воскресеньям", systemImage: "moon.zzz")
-        Label("Замена Backtest на Авто", systemImage: "arrow.left.arrow.right")
-        Label("Auto-Exclude при ROI < −5% (n≥20)", systemImage: "xmark.octagon")
-        Label("Posterior buckets (fact hit rate)", systemImage: "chart.bar.xaxis")
+      if let snap = currentSnapshot {
+        Section("Статус") {
+          LabeledContent("Состояние", value: snap.buildStatus)
+          ProgressView(value: snap.buildProgress)
+          LabeledContent("Прогресс",
+                         value: String(format: "%.1f%%", snap.buildProgress * 100))
+          if let f = snap.fromDate, let t = snap.toDate {
+            LabeledContent("Период",
+                           value: "\(Self.shortDate(f)) – \(Self.shortDate(t))")
+          }
+          if let b = snap.builtAt {
+            LabeledContent("Собран",
+                           value: b.formatted(date: .abbreviated, time: .shortened))
+          }
+          LabeledContent("Матчей", value: "\(snap.totalMatches)")
+          LabeledContent("Ставок", value: "\(snap.totalBets)")
+          if snap.totalBets > 0 {
+            LabeledContent("avgROI",
+                           value: String(format: "%+.2f%%", snap.avgROI * 100))
+            LabeledContent("Sharpe",
+                           value: String(format: "%.2f", snap.sharpe))
+            LabeledContent("Sortino",
+                           value: String(format: "%.2f", snap.sortino))
+            LabeledContent("Profit Factor",
+                           value: String(format: "%.2f", snap.profitFactor))
+            LabeledContent("Brier",
+                           value: String(format: "%.3f", snap.brier))
+            LabeledContent("avgCLV",
+                           value: String(format: "%+.2f%%", snap.avgCLV * 100))
+          }
+          if let err = snap.lastError {
+            Text(err).font(.caption).foregroundStyle(.red)
+          }
+        }
+      } else {
+        Section("Статус") {
+          Text("Снапшот ещё не создан").font(.caption).foregroundStyle(.secondary)
+        }
       }
 
-      Section("Дальше") {
-        Label("Волна B — Model Ensemble, Elo/Glicko, Bayesian posterior", systemImage: "function")
-        Label("Волна F — Self-Tuning UI", systemImage: "slider.horizontal.3")
-        Label("Волна C — UX и визуализация", systemImage: "paintbrush")
-        Label("Волна D — Live odds, Sharp money, voting", systemImage: "bolt")
+      Section("Действия") {
+        Button {
+          Task { await runFullBuild() }
+        } label: {
+          Label("Собрать базу (2 года × 8 лиг)",
+                systemImage: "arrow.down.circle")
+        }
+        .disabled(busy || currentSnapshot?.buildStatus == "building")
+
+        Button {
+          Task { await runIncremental() }
+        } label: {
+          Label("Докачать за неделю",
+                systemImage: "arrow.triangle.2.circlepath")
+        }
+        .disabled(busy || currentSnapshot?.buildStatus != "ready")
+
+        if !btProgressText.isEmpty {
+          Text(btProgressText)
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+        }
+
+        Text("Полный сбор идёт в фореграунде — не сворачивайте приложение до конца. iOS может прервать работу; прогресс сохраняется каждые ~25 сек.")
+          .font(.caption2).foregroundStyle(.secondary)
       }
 
-      Section("Статус") {
-        LabeledContent("Снапшот", value: "не собран")
-        LabeledContent("Последнее обновление", value: "—")
+      if let snap = currentSnapshot {
+        let leagues = snap.decodedLeagueStats()
+        if !leagues.isEmpty {
+          Section("Лиги (ROI)") {
+            ForEach(leagues.keys.sorted(), id: \.self) { lg in
+              if let s = leagues[lg] {
+                segmentRow(name: lg, s: s)
+              }
+            }
+          }
+        }
+
+        let markets = snap.decodedMarketStats()
+        if !markets.isEmpty {
+          Section("Рынки (ROI)") {
+            ForEach(markets.keys.sorted(), id: \.self) { mk in
+              if let s = markets[mk] {
+                segmentRow(name: mk, s: s)
+              }
+            }
+          }
+        }
+
+        let evB = snap.decodedEVBuckets()
+        if !evB.isEmpty {
+          Section("EV buckets") {
+            ForEach(evB.keys.sorted(), id: \.self) { k in
+              if let s = evB[k] {
+                segmentRow(name: k, s: s)
+              }
+            }
+          }
+        }
+
+        let oddsB = snap.decodedOddsBuckets()
+        if !oddsB.isEmpty {
+          Section("Odds bands") {
+            ForEach(oddsB.keys.sorted(), id: \.self) { k in
+              if let s = oddsB[k] {
+                segmentRow(name: k, s: s)
+              }
+            }
+          }
+        }
+
+        let clB = snap.decodedClassification()
+        if !clB.isEmpty {
+          Section("Классы") {
+            ForEach(clB.keys.sorted(), id: \.self) { k in
+              if let s = clB[k] {
+                segmentRow(name: k, s: s)
+              }
+            }
+          }
+        }
+      }
+
+      Section("Задачи Волны G") {
+        Label("G1 BacktestSnapshot", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+        Label("G2 buildFullBase", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+        Label("G3 updateIncremental", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+        Label("G4 BGProcessingTask", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+        Label("G5 Удалить Backtest, расширить Авто", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+        Label("G6 Фильтр мёртвых комбинаций в ScanCoordinator", systemImage: "circle.dashed")
+        Label("G7 Auto-Exclude (ROI < −5%, n≥20)", systemImage: "circle.dashed")
+        Label("G8 Posterior buckets", systemImage: "circle.dashed")
       }
 
       Section("Принцип") {
@@ -444,7 +473,51 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
-  // MARK: - Контроль (A4: LeagueBaselines)
+  private func segmentRow(name: String, s: StoredSegmentStats) -> some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(name).font(.subheadline)
+        Text("n=\(s.bets) · hit \(String(format: "%.0f%%", s.hitRate * 100))")
+          .font(.caption2).foregroundStyle(.secondary)
+      }
+      Spacer()
+      Text(String(format: "%+.1f%%", s.roi * 100))
+        .font(.subheadline.monospacedDigit())
+        .foregroundStyle(s.roi >= 0 ? .green : .red)
+    }
+  }
+
+  private static func shortDate(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    return f.string(from: d)
+  }
+
+  private func runFullBuild() async {
+    guard !busy else { return }
+    busy = true
+    defer { busy = false }
+
+    btProgressText = "Запуск…"
+    let ok = await BacktestService.shared.buildFullBase { progress, msg in
+      btProgressText = String(format: "%.0f%% · %@", progress * 100, msg)
+    }
+    btProgressText = ok ? "Готово" : "Ошибка/прервано"
+    try? context.save()
+  }
+
+  private func runIncremental() async {
+    guard !busy else { return }
+    busy = true
+    defer { busy = false }
+
+    btProgressText = "Докачка…"
+    let ok = await BacktestService.shared.updateIncremental()
+    btProgressText = ok ? "Докачка завершена" : "Докачка не выполнена"
+    try? context.save()
+  }
+
+  // MARK: - Контроль
 
   private var diagnosticsView: some View {
     List {
@@ -477,13 +550,34 @@ struct RootView: View {
         LabeledContent("Avg CLV", value: String(format: "%+.2f%%", m.avgCLV * 100))
         LabeledContent("Brier", value: String(format: "%.3f", m.brier))
       }
+      Section("Backtest snapshot") {
+        if let snap = currentSnapshot {
+          LabeledContent("Status", value: snap.buildStatus)
+          LabeledContent("Progress",
+                         value: String(format: "%.1f%%", snap.buildProgress * 100))
+          LabeledContent("Matches", value: "\(snap.totalMatches)")
+          LabeledContent("Bets", value: "\(snap.totalBets)")
+          if snap.totalBets > 0 {
+            LabeledContent("avgROI",
+                           value: String(format: "%+.2f%%", snap.avgROI * 100))
+            LabeledContent("Sharpe",
+                           value: String(format: "%.2f", snap.sharpe))
+          }
+          if let err = snap.lastError {
+            Text(err).font(.caption).foregroundStyle(.red)
+          }
+        } else {
+          Text("Снапшот ещё не создан")
+            .font(.caption).foregroundStyle(.secondary)
+        }
+      }
       Section("Пул лиг") {
         ForEach(LeaguePool.pool, id: \.id) { lg in
           Text("\(lg.id) · \(lg.name)").font(.subheadline)
         }
       }
       Section("League baselines (prior)") {
-        Text("Структурные приоритеты. sampleSize=0 → prior, не измеренные данные. Волна G заменит на фактические.")
+        Text("Структурные приоритеты. sampleSize=0 → prior, не измеренные данные.")
           .font(.caption2).foregroundStyle(.secondary)
         ForEach(LeagueBaselines.all) { b in
           VStack(alignment: .leading, spacing: 4) {
@@ -504,7 +598,7 @@ struct RootView: View {
           .font(.caption).foregroundStyle(.secondary)
         Text("Portfolio cap 10% bankroll в день")
           .font(.caption).foregroundStyle(.secondary)
-        Text("Background refresh: BGAppRefreshTask, интервал ≥ 30 мин")
+        Text("BGAppRefreshTask ≥ 30 мин · BGProcessingTask — воскресенье 02:00")
           .font(.caption).foregroundStyle(.secondary)
       }
       if !diagnostics.isEmpty {
@@ -609,7 +703,7 @@ struct RootView: View {
     diagnostics.append("scanned=\(summary.scannedMatches)")
   }
 
-  // MARK: - Settle Journal
+  // MARK: - Settle
 
   private func settleJournal() async {
     guard !busy else { return }
@@ -627,188 +721,6 @@ struct RootView: View {
     let result = await JournalService.settleOpenEntries(
       context: context, client: client)
     lastSettleStatus = "Закрыто \(result.closed), ошибок \(result.failed)"
-  }
-
-  // MARK: - Backtest (без изменений)
-
-  private func runBacktest() async {
-    guard !busy else { return }
-    busy = true
-    defer { busy = false }
-
-    var lines: [String] = []
-    func log(_ s: String) {
-      lines.append(s)
-      backtestStatus = lines.joined(separator: "\n")
-      print("[BT] \(s)")
-    }
-
-    do {
-      guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      else { throw APIError.missingAPIKey }
-      let client = SStatsClient(settings: settings)
-      let engine = QuantEngine()
-
-      let toDate = Date()
-      let fromDate = Calendar.current.date(byAdding: .day, value: -45, to: toDate) ?? toDate
-      log("1) /Games/list \(Self.fmt(fromDate))…\(Self.fmt(toDate))")
-
-      var json: JSONValue
-      do {
-        json = try await client.listGamesRange(from: fromDate, to: toDate, limit: 1000)
-      } catch {
-        log("1) /Games/list упал (\(error.localizedDescription)), беру /Ls/List…")
-        json = try await client.listRange(from: fromDate, to: toDate, limit: 1000)
-      }
-
-      var matches = engine.matches(from: json).filter { !isExcluded($0) }
-      log("1) Матчей: \(matches.count)")
-
-      if selectedLeague != "Все" {
-        matches = matches.filter {
-          $0.league.localizedCaseInsensitiveContains(selectedLeague)
-        }
-        log("1) После фильтра: \(matches.count)")
-      }
-
-      matches = matches.filter { $0.homeFT != nil && $0.awayFT != nil }
-      log("1) С FT: \(matches.count)")
-
-      let inline = matches.filter { ($0.oddsJSON?.array?.isEmpty == false) }
-      log("1) С odds: \(inline.count)")
-
-      let needFetch = matches.filter { ($0.oddsJSON?.array?.isEmpty != false) }
-      let cap = min(needFetch.count, 80)
-      log("2) /Odds для \(cap) матчей…")
-      var prepared: [Match] = inline
-      for (i, m) in needFetch.prefix(cap).enumerated() {
-        var mm = m
-        if let nid = mm.numericID {
-          if i % 10 == 0 { log("2) \(i + 1)/\(cap)…") }
-          if let o = try? await client.odds(numericID: nid) {
-            mm.oddsJSON = o.object?["data"]
-          }
-          try? await Task.sleep(for: .milliseconds(700))
-        }
-        if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
-      }
-      log("2) С odds итого: \(prepared.count)")
-
-      guard !prepared.isEmpty else {
-        log("Стоп: нет odds")
-        return
-      }
-
-      let histories = engine.allRecords(from: json)
-      log("3) Команд: \(histories.count)")
-
-      log("4) Walk-forward…")
-      let report = WalkForwardBacktester().run(
-        matches: prepared, histories: histories)
-
-      context.insert(
-        BacktestRun(
-          matches: report.matches, bets: report.bets,
-          wins: report.wins, losses: report.losses, pushes: report.pushes,
-          profit: report.profit, staked: report.staked, roi: report.roi,
-          yieldPct: report.yieldPct, hitRate: report.hitRate,
-          maxDrawdown: report.maxDrawdown,
-          maxLosingStreak: report.maxLosingStreak,
-          sharpe: report.sharpe, brier: report.brier,
-          logLoss: report.logLoss, avgCLV: report.avgCLV))
-      try? context.save()
-
-      log("--- Итог ---")
-      log("Matches: \(report.matches)")
-      log("Bets: \(report.bets)")
-      log("W/L/P: \(report.wins)/\(report.losses)/\(report.pushes)")
-      log("Hit: \(String(format: "%.1f%%", report.hitRate * 100))")
-      log("ROI: \(String(format: "%+.2f%%", report.roi * 100))")
-      log("Yield: \(String(format: "%+.2f%%", report.yieldPct * 100))")
-      log("Profit: \(String(format: "%+.3f", report.profit))")
-      log("Avg odds: \(String(format: "%.2f", report.avgOdds))")
-      log("Expectancy: \(String(format: "%+.3f", report.expectancy))")
-
-      log("--- Риск ---")
-      log("Max DD: \(String(format: "%.3f", report.maxDrawdown))")
-      log("Max loss streak: \(report.maxLosingStreak)")
-      log("Sharpe: \(String(format: "%.2f", report.sharpe))")
-      log("Sortino: \(String(format: "%.2f", report.sortino))")
-      log("Profit Factor: \(String(format: "%.2f", report.profitFactor))")
-
-      log("--- Качество прогноза ---")
-      log("Brier: \(String(format: "%.3f", report.brier))")
-      log("LogLoss: \(String(format: "%.3f", report.logLoss))")
-      log("Avg CLV: \(String(format: "%+.2f%%", report.avgCLV * 100))")
-
-      logSection("EV buckets", log: log, dict: report.byEVBucket)
-      logSection("Classification", log: log, dict: report.byClassification)
-      logSection("Odds bands", log: log, dict: report.byOddsBand)
-
-      log("--- Лиги ---")
-      let topLeagues = report.perLeague
-        .sorted(by: { $0.value.bets > $1.value.bets })
-        .prefix(5)
-      for (lg, s) in topLeagues {
-        log("\(lg): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100)), hit \(String(format: "%.0f%%", s.hitRate * 100))")
-      }
-
-      log("--- Рынки ---")
-      for (mk, s) in report.perMarket.sorted(by: { $0.value.bets > $1.value.bets }) {
-        log("\(mk): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100))")
-      }
-
-      log("--- По неделям ---")
-      let weeksSorted = report.byWeek.sorted(by: { $0.key < $1.key })
-      for (wk, s) in weeksSorted {
-        log("\(wk): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100))")
-      }
-    } catch {
-      log("ERROR: \(error.localizedDescription)")
-    }
-  }
-
-  private func logSection(
-    _ title: String,
-    log: (String) -> Void,
-    dict: [String: SegmentStats]
-  ) {
-    guard !dict.isEmpty else { return }
-    log("--- \(title) ---")
-    for (k, s) in dict.sorted(by: { $0.value.bets > $1.value.bets }) {
-      log("\(k): \(s.bets)b, ROI \(String(format: "%+.1f%%", s.roi * 100)), hit \(String(format: "%.0f%%", s.hitRate * 100))")
-    }
-  }
-
-  private static func fmt(_ d: Date) -> String {
-    let f = DateFormatter()
-    f.dateFormat = "yyyy-MM-dd"
-    f.timeZone = TimeZone(secondsFromGMT: 3 * 3600)
-    return f.string(from: d)
-  }
-
-  private func isExcluded(_ m: Match) -> Bool {
-    let x = "\(m.league) \(m.home) \(m.away)".lowercased()
-    let bad = ["friendly", "women", "женщ", "u19 women", "u20 women"]
-    return bad.contains(where: x.contains)
-  }
-}
-
-// MARK: - LeagueROICell (для heatmap)
-
-struct LeagueROICell: Identifiable {
-  let id: String
-  let league: String
-  let bets: Int
-  let roi: Double
-
-  var color: Color {
-    if bets < 5 { return .gray }
-    if roi >= 0.10 { return .green }
-    if roi >= 0.02 { return Color.green.opacity(0.7) }
-    if roi > -0.02 { return .yellow }
-    if roi > -0.10 { return .orange }
-    return .red
   }
 }
 
@@ -877,7 +789,7 @@ struct SignalCard: View {
   }
 }
 
-// MARK: - SignalDetailView (Волна A, A5)
+// MARK: - SignalDetailView
 
 struct SignalDetailView: View {
   let signal: BetSignal

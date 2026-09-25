@@ -12,6 +12,7 @@ import SwiftUI
       JournalEntry.self,
       CalibrationSample.self,
       BacktestRun.self,
+      BacktestSnapshot.self,
     ])
     let config = ModelConfiguration(
       schema: schema, isStoredInMemoryOnly: false)
@@ -23,7 +24,6 @@ import SwiftUI
       fatalError("ModelContainer init failed: \(error)")
     }
     self.container = c
-    // A9: контейнер доступен из фоновых задач через AppDependencies.shared.
     AppDependencies.shared.container = c
   }
 
