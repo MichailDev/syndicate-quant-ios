@@ -50,6 +50,7 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.syndicatequant.app.refresh</string>
+		<string>com.syndicatequant.app.processing</string>
 	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
