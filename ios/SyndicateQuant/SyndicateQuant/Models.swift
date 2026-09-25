@@ -18,6 +18,38 @@ enum LeaguePool {
   static func name(for id: Int) -> String? { pool.first(where: { $0.id == id })?.name }
 }
 
+// MARK: - League baselines (Волна A, A4)
+//
+// ВАЖНО: это структурные ПРИОРЫ, а не измеренные данные.
+// sampleSize = 0 означает "prior", а не "n наблюдений".
+// В Волне G значения будут заменены на фактические, собранные из 2-летней базы.
+
+struct LeagueBaseline: Identifiable, Hashable {
+  let id: Int
+  let name: String
+  let homeLambda: Double
+  let awayLambda: Double
+  let homeAdvantage: Double
+  let rho: Double
+  let sampleSize: Int
+}
+
+enum LeagueBaselines {
+  static let all: [LeagueBaseline] = [
+    LeagueBaseline(id: 39,  name: "Premier League",   homeLambda: 1.55, awayLambda: 1.20, homeAdvantage: 0.22, rho: -0.08, sampleSize: 0),
+    LeagueBaseline(id: 78,  name: "Bundesliga",       homeLambda: 1.68, awayLambda: 1.28, homeAdvantage: 0.18, rho: -0.06, sampleSize: 0),
+    LeagueBaseline(id: 140, name: "La Liga",          homeLambda: 1.45, awayLambda: 1.10, homeAdvantage: 0.24, rho: -0.09, sampleSize: 0),
+    LeagueBaseline(id: 135, name: "Serie A",          homeLambda: 1.48, awayLambda: 1.15, homeAdvantage: 0.21, rho: -0.07, sampleSize: 0),
+    LeagueBaseline(id: 61,  name: "Ligue 1",          homeLambda: 1.42, awayLambda: 1.12, homeAdvantage: 0.20, rho: -0.08, sampleSize: 0),
+    LeagueBaseline(id: 235, name: "RPL",              homeLambda: 1.35, awayLambda: 1.05, homeAdvantage: 0.25, rho: -0.10, sampleSize: 0),
+    LeagueBaseline(id: 2,   name: "Champions League", homeLambda: 1.55, awayLambda: 1.25, homeAdvantage: 0.20, rho: -0.08, sampleSize: 0),
+    LeagueBaseline(id: 3,   name: "Europa League",    homeLambda: 1.50, awayLambda: 1.20, homeAdvantage: 0.20, rho: -0.08, sampleSize: 0),
+  ]
+  static func baseline(for name: String) -> LeagueBaseline? {
+    all.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+  }
+}
+
 // MARK: - Sample classification
 
 enum SampleClass: String, Codable {
@@ -172,6 +204,11 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var clv: Double?
   var profit: Double?
 
+  // Волна A, A3 — движение линии.
+  // Опциональные поля → миграция SwiftData не требуется.
+  var openingOdds: Double?   // цена в момент постановки в журнал
+  var movement: Double?      // openingOdds / closingOdds - 1
+
   init(signal: BetSignal, status: String = "OPEN") {
     id = signal.id
     gameID = signal.gameID
@@ -195,6 +232,8 @@ struct BetSignal: Identifiable, Codable, Hashable {
     closingOdds = nil
     clv = nil
     profit = nil
+    openingOdds = signal.odds
+    movement = nil
   }
 }
 
@@ -273,7 +312,7 @@ struct AppStats {
   var staked = 0.0
 }
 
-// MARK: - JournalMetrics & Metrics (Этап 6)
+// MARK: - JournalMetrics & Metrics
 
 struct JournalMetrics {
   var totalEntries = 0
@@ -304,6 +343,15 @@ struct CalibrationBucket: Identifiable {
   let predicted: Double
   let actual: Double
   let count: Int
+}
+
+// Волна A, A2 — точка equity curve.
+struct EquityPoint: Identifiable, Hashable {
+  let id: String
+  let date: Date
+  let cumulativeProfit: Double
+  let cumulativeStaked: Double
+  let bets: Int
 }
 
 enum Metrics {
@@ -392,9 +440,32 @@ enum Metrics {
     }
     return totalN > 0 ? weightedSum / Double(totalN) : 0
   }
+
+  /// Волна A, A2 — equity curve по закрытым записям, отсортированным по времени.
+  static func equityCurve(_ entries: [JournalEntry]) -> [EquityPoint] {
+    let closed = entries
+      .filter { $0.status == "CLOSED" && $0.profit != nil }
+      .sorted { $0.createdAt < $1.createdAt }
+    guard !closed.isEmpty else { return [] }
+
+    var curve: [EquityPoint] = []
+    var cumProfit = 0.0
+    var cumStaked = 0.0
+    for (i, e) in closed.enumerated() {
+      cumProfit += e.profit ?? 0
+      cumStaked += e.stake
+      curve.append(EquityPoint(
+        id: "eq\(i)_\(e.id)",
+        date: e.createdAt,
+        cumulativeProfit: cumProfit,
+        cumulativeStaked: cumStaked,
+        bets: i + 1))
+    }
+    return curve
+  }
 }
 
-// MARK: - JournalService (Этап 6)
+// MARK: - JournalService
 
 enum JournalService {
   @MainActor
@@ -432,6 +503,10 @@ enum JournalService {
          closingOdds > 1 {
         entry.closingOdds = closingOdds
         entry.clv = entry.odds / closingOdds - 1
+        // A3: movement — движение линии от открытия к закрытию.
+        if let openOdds = entry.openingOdds, openOdds > 1 {
+          entry.movement = openOdds / closingOdds - 1
+        }
       }
 
       entry.status = "CLOSED"
@@ -553,9 +628,18 @@ enum JournalService {
   }
 }
 
-// MARK: - ScanCoordinator (Этап 8)
+// MARK: - AppDependencies (Волна A, A9)
+// Общий ModelContainer, доступный и из UI, и из фоновых задач.
+
+@MainActor
+final class AppDependencies {
+  static let shared = AppDependencies()
+  var container: ModelContainer?
+  private init() {}
+}
+
+// MARK: - ScanCoordinator
 // Общий сервис сканирования, доступный и из UI, и из BGAppRefreshTask.
-// Логика повторяет refresh() из RootView, но без UI-зависимостей и без @State.
 
 @MainActor
 final class ScanCoordinator {
@@ -574,10 +658,6 @@ final class ScanCoordinator {
     var success: Bool = false
   }
 
-  /// Основное сканирование. Возвращает summary.
-  /// - Parameters:
-  ///   - settings: настройки приложения. Если nil — берётся новый AppSettings (Keychain).
-  ///   - selectedLeague: "Все" или название лиги из LeaguePool.
   func scan(
     settings: AppSettings? = nil,
     selectedLeague: String = "Все"
@@ -652,7 +732,6 @@ final class ScanCoordinator {
     return summary
   }
 
-  /// Обёртка для BGAppRefreshTask — возвращает true при успехе.
   func scanInBackground() async -> Bool {
     let result = await scan(settings: nil)
     return result.success

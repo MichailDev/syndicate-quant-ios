@@ -1,3 +1,4 @@
+import Charts
 import SwiftData
 import SwiftUI
 
@@ -26,6 +27,8 @@ struct RootView: View {
         .tabItem { Label("Журнал", systemImage: "list.bullet.rectangle") }
       NavigationStack { backtestView }
         .tabItem { Label("Backtest", systemImage: "chart.xyaxis.line") }
+      NavigationStack { autoView }
+        .tabItem { Label("Авто", systemImage: "gearshape.2") }
       NavigationStack { diagnosticsView }
         .tabItem { Label("Контроль", systemImage: "checkmark.shield") }
       NavigationStack { settingsView }
@@ -35,7 +38,7 @@ struct RootView: View {
     .task { await refresh() }
   }
 
-  // MARK: - Прогноз
+  // MARK: - Прогноз (A5: NavigationLink → SignalDetailView)
 
   private var forecast: some View {
     List {
@@ -71,14 +74,12 @@ struct RootView: View {
 
       ForEach(signals) { s in
         Section {
-          SignalCard(signal: s)
-            .contentShape(Rectangle())
-            .onTapGesture {
-              if !journal.contains(where: { $0.id == s.id }) {
-                context.insert(JournalEntry(signal: s))
-                try? context.save()
-              }
-            }
+          NavigationLink {
+            SignalDetailView(signal: s)
+              .onAppear { autoJournal(s) }
+          } label: {
+            SignalCard(signal: s)
+          }
         }
       }
 
@@ -91,7 +92,15 @@ struct RootView: View {
     .refreshable { await refresh() }
   }
 
-  // MARK: - Журнал
+  /// Первое открытие карточки сигнала → запись в журнал.
+  private func autoJournal(_ s: BetSignal) {
+    if !journal.contains(where: { $0.id == s.id }) {
+      context.insert(JournalEntry(signal: s))
+      try? context.save()
+    }
+  }
+
+  // MARK: - Журнал (A2: Equity chart, A3: movement)
 
   private var journalView: some View {
     List {
@@ -112,6 +121,7 @@ struct RootView: View {
         }
       } else {
         Section("Статистика") { journalStatsView() }
+        equitySection
         Section("Калибровка") { calibrationView() }
         Section("Записи") {
           ForEach(journal) { e in
@@ -131,6 +141,42 @@ struct RootView: View {
     .listStyle(.insetGrouped)
     .navigationTitle("Журнал")
     .navigationBarTitleDisplayMode(.large)
+  }
+
+  @ViewBuilder
+  private var equitySection: some View {
+    let curve = Metrics.equityCurve(journal)
+    Section("Equity curve") {
+      if curve.count < 2 {
+        Text("Нужно минимум 2 закрытые записи")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        Chart {
+          ForEach(curve) { p in
+            AreaMark(
+              x: .value("Дата", p.date),
+              y: .value("P/L", p.cumulativeProfit)
+            )
+            .foregroundStyle(.blue.opacity(0.15))
+            LineMark(
+              x: .value("Дата", p.date),
+              y: .value("P/L", p.cumulativeProfit)
+            )
+            .foregroundStyle(.blue)
+          }
+        }
+        .frame(height: 180)
+        HStack {
+          Text("Точек: \(curve.count)")
+          Spacer()
+          if let last = curve.last {
+            Text(String(format: "Итог: %+.3f", last.cumulativeProfit))
+              .foregroundStyle(last.cumulativeProfit >= 0 ? .green : .red)
+          }
+        }
+        .font(.caption)
+      }
+    }
   }
 
   private func journalStatsView() -> some View {
@@ -209,6 +255,11 @@ struct RootView: View {
             .font(.caption2.monospacedDigit())
             .foregroundStyle(clv > 0 ? .green : .red)
         }
+        if let mv = e.movement {
+          Text("Δ \(String(format: "%+.2f%%", mv * 100))")
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(mv > 0 ? .green : .red)
+        }
         if let p = e.profit {
           Text("P/L \(String(format: "%+.3f", p))")
             .font(.caption2.monospacedDigit())
@@ -256,7 +307,7 @@ struct RootView: View {
     }
   }
 
-  // MARK: - Backtest
+  // MARK: - Backtest (A7: ROI heatmap лиг)
 
   private var backtestView: some View {
     List {
@@ -274,6 +325,7 @@ struct RootView: View {
         }
         .disabled(busy)
       }
+      leagueHeatmapSection
       if !backtests.isEmpty {
         Section("История") {
           ForEach(backtests) { b in
@@ -286,6 +338,52 @@ struct RootView: View {
     .listStyle(.insetGrouped)
     .navigationTitle("Backtest")
     .navigationBarTitleDisplayMode(.large)
+  }
+
+  @ViewBuilder
+  private var leagueHeatmapSection: some View {
+    let cells = leagueROICells
+    Section("Лиги — ROI heatmap") {
+      if cells.isEmpty {
+        Text("Закрытых записей журнала пока нет")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        Text("ROI по закрытым записям журнала, сгруппированным по лиге.")
+          .font(.caption2).foregroundStyle(.secondary)
+        LazyVGrid(
+          columns: [GridItem(.adaptive(minimum: 100), spacing: 8)],
+          spacing: 8
+        ) {
+          ForEach(cells) { c in
+            VStack(spacing: 3) {
+              Text(c.league)
+                .font(.caption2).lineLimit(2)
+                .multilineTextAlignment(.center)
+              Text(String(format: "%+.1f%%", c.roi * 100))
+                .font(.caption.monospacedDigit().bold())
+              Text("n=\(c.bets)")
+                .font(.caption2).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: 62)
+            .padding(6)
+            .background(c.color.opacity(0.28))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+          }
+        }
+        .padding(.vertical, 4)
+      }
+    }
+  }
+
+  private var leagueROICells: [LeagueROICell] {
+    let closed = journal.filter { $0.status == "CLOSED" }
+    let grouped = Dictionary(grouping: closed, by: { $0.league })
+    return grouped.map { (lg, entries) in
+      let stake = entries.reduce(0.0) { $0 + $1.stake }
+      let profit = entries.reduce(0.0) { $0 + ($1.profit ?? 0) }
+      let roi = stake > 0 ? profit / stake : 0
+      return LeagueROICell(id: lg, league: lg, bets: entries.count, roi: roi)
+    }.sorted { $0.bets > $1.bets }
   }
 
   private func backtestRow(_ b: BacktestRun) -> some View {
@@ -301,7 +399,52 @@ struct RootView: View {
     }.padding(.vertical, 2)
   }
 
-  // MARK: - Контроль
+  // MARK: - Авто (A8: заглушка под Волну G)
+
+  private var autoView: some View {
+    List {
+      Section {
+        Text("Волна G — Backtest Service")
+          .font(.headline)
+        Text("Приложение само собирает базу за 2 года × 8 лиг и обновляет её по воскресеньям в фоне. Результаты используются для авто-отключения «мёртвых» комбинаций (лига+рынок) и корректировки порогов.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+
+      Section("В работе (Волна G)") {
+        Label("BacktestSnapshot @Model", systemImage: "cylinder")
+        Label("buildFullBase (2 года, прогресс, возобновление)", systemImage: "arrow.down.circle")
+        Label("updateIncremental (докачка за неделю)", systemImage: "arrow.triangle.2.circlepath")
+        Label("BGProcessingTask по воскресеньям", systemImage: "moon.zzz")
+        Label("Замена Backtest на Авто", systemImage: "arrow.left.arrow.right")
+        Label("Auto-Exclude при ROI < −5% (n≥20)", systemImage: "xmark.octagon")
+        Label("Posterior buckets (fact hit rate)", systemImage: "chart.bar.xaxis")
+      }
+
+      Section("Дальше") {
+        Label("Волна B — Model Ensemble, Elo/Glicko, Bayesian posterior", systemImage: "function")
+        Label("Волна F — Self-Tuning UI", systemImage: "slider.horizontal.3")
+        Label("Волна C — UX и визуализация", systemImage: "paintbrush")
+        Label("Волна D — Live odds, Sharp money, voting", systemImage: "bolt")
+      }
+
+      Section("Статус") {
+        LabeledContent("Снапшот", value: "не собран")
+        LabeledContent("Последнее обновление", value: "—")
+      }
+
+      Section("Принцип") {
+        Text("NO DATA → NO NUMBER → NO EDGE → NO BET")
+          .font(.subheadline).bold()
+      }
+
+      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("Авто")
+    .navigationBarTitleDisplayMode(.large)
+  }
+
+  // MARK: - Контроль (A4: LeagueBaselines)
 
   private var diagnosticsView: some View {
     List {
@@ -337,6 +480,22 @@ struct RootView: View {
       Section("Пул лиг") {
         ForEach(LeaguePool.pool, id: \.id) { lg in
           Text("\(lg.id) · \(lg.name)").font(.subheadline)
+        }
+      }
+      Section("League baselines (prior)") {
+        Text("Структурные приоритеты. sampleSize=0 → prior, не измеренные данные. Волна G заменит на фактические.")
+          .font(.caption2).foregroundStyle(.secondary)
+        ForEach(LeagueBaselines.all) { b in
+          VStack(alignment: .leading, spacing: 4) {
+            Text(b.name).font(.subheadline).bold()
+            HStack(spacing: 12) {
+              miniBlock("λH", String(format: "%.2f", b.homeLambda))
+              miniBlock("λA", String(format: "%.2f", b.awayLambda))
+              miniBlock("Adv", String(format: "%.2f", b.homeAdvantage))
+              miniBlock("ρ", String(format: "%+.2f", b.rho))
+            }
+          }
+          .padding(.vertical, 2)
         }
       }
       Section("Принципы") {
@@ -427,7 +586,7 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
-  // MARK: - Refresh (через ScanCoordinator)
+  // MARK: - Refresh
 
   private func refresh() async {
     guard !busy else { return }
@@ -470,7 +629,7 @@ struct RootView: View {
     lastSettleStatus = "Закрыто \(result.closed), ошибок \(result.failed)"
   }
 
-  // MARK: - Backtest
+  // MARK: - Backtest (без изменений)
 
   private func runBacktest() async {
     guard !busy else { return }
@@ -635,6 +794,24 @@ struct RootView: View {
   }
 }
 
+// MARK: - LeagueROICell (для heatmap)
+
+struct LeagueROICell: Identifiable {
+  let id: String
+  let league: String
+  let bets: Int
+  let roi: Double
+
+  var color: Color {
+    if bets < 5 { return .gray }
+    if roi >= 0.10 { return .green }
+    if roi >= 0.02 { return Color.green.opacity(0.7) }
+    if roi > -0.02 { return .yellow }
+    if roi > -0.10 { return .orange }
+    return .red
+  }
+}
+
 // MARK: - SignalCard
 
 struct SignalCard: View {
@@ -696,6 +873,163 @@ struct SignalCard: View {
     VStack(alignment: .leading, spacing: 2) {
       Text(n).font(.caption2).foregroundStyle(.secondary)
       Text(String(format: f, v)).font(.caption.monospacedDigit())
+    }
+  }
+}
+
+// MARK: - SignalDetailView (Волна A, A5)
+
+struct SignalDetailView: View {
+  let signal: BetSignal
+
+  var body: some View {
+    List {
+      Section("Матч") {
+        LabeledContent("Хозяева", value: signal.home)
+        LabeledContent("Гости", value: signal.away)
+        LabeledContent("Лига", value: signal.league)
+        LabeledContent("Рынок", value: signal.market)
+        LabeledContent("Выбор", value: selectionLine)
+      }
+
+      Section("Классификация") {
+        HStack {
+          Text("Класс").font(.subheadline)
+          Spacer()
+          Text(signal.classification)
+            .font(.subheadline.bold())
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(classColor.opacity(0.22))
+            .clipShape(Capsule())
+        }
+        LabeledContent("Модель", value: signal.model)
+        LabeledContent("Букмекеров", value: "\(signal.bookmakers)")
+        if signal.priceAnomaly {
+          Label("Аномальная цена (flag)", systemImage: "exclamationmark.triangle")
+            .foregroundStyle(.orange).font(.caption)
+        }
+      }
+
+      Section("Цена и вероятность") {
+        LabeledContent("Odds", value: String(format: "%.3f", signal.odds))
+        LabeledContent("Fair odds",
+                       value: String(format: "%.3f", signal.fairOdds))
+        LabeledContent("P (модель)",
+                       value: String(format: "%.2f%%", signal.probability * 100))
+        LabeledContent("P (рынок)",
+                       value: String(format: "%.2f%%", signal.marketProbability * 100))
+        LabeledContent("EV",
+                       value: String(format: "%+.2f%%", signal.ev * 100))
+        LabeledContent("Robust EV",
+                       value: String(format: "%+.2f%%", signal.robustEV * 100))
+      }
+
+      Section("Интервал неопределённости") {
+        HStack {
+          intervalBlock("P10",
+                        String(format: "%.1f%%", signal.probabilityLow * 100))
+          intervalBlock("P50",
+                        String(format: "%.1f%%", signal.probability * 100))
+          intervalBlock("P90",
+                        String(format: "%.1f%%", signal.probabilityHigh * 100))
+        }
+        LabeledContent("Uncertainty",
+                       value: String(format: "%.3f", signal.uncertainty))
+        LabeledContent("Band", value: signal.uncertaintyBand)
+        LabeledContent("Market MAD",
+                       value: String(format: "%.2f", signal.marketMAD))
+      }
+
+      Section("Компоненты QCS") {
+        Text("QCS = 0.30·MES + 0.20·DCS + 0.20·MS + 0.15·TS + 0.15·RS")
+          .font(.caption2).foregroundStyle(.secondary)
+        scoreRow("DCS", signal.dcs, w: "0.20")
+        scoreRow("MS",  signal.ms,  w: "0.20")
+        scoreRow("MES", signal.mes, w: "0.30")
+        scoreRow("TS",  signal.ts,  w: "0.15")
+        scoreRow("RS",  signal.rs,  w: "0.15")
+        HStack {
+          Text("QCS").font(.subheadline.bold())
+          Spacer()
+          Text(String(format: "%.1f", signal.qcs))
+            .font(.subheadline.monospacedDigit().bold())
+        }
+      }
+
+      Section("Sample") {
+        LabeledContent("Класс", value: signal.sampleClass)
+        LabeledContent("Матчей хозяев", value: "\(signal.homeSample)")
+        LabeledContent("Матчей гостей", value: "\(signal.awaySample)")
+      }
+
+      Section("Kelly / Stake") {
+        LabeledContent("Full Kelly",
+                       value: String(format: "%.2f%%", signal.kellyFraction * 100))
+        LabeledContent("Quarter Kelly",
+                       value: String(format: "%.2f%%", signal.quarterKelly * 100))
+        LabeledContent("Stake cap",
+                       value: String(format: "%.2f%%", signal.stakeCap * 100))
+        HStack {
+          Text("Stake").font(.subheadline.bold())
+          Spacer()
+          Text(String(format: "%.3f%%", signal.stake * 100))
+            .font(.subheadline.monospacedDigit().bold())
+        }
+      }
+
+      if signal.portfolioCorrelation > 0 {
+        Section("Портфель") {
+          LabeledContent("Макс. корреляция",
+                         value: String(format: "%.2f", signal.portfolioCorrelation))
+          LabeledContent("Причина", value: signal.correlationReason)
+        }
+      }
+
+      Section("Идентификаторы") {
+        LabeledContent("Game ID", value: signal.gameID)
+        LabeledContent("Signal ID", value: signal.id)
+        LabeledContent("Timestamp",
+                       value: signal.timestamp.formatted(date: .abbreviated, time: .standard))
+      }
+
+      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("Разбор сигнала")
+    .navigationBarTitleDisplayMode(.inline)
+  }
+
+  private var selectionLine: String {
+    if let line = signal.line {
+      return "\(signal.selection) \(line)"
+    }
+    return signal.selection
+  }
+
+  private var classColor: Color {
+    switch signal.classification {
+    case "S BET": return .green
+    case "A BET": return .blue
+    case "B LEAN": return .yellow
+    case "C WATCH": return .orange
+    default: return .gray
+    }
+  }
+
+  private func intervalBlock(_ label: String, _ value: String) -> some View {
+    VStack(spacing: 2) {
+      Text(label).font(.caption2).foregroundStyle(.secondary)
+      Text(value).font(.subheadline.monospacedDigit())
+    }.frame(maxWidth: .infinity)
+  }
+
+  private func scoreRow(_ name: String, _ value: Double, w: String) -> some View {
+    HStack {
+      Text(name).font(.subheadline)
+      Text("· w=\(w)").font(.caption2).foregroundStyle(.secondary)
+      Spacer()
+      Text(String(format: "%.1f", value))
+        .font(.subheadline.monospacedDigit())
     }
   }
 }

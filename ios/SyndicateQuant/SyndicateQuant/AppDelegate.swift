@@ -1,5 +1,6 @@
 @preconcurrency import BackgroundTasks
 @preconcurrency import UIKit
+import SwiftData
 
 @MainActor
 final class AppDelegate: NSObject, UIApplicationDelegate {
@@ -31,11 +32,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
   // MARK: - BGTask handling
 
   nonisolated private static func handle(_ task: BGAppRefreshTask) {
-    // Планируем следующую попытку сразу — иначе iOS может перестать будить.
+    // Планируем следующую попытку сразу.
     scheduleNextRefresh()
 
     let work = Task { @MainActor in
       let success = await ScanCoordinator.shared.scanInBackground()
+      // A1: авто-settle журнала после фонового скана.
+      // Запускается даже если scan вернул false — чтобы закрыть "зависшие" OPEN.
+      await autoSettle()
       task.setTaskCompleted(success: success)
     }
 
@@ -44,9 +48,29 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
   }
 
+  /// A1: закрывает OPEN-записи журнала через общий ModelContainer.
+  @MainActor
+  private static func autoSettle() async {
+    guard let container = AppDependencies.shared.container else {
+      print("[BG] container недоступен — skip auto-settle")
+      return
+    }
+    let settings = AppSettings()
+    let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else {
+      print("[BG] API key пуст — skip auto-settle")
+      return
+    }
+
+    let client = SStatsClient(settings: settings)
+    let context = ModelContext(container)
+    let result = await JournalService.settleOpenEntries(
+      context: context, client: client)
+    print("[BG] auto-settle: closed=\(result.closed) failed=\(result.failed)")
+  }
+
   nonisolated private static func scheduleNextRefresh() {
     let request = BGAppRefreshTaskRequest(identifier: refreshID)
-    // iOS сам решит, когда запускать (обычно ≥ 30 мин).
     request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
     do {
       try BGTaskScheduler.shared.submit(request)
