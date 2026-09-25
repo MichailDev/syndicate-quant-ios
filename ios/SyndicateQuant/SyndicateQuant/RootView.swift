@@ -24,7 +24,6 @@ struct RootView: View {
 
   @State private var btProgressText = ""
 
-  // C1: таб и deep-link
   @State private var selectedTab: Int = 0
   @State private var pendingSignalID: String?
 
@@ -192,7 +191,7 @@ struct RootView: View {
 
   @ViewBuilder
   private var equitySection: some View {
-    let curve = Metrics.equityCurve(journal)
+    let curve = Metrics.equityCurve(journal, bankroll: settings.effectiveBankroll)
     Section("Equity curve") {
       if curve.count < 2 {
         Text("Нужно минимум 2 закрытые записи")
@@ -217,8 +216,13 @@ struct RootView: View {
           Text("Точек: \(curve.count)")
           Spacer()
           if let last = curve.last {
-            Text(String(format: "Итог: %+.3f", last.cumulativeProfit))
-              .foregroundStyle(last.cumulativeProfit >= 0 ? .green : .red)
+            if settings.useMoneyStakes {
+              Text(String(format: "Итог: %+.0f", last.cumulativeProfit))
+                .foregroundStyle(last.cumulativeProfit >= 0 ? .green : .red)
+            } else {
+              Text(String(format: "Итог: %+.3f", last.cumulativeProfit))
+                .foregroundStyle(last.cumulativeProfit >= 0 ? .green : .red)
+            }
           }
         }
         .font(.caption)
@@ -308,7 +312,14 @@ struct RootView: View {
             .foregroundStyle(mv > 0 ? .green : .red)
         }
         if let p = e.profit {
-          Text("P/L \(String(format: "%+.3f", p))")
+          let label: String = {
+            if let sm = e.stakeMoney, e.stake > 0 {
+              let money = p / e.stake * sm
+              return String(format: "P/L %+.0f", money)
+            }
+            return String(format: "P/L %+.3f", p)
+          }()
+          Text(label)
             .font(.caption2.monospacedDigit())
             .foregroundStyle(p >= 0 ? .green : .red)
         }
@@ -491,8 +502,6 @@ struct RootView: View {
     return n
   }
 
-  // MARK: - C3: League × Market heatmap
-
   @ViewBuilder
   private var leagueMarketHeatmapSection: some View {
     let stats = currentSnapshot?.decodedLeagueMarketStats() ?? [:]
@@ -562,8 +571,6 @@ struct RootView: View {
     if roi > -0.10 { return .orange }
     return .red
   }
-
-  // MARK: - Остальные секции Авто
 
   @ViewBuilder
   private var volatilitySection: some View {
@@ -904,6 +911,12 @@ struct RootView: View {
         LabeledContent("Odds format", value: settings.oddsFormat.label)
         LabeledContent("Тема", value: settings.colorScheme.label)
       }
+      Section("Банк") {
+        LabeledContent("Ставки в деньгах",
+                       value: settings.useMoneyStakes ? "да" : "нет")
+        LabeledContent("Размер банка",
+                       value: String(format: "%.0f", settings.bankroll))
+      }
       Section("Team ratings (B3)") {
         LabeledContent("Всего команд", value: "\(teamRatings.count)")
         let usable = teamRatings.filter { $0.matches >= TeamRatingService.minMatchesForUse }.count
@@ -1036,6 +1049,22 @@ struct RootView: View {
           }
         }
       }
+      Section("Банк") {
+        Toggle("Ставки в деньгах", isOn: $settings.useMoneyStakes)
+        if settings.useMoneyStakes {
+          HStack {
+            Text("Размер банка")
+            Spacer()
+            TextField("0", value: $settings.bankroll, format: .number)
+              .keyboardType(.decimalPad)
+              .multilineTextAlignment(.trailing)
+              .frame(width: 140)
+              .monospacedDigit()
+          }
+        }
+        Text("При включённом режиме стейк отображается в деньгах (2% банка = 0.02 × размер).")
+          .font(.caption2).foregroundStyle(.secondary)
+      }
       Section("Автообновление") {
         Toggle("Фоновое обновление", isOn: $settings.autoRefresh)
         Stepper("Интервал: \(settings.refreshMinutes) мин",
@@ -1115,6 +1144,7 @@ struct RootView: View {
 struct SignalCard: View {
   let signal: BetSignal
   let oddsFormat: OddsFormat
+  @EnvironmentObject private var settings: AppSettings
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
@@ -1135,7 +1165,7 @@ struct SignalCard: View {
         metric("EV", String(format: "%+.1f%%", signal.ev * 100))
         metric("Rob.", String(format: "%+.1f%%", signal.robustEV * 100))
         metric("QCS", String(format: "%.0f", signal.qcs))
-        metric("Stake", String(format: "%.2f%%", signal.stake * 100))
+        stakeMetric
       }
       HStack(spacing: 10) {
         Text("DCS \(String(format: "%.0f", signal.dcs))")
@@ -1163,6 +1193,18 @@ struct SignalCard: View {
     return "\(signal.league) · \(signal.market) · \(signal.selection)\(linePart)"
   }
 
+  @ViewBuilder
+  private var stakeMetric: some View {
+    if settings.useMoneyStakes, let money = signal.stakeMoney {
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Stake").font(.caption2).foregroundStyle(.secondary)
+        Text(String(format: "%.0f", money)).font(.caption.monospacedDigit())
+      }
+    } else {
+      metric("Stake", String(format: "%.2f%%", signal.stake * 100))
+    }
+  }
+
   private func classificationColor(_ c: String) -> Color {
     switch c {
     case "S BET": return .green
@@ -1181,7 +1223,7 @@ struct SignalCard: View {
   }
 }
 
-// MARK: - SignalDetailView (C2: Match preview)
+// MARK: - SignalDetailView
 
 struct SignalDetailView: View {
   let signal: BetSignal
@@ -1238,6 +1280,27 @@ struct SignalDetailView: View {
                        value: String(format: "%+.2f%%", signal.ev * 100))
         LabeledContent("Robust EV",
                        value: String(format: "%+.2f%%", signal.robustEV * 100))
+      }
+
+      if let best = signal.bestOdds,
+         let avg = signal.avgOdds,
+         let worst = signal.worstOdds,
+         let bestBook = signal.bestBook,
+         let worstBook = signal.worstBook {
+        Section("Odds comparison (D4)") {
+          LabeledContent("Лучшая",
+                         value: "\(OddsFormatter.format(best, as: settings.oddsFormat)) · \(bestBook)")
+          LabeledContent("Средняя",
+                         value: OddsFormatter.format(avg, as: settings.oddsFormat))
+          LabeledContent("Худшая",
+                         value: "\(OddsFormatter.format(worst, as: settings.oddsFormat)) · \(worstBook)")
+          LabeledContent("Книг", value: "\(signal.bookmakers)")
+          if signal.bookmakers >= 3, avg > 0 {
+            let spread = (best - worst) / avg * 100
+            Text(String(format: "Разброс: %.1f%%", spread))
+              .font(.caption2).foregroundStyle(.secondary)
+          }
+        }
       }
 
       if let w = signal.posteriorWeight {
@@ -1331,8 +1394,13 @@ struct SignalDetailView: View {
         HStack {
           Text("Stake").font(.subheadline.bold())
           Spacer()
-          Text(String(format: "%.3f%%", signal.stake * 100))
-            .font(.subheadline.monospacedDigit().bold())
+          if settings.useMoneyStakes, let money = signal.stakeMoney {
+            Text(String(format: "%.0f", money))
+              .font(.subheadline.monospacedDigit().bold())
+          } else {
+            Text(String(format: "%.3f%%", signal.stake * 100))
+              .font(.subheadline.monospacedDigit().bold())
+          }
         }
       }
 
@@ -1360,8 +1428,6 @@ struct SignalDetailView: View {
       await loadPreview()
     }
   }
-
-  // MARK: - C2: Match preview
 
   @ViewBuilder
   private var matchPreviewSection: some View {
@@ -1429,7 +1495,6 @@ struct SignalDetailView: View {
     return "\(w)В · \(d)Н · \(l)П"
   }
 
-  @ViewBuilder
   private func formBadge(_ r: TeamRecord) -> some View {
     let gf = r.gf ?? 0
     let ga = r.ga ?? 0
@@ -1503,8 +1568,6 @@ struct SignalDetailView: View {
     }
   }
 
-  // MARK: - Helpers
-
   private var selectionLine: String {
     if let line = signal.line {
       return "\(signal.selection) \(line)"
@@ -1540,7 +1603,7 @@ struct SignalDetailView: View {
   }
 }
 
-// MARK: - JournalEntryDetailView (C1 + C4)
+// MARK: - JournalEntryDetailView
 
 struct JournalEntryDetailView: View {
   let entry: JournalEntry
@@ -1561,8 +1624,14 @@ struct JournalEntryDetailView: View {
         LabeledContent("Статус", value: entry.status)
         if let r = entry.result { LabeledContent("Результат", value: r) }
         if let p = entry.profit {
-          LabeledContent("P/L", value: String(format: "%+.3f", p))
-            .foregroundStyle(p >= 0 ? .green : .red)
+          if let sm = entry.stakeMoney, entry.stake > 0 {
+            let money = p / entry.stake * sm
+            LabeledContent("P/L", value: String(format: "%+.0f", money))
+              .foregroundStyle(p >= 0 ? .green : .red)
+          } else {
+            LabeledContent("P/L", value: String(format: "%+.3f", p))
+              .foregroundStyle(p >= 0 ? .green : .red)
+          }
         }
         if let clv = entry.clv {
           LabeledContent("CLV", value: String(format: "%+.2f%%", clv * 100))
@@ -1614,7 +1683,7 @@ struct JournalEntryDetailView: View {
   }
 }
 
-// MARK: - SelfTuningView (Волна F)
+// MARK: - SelfTuningView
 
 struct SelfTuningView: View {
   @Environment(\.modelContext) private var context

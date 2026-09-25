@@ -21,18 +21,24 @@ import Foundation
     didSet { UserDefaults.standard.set(notifyBets, forKey: "notify_bets") }
   }
 
-  // Волна C: формат коэффициентов (EU / US / UK).
   @Published var oddsFormatRaw: String {
     didSet { UserDefaults.standard.set(oddsFormatRaw, forKey: "odds_format") }
   }
 
-  // Волна C: тема оформления (system / light / dark).
   @Published var colorSchemeRaw: String {
     didSet { UserDefaults.standard.set(colorSchemeRaw, forKey: "color_scheme") }
   }
 
+  // Волна D (D5): реальный банкролл.
+  @Published var bankroll: Double {
+    didSet { UserDefaults.standard.set(bankroll, forKey: "bankroll") }
+  }
+  @Published var useMoneyStakes: Bool {
+    didSet { UserDefaults.standard.set(useMoneyStakes, forKey: "use_money_stakes") }
+  }
+
   let baseURL = "https://api.sstats.net"
-  let engineVersion = "v5.4.0-iOS-INSTITUTIONAL"
+  let engineVersion = "v5.5.0-iOS-INSTITUTIONAL"
 
   init() {
     apiKey = KeychainStore.shared.get("sstats_api_key") ?? ""
@@ -44,6 +50,9 @@ import Foundation
 
     oddsFormatRaw = UserDefaults.standard.string(forKey: "odds_format") ?? "eu"
     colorSchemeRaw = UserDefaults.standard.string(forKey: "color_scheme") ?? "system"
+
+    bankroll = UserDefaults.standard.object(forKey: "bankroll") as? Double ?? 10_000
+    useMoneyStakes = UserDefaults.standard.object(forKey: "use_money_stakes") as? Bool ?? false
   }
 
   var oddsFormat: OddsFormat {
@@ -52,5 +61,9 @@ import Foundation
 
   var colorScheme: AppColorScheme {
     AppColorScheme(rawValue: colorSchemeRaw) ?? .system
+  }
+
+  var effectiveBankroll: Double? {
+    useMoneyStakes && bankroll > 0 ? bankroll : nil
   }
 }

@@ -139,7 +139,7 @@ struct QuantEngine {
     return recordFromGame(game, teamID: targetID, isHome: targetID == hid)
   }
 
-  // MARK: - Public model() для backtest
+  // MARK: - Public model()
 
   func model(home: [TeamRecord], away: [TeamRecord], glicko: JSONValue? = nil) -> MatchModel? {
     modelWithRatings(
@@ -195,7 +195,8 @@ struct QuantEngine {
     for (_, qs) in grouped {
       guard !qs.isEmpty else { continue }
       guard let median = QuantMath.median(qs.map { $0.odds }) else { continue }
-      guard let q = qs.first else { continue }
+      // Волна D (D4): лучшая цена.
+      guard let q = qs.max(by: { $0.odds < $1.odds }) else { continue }
       let sharp = sharpGuard(qs, median: median)
 
       let p: Double
@@ -406,6 +407,14 @@ struct QuantEngine {
     let marketProbability = QuantMath.median(quoteProbs) ?? 0.0
     let marketMAD = QuantMath.mad(quoteProbs.map { $0 * 100 }) ?? 0.0
 
+    // Волна D (D4): best/worst/avg по всем книгам.
+    let oddsList = quotes.map { $0.odds }
+    let bestQuote = quotes.max(by: { $0.odds < $1.odds })
+    let worstQuote = quotes.min(by: { $0.odds < $1.odds })
+    let avgOdds: Double? = oddsList.isEmpty
+      ? nil
+      : oddsList.reduce(0, +) / Double(oddsList.count)
+
     let interval = QuantMath.probabilityInterval(
       pFinal, sample: min(homeSample, awaySample), dcs: dcs, marketMAD: marketMAD)
 
@@ -471,6 +480,13 @@ struct QuantEngine {
     signal.probabilityRaw = pRaw
     signal.posteriorWeight = appliedWeight > 0 ? appliedWeight : nil
     signal.posteriorSource = posteriorSource
+
+    signal.bestOdds = bestQuote?.odds
+    signal.bestBook = bestQuote?.bookmaker
+    signal.worstOdds = worstQuote?.odds
+    signal.worstBook = worstQuote?.bookmaker
+    signal.avgOdds = avgOdds
+
     return signal
   }
 
@@ -517,13 +533,14 @@ struct QuantEngine {
     return "X NO BET"
   }
 
-  // MARK: - Portfolio (B4 + B5)
+  // MARK: - Portfolio
 
   func portfolio(
     _ signals: [BetSignal],
     excludedRules: [AutoExcludeRule] = [],
     stopLoss: VolatilityState = .normal,
-    correlationMatrix: CorrelationMatrix? = nil
+    correlationMatrix: CorrelationMatrix? = nil,
+    bankroll: Double? = nil
   ) -> [BetSignal] {
     if stopLoss.isPause { return [] }
 
@@ -559,6 +576,11 @@ struct QuantEngine {
         x.stakeBeforeStop = s.stake
         x.stake = min(s.stake, cap)
         x.stopApplied = "CAP \(Int(cap * 100))%"
+      }
+
+      // Волна D (D5): конвертация в деньги, если включён режим.
+      if let bankroll, bankroll > 0 {
+        x.stakeMoney = x.stake * bankroll
       }
 
       guard totalExposure + x.stake <= dailyCap else { continue }
@@ -829,9 +851,13 @@ struct QuantEngine {
           let market = normalizeMarket(marketName + " " + selection)
           guard !market.isEmpty else { continue }
           let line = extractLine(selection) ?? extractLine(marketName)
+          // Волна D (D4): реальный букмекер.
+          let bookmaker = string(
+            p, ["bookmaker", "bookmakerName", "bookie", "bk", "book", "sportsbook"]
+          ) ?? string(m, ["bookmaker", "bookmakerName", "bookie", "bk"]) ?? "sstats"
           out.append(Quote(
             market: market, selection: selection, line: line,
-            odds: value, bookmaker: "sstats"))
+            odds: value, bookmaker: bookmaker))
         }
       }
     }

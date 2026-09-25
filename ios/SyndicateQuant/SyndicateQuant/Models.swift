@@ -183,6 +183,14 @@ struct BetSignal: Identifiable, Codable, Hashable {
 
   var playerImpactHome: Double? = nil
   var playerImpactAway: Double? = nil
+
+  // Волна D (D4 + D5)
+  var stakeMoney: Double? = nil
+  var bestOdds: Double? = nil
+  var bestBook: String? = nil
+  var worstOdds: Double? = nil
+  var worstBook: String? = nil
+  var avgOdds: Double? = nil
 }
 
 // MARK: - Team rating (B3)
@@ -700,6 +708,9 @@ enum CorrelationBuilder {
   var openingOdds: Double?
   var movement: Double?
 
+  // Волна D (D5)
+  var stakeMoney: Double?
+
   init(signal: BetSignal, status: String = "OPEN") {
     id = signal.id
     gameID = signal.gameID
@@ -725,6 +736,7 @@ enum CorrelationBuilder {
     profit = nil
     openingOdds = signal.odds
     movement = nil
+    stakeMoney = signal.stakeMoney
   }
 }
 
@@ -1110,7 +1122,11 @@ enum Metrics {
     return totalN > 0 ? weightedSum / Double(totalN) : 0
   }
 
-  static func equityCurve(_ entries: [JournalEntry]) -> [EquityPoint] {
+  /// Волна D (D5): bankroll — множитель для перевода P/L и стейка в деньги.
+  static func equityCurve(
+    _ entries: [JournalEntry],
+    bankroll: Double? = nil
+  ) -> [EquityPoint] {
     let closed = entries
       .filter { $0.status == "CLOSED" && $0.profit != nil }
       .sorted { $0.createdAt < $1.createdAt }
@@ -1119,9 +1135,10 @@ enum Metrics {
     var curve: [EquityPoint] = []
     var cumProfit = 0.0
     var cumStaked = 0.0
+    let mult = bankroll ?? 1.0
     for (i, e) in closed.enumerated() {
-      cumProfit += e.profit ?? 0
-      cumStaked += e.stake
+      cumProfit += (e.profit ?? 0) * mult
+      cumStaked += e.stake * mult
       curve.append(EquityPoint(
         id: "eq\(i)_\(e.id)",
         date: e.createdAt,
@@ -1329,7 +1346,7 @@ final class AppDependencies {
   private init() {}
 }
 
-// MARK: - BacktestService (G2 + G3)
+// MARK: - BacktestService
 
 @MainActor
 final class BacktestService {
@@ -1732,7 +1749,7 @@ final class BacktestService {
   }
 }
 
-// MARK: - ScanCoordinator (F: слушает TuningConfig)
+// MARK: - ScanCoordinator
 
 @MainActor
 final class ScanCoordinator {
@@ -1930,7 +1947,8 @@ final class ScanCoordinator {
         filtered,
         excludedRules: excludedRules,
         stopLoss: stopState,
-        correlationMatrix: tuning.correlationEnabled ? corrMatrix : nil)
+        correlationMatrix: tuning.correlationEnabled ? corrMatrix : nil,
+        bankroll: resolvedSettings.effectiveBankroll)
       summary.finishedAt = Date()
       summary.success = true
 
@@ -2038,7 +2056,7 @@ final class ScanCoordinator {
   }
 }
 
-// MARK: - Волна C: Odds format + Theme + Deep-link (C)
+// MARK: - Волна C: Odds format + Theme
 
 enum OddsFormat: String, CaseIterable, Identifiable {
   case eu, us, uk
@@ -2070,7 +2088,6 @@ enum AppColorScheme: String, CaseIterable, Identifiable {
     }
   }
 
-  /// Маппинг на SwiftUI ColorScheme. nil = системная.
   var toColorScheme: SwiftUI.ColorScheme? {
     switch self {
     case .system: return nil
@@ -2124,8 +2141,6 @@ enum OddsFormatter {
 extension Notification.Name {
   static let openSignal = Notification.Name("com.syndicatequant.openSignal")
 }
-
-// MARK: - Wrapper для sheet(item:) (C1)
 
 struct SignalIDWrapper: Identifiable {
   let id: String
