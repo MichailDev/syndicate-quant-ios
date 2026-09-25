@@ -236,28 +236,10 @@ struct QuantEngine {
       }
     }
 
-    // Волна D (D2): sharp money из LiveMonitor.
-    out = out.map { s in
-      var x = s
-      let liveKey = "\(s.market)|\(s.selection.lowercased())|\(s.line.map { String($0) } ?? "")"
-      if let cur = LiveMonitor.shared.snapshots[s.gameID],
-         let prev = LiveMonitor.shared.previousSnapshotForDebug(matchID: s.gameID),
-         let curAvg = cur.avg(forKey: liveKey),
-         let prevAvg = prev.avg(forKey: liveKey),
-         prevAvg > 1 {
-        let delta = (curAvg - prevAvg) / prevAvg
-        x.liveMovement = delta
-        let moving = cur.booksMoving(forKey: liveKey, vs: prev, threshold: 0.01)
-        if moving.count >= 3 && abs(delta) > 0.02 {
-          x.sharpMoney = true
-          x.sharpMovement = delta
-        }
-      }
-      return x
-    }
-
+    // Волна D (D2): sharp money приоритетнее при равном QCS.
+    // Поля sharpMoney/sharpMovement/liveMovement заполняются в ScanCoordinator
+    // (см. Models.swift), т.к. LiveMonitor — @MainActor, а signals() — нет.
     return out.sorted { a, b in
-      // Волна D (D2): sharp money приоритетнее при прочих равных.
       if a.sharpMoney == true && b.sharpMoney != true { return true }
       if b.sharpMoney == true && a.sharpMoney != true { return false }
       return a.qcs > b.qcs
