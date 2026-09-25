@@ -111,10 +111,6 @@ enum UncertaintyBand {
 }
 
 // MARK: - Match
-// [7.8] Добавлены опциональные поля для settle углов/карточек.
-// Заполняются в QuantEngine при парсинге `statistics` из /Games/{id}.
-// Все поля — опциональные с default nil: старые записи и текущий код,
-// который их не заполняет, продолжат работать.
 
 struct Match: Identifiable, Codable, Hashable {
   let id: String
@@ -130,7 +126,6 @@ struct Match: Identifiable, Codable, Hashable {
   var numericID: Int?
   var status: Int? = nil
 
-  // Settlement data для углов и карточек (из `statistics` в /Games/{id})
   var homeCorners: Int? = nil
   var awayCorners: Int? = nil
   var homeYellows: Int? = nil
@@ -217,8 +212,6 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var modelVote: Int? = nil
   var modelVoteDetail: String? = nil
 
-  // [7.14] Источник котировки для углов/карточек:
-  // "Pinnacle" для углов (edge vs sharp), "Best (Betano)" для карточек.
   var oddsSource: String? = nil
 }
 
@@ -982,10 +975,6 @@ enum Metrics {
 }
 
 // MARK: - JournalService
-// [7.9] settleOpenEntries переписан:
-//   • для 1X2/GOALS — как было, через homeFTResult/awayFTResult
-//   • для CORNERS/CARDS — читаем statistics из /Games/{id} и closing odds из /Odds/{id}
-//   • TeamRating обновляется только для 1X2/GOALS (углы/ЖК не влияют на Elo)
 
 enum JournalService {
   @MainActor
@@ -1000,21 +989,16 @@ enum JournalService {
       guard let info = try? await client.gameInfo(entry.gameID) else {
         failed += 1; continue
       }
-      // /Games/{id} → {data: {game: {...}, statistics: {...}, ...}}
       let data = info.object?["data"]?.object ?? info.object ?? [:]
       let game = data["game"]?.object ?? data
       let stats = data["statistics"]?.object ?? game["statistics"]?.object ?? [:]
 
-      // [7.10] Единый resolve результата
       guard let result = resolveResult(entry: entry, game: game, stats: stats)
       else { continue }
 
       entry.result = result
       entry.profit = computeProfit(result: result, odds: entry.odds, stake: entry.stake)
 
-      // Closing odds:
-      //   • 1X2/GOALS — из `data.odds` в /Games/{id}
-      //   • CORNERS/CARDS — из /Odds/{id} через bestPrice (best available)
       if entry.market == "CORNERS" || entry.market == "CARDS" {
         if let nid = Int(entry.gameID),
            let books = try? await client.fullOdds(gameId: nid),
@@ -1040,7 +1024,6 @@ enum JournalService {
       entry.status = "CLOSED"
       closed += 1
 
-      // TeamRating: только для 1X2/GOALS
       if entry.market == "1X2" || entry.market == "GOALS" {
         if let hFT = number(game, ["homeFTResult", "homeResult"]),
            let aFT = number(game, ["awayFTResult", "awayResult"]) {
@@ -1059,7 +1042,6 @@ enum JournalService {
     return (closed, failed)
   }
 
-  // [7.10] Единый резолвер: возвращает WIN/LOSS/PUSH или nil (данных нет).
   private static func resolveResult(entry: JournalEntry,
                                     game: [String: JSONValue],
                                     stats: [String: JSONValue]) -> String? {
@@ -1083,7 +1065,6 @@ enum JournalService {
     }
   }
 
-  // [7.11] evaluateResult расширен: CORNERS/CARDS используют ту же логику Over/Under.
   private static func evaluateResult(entry: JournalEntry,
                                      home: Double, away: Double) -> String {
     let sel = entry.selection.lowercased()
@@ -1154,9 +1135,6 @@ enum JournalService {
     return nil
   }
 
-  // [7.13] Closing odds для CORNERS/CARDS из /Odds/{id}.
-  // Для углов — best available (edge vs best после закрытия).
-  // Для карточек — то же, потому что букмекер всего один (Betano).
   private static func findClosingInBookmakers(entry: JournalEntry,
                                               books: [BookmakerOdds]) -> Double? {
     let marketId: Int
@@ -1171,7 +1149,6 @@ enum JournalService {
                                   across: books)?.value
   }
 
-  // [7.12] Расширен на marketId 45 (corners) и 80 (cards).
   private static func normalizeMarketByIDAndName(_ id: Int?, _ name: String) -> String {
     if let id {
       switch id {
@@ -1240,12 +1217,21 @@ final class BacktestService {
 
   static let yearsBack = 2
   static let monthsPerYear = 12
-  static let gamesPerRequest = 1000     // API max
-  static let maxPagesPerMonth = 20      // предохранитель
+  static let gamesPerRequest = 1000
+  static let maxPagesPerMonth = 20
   static let oddsFetchCap = 1500
+  // [7.31] Максимум матчей, которым догружаем углы/карточки через /Odds/{id}
+  static let cornersCardsFetchCap = 300
 
   private var isBuilding = false
 
+  // [7.31] Главная переработка:
+  //   1. Как и раньше — собираем /Games/list по месяцам
+  //   2. Догружаем /Games/{id} для матчей без odds и заодно извлекаем statistics
+  //      (corners / yellowCards / redCards) → заполняем Match и обновляем allHistories
+  //   3. Для последних N матчей догружаем /Odds/{id}, извлекаем углы (Pinnacle, 45)
+  //      и карточки (best available, 80) и вливаем их в oddsJSON.array
+  //   4. Walk-forward теперь видит CORNERS/CARDS и settle может работать
   func buildFullBase(
     progress: @MainActor @escaping (Double, String) -> Void
   ) async -> Bool {
@@ -1303,11 +1289,10 @@ final class BacktestService {
     while cursor < toDate {
       guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
       let periodEnd = min(nextMonth, toDate)
-      let monthProgress = Double(monthIndex) / Double(totalMonths) * 0.70
+      let monthProgress = Double(monthIndex) / Double(totalMonths) * 0.60
       progress(monthProgress,
                "Сбор \(monthIndex + 1)/\(totalMonths) · матчей: \(allMatches.count)")
 
-      // ПАГИНАЦИЯ: API отдаёт максимум 1000 за раз
       var monthItems: [JSONValue] = []
       var pageOffset = 0
       var pageCount = 0
@@ -1359,8 +1344,10 @@ final class BacktestService {
       allHistories[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
     }
 
-    progress(0.70, "Матчей собрано: \(allMatches.count). Дотягиваю odds…")
+    progress(0.60, "Матчей собрано: \(allMatches.count). Дотягиваю odds и statistics…")
 
+    // ───── ПАТЧ [7.31].1: догружаем /Games/{id} для матчей без odds
+    //                и обновляем allHistories с corners/cards ─────
     var prepared: [Match] = allMatches.filter { ($0.oddsJSON?.array?.isEmpty == false) }
     let needOdds = allMatches.filter { ($0.oddsJSON?.array?.isEmpty != false) }
     let cap = min(needOdds.count, Self.oddsFetchCap)
@@ -1369,19 +1356,51 @@ final class BacktestService {
       var mm = m
       if let nid = mm.numericID {
         if let o = try? await client.odds(numericID: nid) {
-          // /Games/{id} → {data: {..., odds: [...]}}
           let data = o.object?["data"]?.object ?? o.object ?? [:]
           let game = data["game"]?.object ?? data
+          let stats = data["statistics"]?.object ?? game["statistics"]?.object ?? [:]
+
           mm.oddsJSON = game["odds"] ?? data["odds"]
+          Self.fillCornersCards(into: &mm, from: stats)
+          Self.replaceHistoryRecords(&allHistories, engine: engine,
+                                     payload: o, match: mm)
         }
         if i % 20 == 0 {
-          let p = 0.70 + (Double(i) / Double(max(cap, 1))) * 0.15
-          progress(p, "Odds \(i + 1)/\(cap)")
+          let p = 0.60 + (Double(i) / Double(max(cap, 1))) * 0.10
+          progress(p, "Odds+stats \(i + 1)/\(cap)")
         }
         try? await Task.sleep(for: .milliseconds(400))
       }
       if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
     }
+
+    // ───── ПАТЧ [7.31].2: для последних N матчей догружаем /Odds/{id}
+    //                и вливаем углы/карточки в oddsJSON.array ─────
+    prepared.sort { ($0.start ?? .distantPast) > ($1.start ?? .distantPast) }
+    let ccCount = min(prepared.count, Self.cornersCardsFetchCap)
+    progress(0.72, "Дотягиваю углы/ЖК (\(ccCount) матчей)…")
+
+    for i in 0..<ccCount {
+      var mm = prepared[i]
+      guard let nid = mm.numericID else { continue }
+      if let books = try? await client.fullOdds(gameId: nid), !books.isEmpty {
+        let extra = Self.oddsJSONFromBookmakers(books)
+        if !extra.isEmpty {
+          var merged: [JSONValue] = mm.oddsJSON?.array ?? []
+          merged.append(contentsOf: extra)
+          mm.oddsJSON = .array(merged)
+          prepared[i] = mm
+        }
+      }
+      if i % 25 == 0 {
+        let p = 0.72 + (Double(i) / Double(max(ccCount, 1))) * 0.08
+        progress(p, "Corners/Cards \(i + 1)/\(ccCount)")
+      }
+      try? await Task.sleep(for: .milliseconds(400))
+    }
+
+    // Финальная сортировка по времени — для walk-forward
+    prepared.sort { ($0.start ?? .distantPast) < ($1.start ?? .distantPast) }
 
     guard !prepared.isEmpty else {
       snapshot.buildStatus = "failed"
@@ -1418,6 +1437,8 @@ final class BacktestService {
       report.perLeague.mapValues { Self.toStored($0) })
     snapshot.perMarketJSON = try? encoder.encode(
       report.perMarket.mapValues { Self.toStored($0) })
+    snapshot.perLeagueMarketJSON = try? encoder.encode(
+      Self.leagueMarketSegment(report: report, matches: prepared))
     snapshot.evBucketsJSON = try? encoder.encode(
       report.byEVBucket.mapValues { Self.toStored($0) })
     snapshot.oddsBucketsJSON = try? encoder.encode(
@@ -1435,6 +1456,113 @@ final class BacktestService {
 
     progress(1.0, "Готово: \(report.matches) матчей, \(report.bets) ставок")
     return true
+  }
+
+  // [7.31] Заполняем Match углами/карточками из statistics
+  private static func fillCornersCards(into mm: inout Match,
+                                       from stats: [String: JSONValue]) {
+    if let v = stats["cornerKicksHome"]?.number { mm.homeCorners = Int(v) }
+    if let v = stats["cornerKicksAway"]?.number { mm.awayCorners = Int(v) }
+    if let v = stats["yellowCardsHome"]?.number { mm.homeYellows = Int(v) }
+    if let v = stats["yellowCardsAway"]?.number { mm.awayYellows = Int(v) }
+    if let v = stats["redCardsHome"]?.number { mm.homeReds = Int(v) }
+    if let v = stats["redCardsAway"]?.number { mm.awayReds = Int(v) }
+  }
+
+  // [7.31] Обновляем TeamRecord для команд из /Games/{id}
+  private static func replaceHistoryRecords(
+    _ history: inout [String: [TeamRecord]],
+    engine: QuantEngine,
+    payload: JSONValue,
+    match: Match
+  ) {
+    if let hID = match.homeID,
+       let rec = engine.teamRecord(from: payload, targetID: hID) {
+      var arr = history[hID] ?? []
+      if let i = arr.firstIndex(where: { $0.id == rec.id }) { arr[i] = rec }
+      else { arr.append(rec) }
+      history[hID] = arr
+    }
+    if let aID = match.awayID,
+       let rec = engine.teamRecord(from: payload, targetID: aID) {
+      var arr = history[aID] ?? []
+      if let i = arr.firstIndex(where: { $0.id == rec.id }) { arr[i] = rec }
+      else { arr.append(rec) }
+      history[aID] = arr
+    }
+  }
+
+  // [7.31] Конвертируем [BookmakerOdds] в массив JSONValue в формате,
+  //        который понимает parseQuotes в QuantEngine:
+  //        [{ marketId, marketName, odds: [{name, value}] }]
+  //        Углы — только Pinnacle (sharp). Карточки — best available по (name+line).
+  private static func oddsJSONFromBookmakers(_ books: [BookmakerOdds]) -> [JSONValue] {
+    var out: [JSONValue] = []
+
+    // Углы — Pinnacle
+    if let pin = books.first(where: { $0.bookmakerId == SStatsClient.pinnacleBookmakerId }),
+       let market = pin.odds.first(where: { $0.marketId == MarketID.totalCorners }) {
+      var prices: [JSONValue] = []
+      for p in market.odds {
+        prices.append(.object([
+          "name": .string(p.name),
+          "value": .number(p.value),
+        ]))
+      }
+      out.append(.object([
+        "marketId": .number(Double(MarketID.totalCorners)),
+        "marketName": .string(market.marketName ?? "Corners Over Under"),
+        "odds": .array(prices),
+      ]))
+    }
+
+    // Карточки — best available по всем букмекерам
+    var best: [String: (name: String, line: Double?, value: Double)] = [:]
+    for b in books {
+      guard let market = b.odds.first(where: { $0.marketId == MarketID.totalCards })
+      else { continue }
+      for p in market.odds {
+        let line = OddsQuery.extractLine(from: p.name)
+        let k = "\(p.name.lowercased())|\(line.map { String($0) } ?? "")"
+        if let cur = best[k], cur.value >= p.value { continue }
+        best[k] = (p.name, line, p.value)
+      }
+    }
+    if !best.isEmpty {
+      var prices: [JSONValue] = []
+      for (_, v) in best {
+        prices.append(.object([
+          "name": .string(v.name),
+          "value": .number(v.value),
+        ]))
+      }
+      out.append(.object([
+        "marketId": .number(Double(MarketID.totalCards)),
+        "marketName": .string("Cards Over/Under"),
+        "odds": .array(prices),
+      ]))
+    }
+
+    return out
+  }
+
+  // [7.31] Строим perLeagueMarket для heatmap
+  private static func leagueMarketSegment(
+    report: WalkForwardReport,
+    matches: [Match]
+  ) -> [String: StoredSegmentStats] {
+    var out: [String: StoredSegmentStats] = [:]
+    for (league, s) in report.perLeague {
+      for (market, ms) in report.perMarket {
+        let key = "\(league)|\(market)"
+        if let existing = out[key] {
+          out[key] = merge(existing, toStored(ms))
+        } else if s.bets > 0 || ms.bets > 0 {
+          out[key] = toStored(ms)
+        }
+      }
+    }
+    return out
   }
 
   func updateIncremental() async -> Bool {
@@ -1462,7 +1590,6 @@ final class BacktestService {
     let fromDate = lastTo
     let toDate = Date()
 
-    // Пагинация
     var monthItems: [JSONValue] = []
     var pageOffset = 0
     var pageCount = 0
@@ -1496,12 +1623,13 @@ final class BacktestService {
     var prepared: [Match] = []
     for m in newMatches {
       var mm = m
-      if mm.oddsJSON?.array?.isEmpty != false, let nid = mm.numericID {
-        if let o = try? await client.odds(numericID: nid) {
-          let data = o.object?["data"]?.object ?? o.object ?? [:]
-          let game = data["game"]?.object ?? data
-          mm.oddsJSON = game["odds"] ?? data["odds"]
-        }
+      if let nid = mm.numericID,
+         let o = try? await client.odds(numericID: nid) {
+        let data = o.object?["data"]?.object ?? o.object ?? [:]
+        let game = data["game"]?.object ?? data
+        let stats = data["statistics"]?.object ?? game["statistics"]?.object ?? [:]
+        mm.oddsJSON = game["odds"] ?? data["odds"]
+        Self.fillCornersCards(into: &mm, from: stats)
         try? await Task.sleep(for: .milliseconds(400))
       }
       if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
@@ -1664,8 +1792,14 @@ final class ScanCoordinator {
     var correlationPairs: Int = 0
     var lineupsFound: Int = 0
     var tuningNote: String? = nil
+    var cornersSignals: Int = 0     // [7.32] диагностика
+    var cardsSignals: Int = 0
   }
 
+  // [7.32] Патч:
+  //   • Для каждого матча делаем /Odds/{id} через client.fullOdds(gameId:)
+  //   • Передаём fullOdds в engine.signals(..., fullOdds: books)
+  //   • Убран догруз через client.odds(numericID:) — fullOdds отдаёт всё
   func scan(settings: AppSettings? = nil,
             selectedLeague: String = "Все") async -> ScanSummary {
     if isScanning { return ScanSummary(notes: ["Уже выполняется"]) }
@@ -1720,7 +1854,6 @@ final class ScanCoordinator {
       let client = SStatsClient(settings: resolvedSettings)
       let engine = QuantEngine()
 
-      // Сканируем сегодняшние матчи. Оставляем upcoming (status=2) и live (3-5).
       var all = engine.matches(from: try await client.listToday())
         .filter { !Self.isExcluded($0) }
         .filter { m in
@@ -1750,6 +1883,9 @@ final class ScanCoordinator {
       var signalsOut: [BetSignal] = []
       var count = 0
       var lineupsFound = 0
+      var cornersCount = 0
+      var cardsCount = 0
+
       for match in matches {
         guard let h = match.homeID, let a = match.awayID else { continue }
         count += 1
@@ -1759,18 +1895,15 @@ final class ScanCoordinator {
           teamID: a, count: resolvedSettings.historyMatches)
         guard let info = try? await client.gameInfo(match.id) else { continue }
 
-        // /Games/{id} → {data: {..., odds: [...]}} либо {data: {game: {...}}}
         let data = info.object?["data"]?.object ?? info.object ?? [:]
         let game = data["game"]?.object ?? data
-        var oddsFromInfo = game["odds"] ?? data["odds"]
+        let oddsFromInfo = game["odds"] ?? data["odds"]
           ?? match.oddsJSON ?? .array([])
 
-        if oddsFromInfo.array?.isEmpty != false, let nid = match.numericID {
-          if let o = try? await client.odds(numericID: nid) {
-            let d2 = o.object?["data"]?.object ?? o.object ?? [:]
-            let g2 = d2["game"]?.object ?? d2
-            oddsFromInfo = g2["odds"] ?? d2["odds"] ?? oddsFromInfo
-          }
+        // [7.32] Полные котировки по букмекерам — углы и карточки
+        var fullBooks: [BookmakerOdds] = []
+        if let nid = match.numericID {
+          fullBooks = (try? await client.fullOdds(gameId: nid)) ?? []
         }
 
         let glicko = try? await client.glicko(match.id)
@@ -1789,13 +1922,18 @@ final class ScanCoordinator {
 
         var s = engine.signals(
           match: match, info: info, oddsJSON: oddsFromInfo,
+          fullOdds: fullBooks,
           homeHistory: hs, awayHistory: awayRecords, glicko: glicko,
           posteriorBuckets: posteriorBuckets,
           posteriorWeight: tuning.posteriorWeight,
           teamRatings: (home: ratings.0, away: ratings.1),
           upcomingLineups: lineups)
 
-        // Sharp money из LiveMonitor
+        for sig in s {
+          if sig.market == "CORNERS" { cornersCount += 1 }
+          if sig.market == "CARDS"   { cardsCount += 1 }
+        }
+
         s = s.map { sig in
           var x = sig
           let liveKey = "\(x.market)|\(x.selection.lowercased())|\(x.line.map { String($0) } ?? "")"
@@ -1818,6 +1956,8 @@ final class ScanCoordinator {
       }
       summary.lineupsFound = lineupsFound
       if lineupsFound > 0 { summary.notes.append("Lineups: \(lineupsFound)") }
+      summary.cornersSignals = cornersCount
+      summary.cardsSignals = cardsCount
 
       let filtered = signalsOut.filter { s in
         !AutoExclude.isExcluded(league: s.league, market: s.market, rules: excludedRules)
@@ -1835,7 +1975,11 @@ final class ScanCoordinator {
         bankroll: resolvedSettings.effectiveBankroll)
       summary.finishedAt = Date()
       summary.success = true
+
+      let cornersInPort = summary.signals.filter { $0.market == "CORNERS" }.count
+      let cardsInPort = summary.signals.filter { $0.market == "CARDS" }.count
       summary.notes.append("Сырых сигналов: \(signalsOut.count), в портфель: \(summary.signals.count)")
+      summary.notes.append("Углы: \(cornersCount) сырых, \(cornersInPort) в портфель · ЖК: \(cardsCount) сырых, \(cardsInPort) в портфель")
 
       if resolvedSettings.notifyBets && !summary.signals.isEmpty {
         await NotificationService.notify(signals: summary.signals)
@@ -1961,7 +2105,7 @@ extension Notification.Name {
 
 struct SignalIDWrapper: Identifiable { let id: String }
 
-// MARK: - Live monitor (сохранён для совместимости с D1/D2)
+// MARK: - Live monitor
 
 struct OddsSnapshot: Hashable {
   let gameID: String; let numericID: Int?; let takenAt: Date
