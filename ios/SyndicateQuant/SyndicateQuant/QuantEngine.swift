@@ -54,9 +54,7 @@ struct QuantEngine {
   static let countLines = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5]
   static let sharpBooks = ["pinnacle", "betfair", "sbo", "sbobet", "marathon"]
 
-  // B2: минимальный n, чтобы posterior применялся.
   static let posteriorMinN = 20
-  // B2: фиксированный вес posterior-поправки (p_adj = (1-w)·p + w·posterior).
   static let posteriorWeight = 0.15
 
   // MARK: - Matches
@@ -148,17 +146,14 @@ struct QuantEngine {
     let ph = playerAssembly(home)
     let pa = playerAssembly(away)
     let player = (base.0 * ph.factor, base.1 * pa.factor)
-    let final = glickoAdjust(player, glicko)
+    let final = glickoAdjust(player, teamRatings: (nil, nil), glickoJSON: glicko)
 
     let maxGoals = 12
 
-    // B1: три модели.
     let dcMatrix = QuantMath.dixonColes(
       final.0, final.1, rho: -0.055, maxGoals: maxGoals)
     let bivarMatrix = QuantMath.bivariatePoisson(
       final.0, final.1, l3: 0.05, maxGoals: maxGoals)
-    // NB-flavoured: тот же DC, но с плоским rho — компенсирует overdispersion хвостов
-    // (честный NB требует конструктора Matrix2D, недоступного снаружи QuantMath).
     let nbMatrix = QuantMath.dixonColes(
       final.0, final.1, rho: -0.020, maxGoals: maxGoals)
 
@@ -166,7 +161,6 @@ struct QuantEngine {
     let oBiv = QuantMath.outcomes(bivarMatrix)
     let oNB = QuantMath.outcomes(nbMatrix)
 
-    // Веса по средней xG обеих команд.
     let combined = home + away
     let xgValues = combined.compactMap { $0.xg }
     let avgXG: Double? = xgValues.isEmpty
@@ -178,10 +172,8 @@ struct QuantEngine {
     var wNB = 0.20
     if let ax = avgXG {
       if ax < 1.0 {
-        // низкие xG → bivariate лучше описывает коррелированные 0-0, 1-0, 0-1
         wDC = 0.30; wBiv = 0.55; wNB = 0.15
       } else if ax > 1.8 {
-        // высокие xG → хвосты толще, NB-flavoured компенсирует
         wDC = 0.40; wBiv = 0.10; wNB = 0.50
       }
     }
@@ -192,7 +184,6 @@ struct QuantEngine {
     let ensembleDraw = wDC * oDC.draw + wBiv * oBiv.draw + wNB * oNB.draw
     let ensembleAway = wDC * oDC.away + wBiv * oBiv.away + wNB * oNB.away
 
-    // Для GOALS используем матрицу-доминанту (у totalDistribution одна матрица).
     let primaryMatrix: Matrix2D
     if wDC >= wBiv && wDC >= wNB { primaryMatrix = dcMatrix }
     else if wBiv >= wNB { primaryMatrix = bivarMatrix }
@@ -215,10 +206,12 @@ struct QuantEngine {
     match: Match, info: JSONValue, oddsJSON: JSONValue,
     homeHistory: [TeamRecord], awayHistory: [TeamRecord],
     glicko: JSONValue? = nil,
-    posteriorBuckets: [PosteriorBucket] = []
+    posteriorBuckets: [PosteriorBucket] = [],
+    teamRatings: (home: Double?, away: Double?) = (nil, nil)
   ) -> [BetSignal] {
-    guard let matchModel = self.model(
-      home: homeHistory, away: awayHistory, glicko: glicko)
+    guard let matchModel = self.modelWithRatings(
+      home: homeHistory, away: awayHistory, glicko: glicko,
+      teamRatings: teamRatings)
     else { return [] }
 
     let quotes = parseQuotes(oddsJSON)
@@ -283,6 +276,68 @@ struct QuantEngine {
     return out.sorted { $0.qcs > $1.qcs }
   }
 
+  /// Промежуточный model() с поддержкой teamRatings (не ломает публичный API).
+  private func modelWithRatings(
+    home: [TeamRecord], away: [TeamRecord], glicko: JSONValue?,
+    teamRatings: (home: Double?, away: Double?)
+  ) -> MatchModel? {
+    guard let base = estimateLambdas(home, away) else { return nil }
+    let ph = playerAssembly(home)
+    let pa = playerAssembly(away)
+    let player = (base.0 * ph.factor, base.1 * pa.factor)
+    let final = glickoAdjust(player, teamRatings: teamRatings, glickoJSON: glicko)
+
+    let maxGoals = 12
+    let dcMatrix = QuantMath.dixonColes(
+      final.0, final.1, rho: -0.055, maxGoals: maxGoals)
+    let bivarMatrix = QuantMath.bivariatePoisson(
+      final.0, final.1, l3: 0.05, maxGoals: maxGoals)
+    let nbMatrix = QuantMath.dixonColes(
+      final.0, final.1, rho: -0.020, maxGoals: maxGoals)
+
+    let oDC = QuantMath.outcomes(dcMatrix)
+    let oBiv = QuantMath.outcomes(bivarMatrix)
+    let oNB = QuantMath.outcomes(nbMatrix)
+
+    let combined = home + away
+    let xgValues = combined.compactMap { $0.xg }
+    let avgXG: Double? = xgValues.isEmpty
+      ? nil
+      : xgValues.reduce(0, +) / Double(xgValues.count)
+
+    var wDC = 0.55
+    var wBiv = 0.25
+    var wNB = 0.20
+    if let ax = avgXG {
+      if ax < 1.0 {
+        wDC = 0.30; wBiv = 0.55; wNB = 0.15
+      } else if ax > 1.8 {
+        wDC = 0.40; wBiv = 0.10; wNB = 0.50
+      }
+    }
+    let wSum = wDC + wBiv + wNB
+    wDC /= wSum; wBiv /= wSum; wNB /= wSum
+
+    let ensembleHome = wDC * oDC.home + wBiv * oBiv.home + wNB * oNB.home
+    let ensembleDraw = wDC * oDC.draw + wBiv * oBiv.draw + wNB * oNB.draw
+    let ensembleAway = wDC * oDC.away + wBiv * oBiv.away + wNB * oNB.away
+
+    let primaryMatrix: Matrix2D
+    if wDC >= wBiv && wDC >= wNB { primaryMatrix = dcMatrix }
+    else if wBiv >= wNB { primaryMatrix = bivarMatrix }
+    else { primaryMatrix = nbMatrix }
+
+    return MatchModel(
+      lh: final.0, la: final.1,
+      baseLH: base.0, baseLA: base.1,
+      baseMatrix: dcMatrix, playerMatrix: dcMatrix, matrix: primaryMatrix,
+      outcomes: (ensembleHome, ensembleDraw, ensembleAway),
+      components: [oDC.home, oDC.draw, oDC.away, ensembleHome, ensembleDraw, ensembleAway],
+      playerHome: ph, playerAway: pa,
+      ensembleWeights: (dc: wDC, biv: wBiv, nb: wNB),
+      ensembleAvgXG: avgXG)
+  }
+
   // MARK: - Probability calculations
 
   private func compute1X2Probability(
@@ -326,7 +381,7 @@ struct QuantEngine {
       q, mean: mean, variance: countVariance(records, \.cards))
   }
 
-  // MARK: - Finish (B2: posterior adjustment)
+  // MARK: - Finish
 
   private func finish(
     match: Match, q: Quote, p: Double,
@@ -337,7 +392,6 @@ struct QuantEngine {
     posteriorBuckets: [PosteriorBucket]
   ) -> BetSignal? {
 
-    // B2: posterior adjustment.
     let pRaw = p
     var pFinal = p
     var posteriorWeight: Double = 0
@@ -472,15 +526,22 @@ struct QuantEngine {
     return "X NO BET"
   }
 
-  // MARK: - Portfolio
+  // MARK: - Portfolio (B5: stopLoss)
 
   func portfolio(
     _ signals: [BetSignal],
-    excludedRules: [AutoExcludeRule] = []
+    excludedRules: [AutoExcludeRule] = [],
+    stopLoss: VolatilityState = .normal
   ) -> [BetSignal] {
+    // B5: пауза — никаких ставок.
+    if stopLoss.isPause {
+      return []
+    }
+
     var chosen: [BetSignal] = []
     var totalExposure = 0.0
     let dailyCap = 0.10
+    let cap: Double? = stopLoss.capValue
 
     let candidates = signals
       .filter { $0.robustEV > 0 }
@@ -503,13 +564,19 @@ struct QuantEngine {
         }
       }
       if maxCorr >= 0.65 { continue }
-      guard totalExposure + s.stake <= dailyCap else { continue }
 
       var x = s
+      if let cap {
+        x.stakeBeforeStop = s.stake
+        x.stake = min(s.stake, cap)
+        x.stopApplied = "CAP \(Int(cap * 100))%"
+      }
+
+      guard totalExposure + x.stake <= dailyCap else { continue }
       x.portfolioCorrelation = maxCorr
       x.correlationReason = reason
       chosen.append(x)
-      totalExposure += s.stake
+      totalExposure += x.stake
       if chosen.count >= 8 { break }
     }
     return chosen
@@ -581,10 +648,21 @@ struct QuantEngine {
     return (lh, la)
   }
 
+  /// B3: приоритет — teamRatings (если оба не nil), иначе glicko JSON.
   private func glickoAdjust(
-    _ pair: (Double, Double), _ json: JSONValue?
+    _ pair: (Double, Double),
+    teamRatings: (home: Double?, away: Double?),
+    glickoJSON: JSONValue?
   ) -> (Double, Double) {
-    guard let json,
+    if let h = teamRatings.home, let a = teamRatings.away {
+      // Elo-формула с HFA=60.
+      let diff = (h + 60) - a
+      let expectedHome = 1.0 / (1.0 + pow(10.0, -diff / 400.0))
+      let edge = max(-1, min(1, (expectedHome - 0.5) * 2.0))
+      let f = max(-0.12, min(0.12, 0.20 * edge))
+      return (pair.0 * (1 + f), pair.1 * (1 - f))
+    }
+    guard let json = glickoJSON,
           let ph = firstNumber(json, ["homeWinProbability"]),
           let pa = firstNumber(json, ["awayWinProbability"])
     else { return pair }
@@ -881,7 +959,6 @@ struct MatchModel {
   var components: [Double]
   var playerHome: PlayerAssembly
   var playerAway: PlayerAssembly
-  // B1: диагностика ensemble.
   var ensembleWeights: (dc: Double, biv: Double, nb: Double) = (0, 0, 0)
   var ensembleAvgXG: Double? = nil
 }

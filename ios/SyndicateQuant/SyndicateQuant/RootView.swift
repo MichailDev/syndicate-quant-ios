@@ -7,6 +7,7 @@ struct RootView: View {
   @Environment(\.modelContext) private var context
   @Query(sort: \JournalEntry.createdAt, order: .reverse) private var journal: [JournalEntry]
   @Query private var snapshots: [BacktestSnapshot]
+  @Query(sort: \TeamRating.rating, order: .reverse) private var teamRatings: [TeamRating]
 
   @State private var signals: [BetSignal] = []
   @State private var status = "Готов"
@@ -317,9 +318,11 @@ struct RootView: View {
     List {
       Section {
         Text("Backtest Service").font(.headline)
-        Text("Собирает базу за 2 года × 8 лиг. Служит источником для Auto-Exclude и калибровочных поправок (B2 posterior).")
+        Text("Собирает базу за 2 года × 8 лиг. Auto-Exclude, posterior (B2), TeamRating (B3) и stop-loss (B5) опираются на данные отсюда.")
           .font(.caption).foregroundStyle(.secondary)
       }
+
+      volatilitySection
 
       if let snap = currentSnapshot {
         Section("Статус") {
@@ -354,10 +357,6 @@ struct RootView: View {
           if let err = snap.lastError {
             Text(err).font(.caption).foregroundStyle(.red)
           }
-        }
-      } else {
-        Section("Статус") {
-          Text("Снапшот ещё не создан").font(.caption).foregroundStyle(.secondary)
         }
       }
 
@@ -395,15 +394,19 @@ struct RootView: View {
         classSection(snap)
       }
 
+      teamRatingsSection
+
       Section("Задачи Волны B") {
         Label("B1 Model Ensemble (DC+BIV+NB)", systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("B2 Bayesian posterior (p_adj = 0.85·p + 0.15·p_post)",
+        Label("B2 Bayesian posterior (0.85·p + 0.15·p_post)",
               systemImage: "checkmark.circle.fill")
           .foregroundStyle(.green)
-        Label("B3 Elo/Glicko team strength", systemImage: "circle.dashed")
+        Label("B3 Elo team strength", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
         Label("B4 Correlation matrix из журнала", systemImage: "circle.dashed")
-        Label("B5 Volatility stop-loss (lossStreak)", systemImage: "circle.dashed")
+        Label("B5 Volatility stop-loss", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
         Label("B6 Player impact в λ", systemImage: "circle.dashed")
       }
 
@@ -417,6 +420,55 @@ struct RootView: View {
     .listStyle(.insetGrouped)
     .navigationTitle("Авто")
     .navigationBarTitleDisplayMode(.large)
+  }
+
+  @ViewBuilder
+  private var volatilitySection: some View {
+    let ev = VolatilityStop.evaluate(journal)
+    Section("Volatility stop (B5)") {
+      LabeledContent("Текущая серия", value: "\(ev.streak)")
+      LabeledContent("Состояние", value: ev.state.label)
+      switch ev.state {
+      case .normal:
+        Text("Работаем в штатном режиме.")
+          .font(.caption).foregroundStyle(.secondary)
+      case .cap(let v):
+        Text("После \(VolatilityStop.capThreshold) проигрышей подряд — стейк ограничен \(Int(v * 100))%.")
+          .font(.caption).foregroundStyle(.orange)
+      case .pause:
+        Text("После \(VolatilityStop.pauseThreshold) проигрышей подряд — новые ставки не создаются до первой победы (WIN) в журнале.")
+          .font(.caption).foregroundStyle(.red)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var teamRatingsSection: some View {
+    let top = Array(teamRatings.prefix(20))
+    if !top.isEmpty {
+      Section("Team ratings (B3)") {
+        Text("Elo, старт 1500, HFA 60, K=32→20. Применяются после 3 матчей.")
+          .font(.caption2).foregroundStyle(.secondary)
+        ForEach(top) { r in
+          HStack {
+            VStack(alignment: .leading, spacing: 2) {
+              Text(r.name.isEmpty ? r.teamID : r.name).font(.subheadline)
+              Text("n=\(r.matches)").font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(String(format: "%.0f", r.rating))
+              .font(.subheadline.monospacedDigit())
+              .foregroundStyle(.primary)
+            if r.lastDelta != 0 {
+              Text(String(format: "%+.0f", r.lastDelta))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(r.lastDelta > 0 ? .green : .red)
+                .frame(width: 44, alignment: .trailing)
+            }
+          }
+        }
+      }
+    }
   }
 
   @ViewBuilder
@@ -616,6 +668,16 @@ struct RootView: View {
         LabeledContent("Avg CLV", value: String(format: "%+.2f%%", m.avgCLV * 100))
         LabeledContent("Brier", value: String(format: "%.3f", m.brier))
       }
+      Section("Team ratings (B3)") {
+        LabeledContent("Всего команд", value: "\(teamRatings.count)")
+        let usable = teamRatings.filter { $0.matches >= TeamRatingService.minMatchesForUse }.count
+        LabeledContent("С ≥ 3 матчами", value: "\(usable)")
+      }
+      Section("Volatility stop (B5)") {
+        let ev = VolatilityStop.evaluate(journal)
+        LabeledContent("Текущая серия", value: "\(ev.streak)")
+        LabeledContent("Состояние", value: ev.state.label)
+      }
       Section("Backtest snapshot") {
         if let snap = currentSnapshot {
           LabeledContent("Status", value: snap.buildStatus)
@@ -672,7 +734,9 @@ struct RootView: View {
           .font(.caption).foregroundStyle(.secondary)
         Text("Portfolio cap 10% bankroll в день")
           .font(.caption).foregroundStyle(.secondary)
-        Text("Ensemble: DC + BIV + NB-flavoured; posterior 0.15 при n≥20")
+        Text("Ensemble DC+BIV+NB · posterior 0.15 при n≥20")
+          .font(.caption).foregroundStyle(.secondary)
+        Text("Stop-loss: ≥4 LOSS → CAP 5%, ≥7 → PAUSE")
           .font(.caption).foregroundStyle(.secondary)
       }
       if !diagnostics.isEmpty {
@@ -829,9 +893,8 @@ struct SignalCard: View {
         Text("MS \(String(format: "%.0f", signal.ms))")
         Text("Sample \(signal.sampleClass)")
         Text("\(signal.bookmakers)b")
-        if signal.posteriorWeight != nil {
-          Text("PST").foregroundStyle(.purple)
-        }
+        if signal.posteriorWeight != nil { Text("PST").foregroundStyle(.purple) }
+        if signal.stopApplied != nil { Text("STOP").foregroundStyle(.red) }
       }
       .font(.caption2).foregroundStyle(.secondary)
     }
@@ -933,6 +996,22 @@ struct SignalDetailView: View {
             let delta = (signal.probability - raw) * 100
             LabeledContent("Δ", value: String(format: "%+.2f п.п.", delta))
           }
+        }
+      }
+
+      if signal.stopApplied != nil {
+        Section("Stop-loss (B5)") {
+          if let reason = signal.stopApplied {
+            LabeledContent("Применено", value: reason)
+          }
+          if let before = signal.stakeBeforeStop {
+            LabeledContent("Стейк был",
+                           value: String(format: "%.3f%%", before * 100))
+            LabeledContent("Стейк стал",
+                           value: String(format: "%.3f%%", signal.stake * 100))
+          }
+          Text("Серия проигрышей ≥4 → ограничение стейка до 5%. ≥7 → пауза.")
+            .font(.caption2).foregroundStyle(.secondary)
         }
       }
 

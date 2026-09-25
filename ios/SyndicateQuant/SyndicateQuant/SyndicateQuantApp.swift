@@ -13,6 +13,7 @@ import SwiftUI
       CalibrationSample.self,
       BacktestRun.self,
       BacktestSnapshot.self,
+      TeamRating.self,
     ])
     let config = ModelConfiguration(
       schema: schema, isStoredInMemoryOnly: false)

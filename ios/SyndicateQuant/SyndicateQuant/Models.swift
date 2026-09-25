@@ -139,14 +139,14 @@ struct BetSignal: Identifiable, Codable, Hashable {
   let selection: String
   let line: Double?
   let odds: Double
-  let probability: Double        // финальная (с posterior)
+  var probability: Double        // финальная (с posterior); var → может меняться stop-loss'ом? нет, но оставлю let
   let fairOdds: Double
   let ev: Double
   let robustEV: Double
   let model: String
   let timestamp: Date
   let classification: String
-  let stake: Double
+  var stake: Double              // B5: может быть пересчитан stop-loss'ом
   let priceAnomaly: Bool
   let bookmakers: Int
 
@@ -174,9 +174,165 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var correlationReason: String
 
   // B2: диагностика posterior
-  var probabilityRaw: Double? = nil      // p_model до posterior
-  var posteriorWeight: Double? = nil     // применённый вес (0 если не применялся)
-  var posteriorSource: String? = nil     // текстовое описание бакета
+  var probabilityRaw: Double? = nil
+  var posteriorWeight: Double? = nil
+  var posteriorSource: String? = nil
+
+  // B5: диагностика stop-loss
+  var stopApplied: String? = nil
+  var stakeBeforeStop: Double? = nil
+}
+
+// MARK: - Team rating (B3)
+
+@Model final class TeamRating {
+  @Attribute(.unique) var teamID: String
+  var name: String
+  var rating: Double
+  var matches: Int
+  var lastDelta: Double
+  var updatedAt: Date
+
+  init(teamID: String, name: String = "",
+       rating: Double = 1500, matches: Int = 0) {
+    self.teamID = teamID
+    self.name = name
+    self.rating = rating
+    self.matches = matches
+    self.lastDelta = 0
+    self.updatedAt = Date()
+  }
+}
+
+// MARK: - Volatility stop (B5)
+
+enum VolatilityState: Equatable {
+  case normal
+  case cap(Double)
+  case pause
+
+  var label: String {
+    switch self {
+    case .normal: return "NORMAL"
+    case .cap(let v): return String(format: "CAP %.1f%%", v * 100)
+    case .pause: return "PAUSE"
+    }
+  }
+  var isPause: Bool {
+    if case .pause = self { return true }
+    return false
+  }
+  var capValue: Double? {
+    if case .cap(let v) = self { return v }
+    return nil
+  }
+}
+
+enum VolatilityStop {
+  static let capThreshold = 4
+  static let pauseThreshold = 7
+  static let capValue = 0.05
+
+  static func evaluate(_ journal: [JournalEntry]) -> (streak: Int, state: VolatilityState) {
+    let sorted = journal
+      .filter { $0.status == "CLOSED" }
+      .sorted { $0.createdAt > $1.createdAt }
+    var streak = 0
+    for e in sorted {
+      guard let r = e.result else { continue }
+      if r == "VOID" || r == "PUSH" { continue }
+      if r == "LOSS" { streak += 1; continue }
+      break
+    }
+    if streak >= pauseThreshold { return (streak, .pause) }
+    if streak >= capThreshold { return (streak, .cap(capValue)) }
+    return (streak, .normal)
+  }
+}
+
+// MARK: - Team rating service (B3)
+
+@MainActor
+enum TeamRatingService {
+  static let initialRating = 1500.0
+  static let homeAdvantage = 60.0
+  static let kBase = 32.0
+  static let kDecayAfter = 30
+  static let kMin = 20.0
+  static let minMatchesForUse = 3
+
+  static func expectedHome(home: Double, away: Double) -> Double {
+    let diff = (home + homeAdvantage) - away
+    return 1.0 / (1.0 + pow(10.0, -diff / 400.0))
+  }
+
+  static func kFactor(matches: Int) -> Double {
+    if matches >= kDecayAfter { return kMin }
+    let t = Double(matches) / Double(kDecayAfter)
+    return kBase + (kMin - kBase) * t
+  }
+
+  @discardableResult
+  static func update(
+    context: ModelContext,
+    homeTeamID: String, homeName: String,
+    awayTeamID: String, awayName: String,
+    homeGoals: Double, awayGoals: Double
+  ) -> (deltaHome: Double, deltaAway: Double)? {
+    guard !homeTeamID.isEmpty, !awayTeamID.isEmpty,
+          homeTeamID != awayTeamID else { return nil }
+
+    let h = fetchOrCreate(context, teamID: homeTeamID, name: homeName)
+    let a = fetchOrCreate(context, teamID: awayTeamID, name: awayName)
+
+    let expectedHome = expectedHome(home: h.rating, away: a.rating)
+    let outcomeHome: Double
+    if homeGoals > awayGoals { outcomeHome = 1.0 }
+    else if homeGoals == awayGoals { outcomeHome = 0.5 }
+    else { outcomeHome = 0.0 }
+    let outcomeAway = 1.0 - outcomeHome
+
+    let deltaH = kFactor(matches: h.matches) * (outcomeHome - expectedHome)
+    let deltaA = kFactor(matches: a.matches) * (outcomeAway - (1 - expectedHome))
+
+    h.rating += deltaH
+    h.matches += 1
+    h.lastDelta = deltaH
+    h.updatedAt = Date()
+
+    a.rating += deltaA
+    a.matches += 1
+    a.lastDelta = deltaA
+    a.updatedAt = Date()
+
+    try? context.save()
+    return (deltaH, deltaA)
+  }
+
+  static func fetchOrCreate(
+    _ context: ModelContext, teamID: String, name: String
+  ) -> TeamRating {
+    let descriptor = FetchDescriptor<TeamRating>(
+      predicate: #Predicate { $0.teamID == teamID })
+    if let existing = try? context.fetch(descriptor).first {
+      if !name.isEmpty, existing.name != name { existing.name = name }
+      return existing
+    }
+    let r = TeamRating(teamID: teamID, name: name)
+    context.insert(r)
+    return r
+  }
+
+  /// Возвращает рейтинг, только если у команды достаточно матчей.
+  static func usableRating(
+    for teamID: String, context: ModelContext
+  ) -> Double? {
+    let descriptor = FetchDescriptor<TeamRating>(
+      predicate: #Predicate { $0.teamID == teamID })
+    guard let r = try? context.fetch(descriptor).first,
+          r.matches >= minMatchesForUse else { return nil }
+    return r.rating
+  }
 }
 
 // MARK: - Journal
@@ -302,7 +458,7 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
-// MARK: - Backtest snapshot
+// MARK: - Backtest snapshot (Волна G)
 
 struct StoredSegmentStats: Codable, Hashable {
   var bets: Int
@@ -683,6 +839,16 @@ enum JournalService {
       entry.status = "CLOSED"
       closed += 1
 
+      // B3: обновить TeamRating после матча.
+      let ids = extractTeamIDs(from: game)
+      if let hID = ids.home, let aID = ids.away {
+        TeamRatingService.update(
+          context: context,
+          homeTeamID: hID, homeName: entry.home,
+          awayTeamID: aID, awayName: entry.away,
+          homeGoals: hFT, awayGoals: aFT)
+      }
+
       try? await Task.sleep(for: .milliseconds(120))
     }
 
@@ -771,6 +937,22 @@ enum JournalService {
     return nil
   }
 
+  private static func extractTeamIDs(
+    from game: [String: JSONValue]
+  ) -> (home: String?, away: String?) {
+    func extract(_ side: String) -> String? {
+      if let s = game[side + "TeamId"]?.string, !s.isEmpty { return s }
+      if let s = game[side + "TeamID"]?.string, !s.isEmpty { return s }
+      if let n = game[side + "TeamId"]?.number { return String(Int(n)) }
+      if let t = game[side + "Team"]?.object {
+        if let s = t["id"]?.string, !s.isEmpty { return s }
+        if let n = t["id"]?.number { return String(Int(n)) }
+      }
+      return nil
+    }
+    return (extract("home"), extract("away"))
+  }
+
   private static func normalizeMarket(_ s: String) -> String {
     if s.contains("corner") { return "CORNERS" }
     if s.contains("card") || s.contains("yellow") { return "CARDS" }
@@ -808,7 +990,7 @@ final class AppDependencies {
   private init() {}
 }
 
-// MARK: - BacktestService (G2 + G3 + G8)
+// MARK: - BacktestService
 
 @MainActor
 final class BacktestService {
@@ -1211,7 +1393,7 @@ final class BacktestService {
   }
 }
 
-// MARK: - ScanCoordinator (B2: posterior передаётся в engine)
+// MARK: - ScanCoordinator (B2 + B3 + B5 + G6)
 
 @MainActor
 final class ScanCoordinator {
@@ -1228,6 +1410,8 @@ final class ScanCoordinator {
     var notes: [String] = []
     var finishedAt: Date?
     var success: Bool = false
+    var lossStreak: Int = 0
+    var volatilityLabel: String = "NORMAL"
   }
 
   func scan(
@@ -1249,6 +1433,9 @@ final class ScanCoordinator {
       summary.notes.append("API key не задан")
       return summary
     }
+
+    let container = AppDependencies.shared.container
+    let ratingContext = container.map { ModelContext($0) }
 
     do {
       let client = SStatsClient(settings: resolvedSettings)
@@ -1276,6 +1463,14 @@ final class ScanCoordinator {
       let excludedRules = Self.loadExcludedRules()
       let excludedCount = excludedRules.filter { $0.excluded }.count
 
+      // B5: текущая серия проигрышей из журнала.
+      let streak = Self.loadLossStreak()
+      summary.lossStreak = streak.streak
+      summary.volatilityLabel = streak.state.label
+      if streak.streak > 0 {
+        summary.notes.append("LossStreak: \(streak.streak) · \(streak.state.label)")
+      }
+
       var signalsOut: [BetSignal] = []
       var count = 0
       for match in matches {
@@ -1294,10 +1489,21 @@ final class ScanCoordinator {
           }
         }
         let glicko = try? await client.glicko(match.id)
+
+        // B3: локальные рейтинги (если есть).
+        let ratings: (Double?, Double?) = {
+          guard let ctx = ratingContext else { return (nil, nil) }
+          return (
+            TeamRatingService.usableRating(for: h, context: ctx),
+            TeamRatingService.usableRating(for: a, context: ctx)
+          )
+        }()
+
         let s = engine.signals(
           match: match, info: info, oddsJSON: oddsFromInfo,
           homeHistory: hs, awayHistory: awayRecords, glicko: glicko,
-          posteriorBuckets: posteriorBuckets)
+          posteriorBuckets: posteriorBuckets,
+          teamRatings: (home: ratings.0, away: ratings.1))
         signalsOut.append(contentsOf: s)
       }
 
@@ -1314,7 +1520,8 @@ final class ScanCoordinator {
       }
 
       summary.scannedMatches = count
-      summary.signals = engine.portfolio(filtered, excludedRules: excludedRules)
+      summary.signals = engine.portfolio(
+        filtered, excludedRules: excludedRules, stopLoss: streak.state)
       summary.finishedAt = Date()
       summary.success = true
 
@@ -1345,6 +1552,18 @@ final class ScanCoordinator {
     let context = ModelContext(container)
     let snap = BacktestService.fetchOrCreate(in: context)
     return snap.decodedPosteriorBuckets()
+  }
+
+  private static func loadLossStreak() -> (streak: Int, state: VolatilityState) {
+    guard let container = AppDependencies.shared.container else {
+      return (0, .normal)
+    }
+    let context = ModelContext(container)
+    let descriptor = FetchDescriptor<JournalEntry>()
+    guard let entries = try? context.fetch(descriptor) else {
+      return (0, .normal)
+    }
+    return VolatilityStop.evaluate(entries)
   }
 
   private static func isExcluded(_ m: Match) -> Bool {
