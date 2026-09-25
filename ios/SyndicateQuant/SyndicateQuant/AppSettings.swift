@@ -29,7 +29,6 @@ import Foundation
     didSet { UserDefaults.standard.set(colorSchemeRaw, forKey: "color_scheme") }
   }
 
-  // Волна D (D5): реальный банкролл.
   @Published var bankroll: Double {
     didSet { UserDefaults.standard.set(bankroll, forKey: "bankroll") }
   }
@@ -37,8 +36,16 @@ import Foundation
     didSet { UserDefaults.standard.set(useMoneyStakes, forKey: "use_money_stakes") }
   }
 
+  // Волна D (D1): Live monitor.
+  @Published var liveMonitorEnabled: Bool {
+    didSet { UserDefaults.standard.set(liveMonitorEnabled, forKey: "live_monitor_enabled") }
+  }
+  @Published var liveMonitorIntervalSec: Int {
+    didSet { UserDefaults.standard.set(liveMonitorIntervalSec, forKey: "live_monitor_interval") }
+  }
+
   let baseURL = "https://api.sstats.net"
-  let engineVersion = "v5.5.0-iOS-INSTITUTIONAL"
+  let engineVersion = "v5.6.0-iOS-INSTITUTIONAL"
 
   init() {
     apiKey = KeychainStore.shared.get("sstats_api_key") ?? ""
@@ -53,6 +60,10 @@ import Foundation
 
     bankroll = UserDefaults.standard.object(forKey: "bankroll") as? Double ?? 10_000
     useMoneyStakes = UserDefaults.standard.object(forKey: "use_money_stakes") as? Bool ?? false
+
+    liveMonitorEnabled = UserDefaults.standard.object(forKey: "live_monitor_enabled") as? Bool ?? false
+    let stored = UserDefaults.standard.object(forKey: "live_monitor_interval") as? Int ?? 60
+    liveMonitorIntervalSec = max(30, min(300, stored))
   }
 
   var oddsFormat: OddsFormat {

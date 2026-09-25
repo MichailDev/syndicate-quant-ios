@@ -197,7 +197,7 @@ final class SStatsClient {
     cfg.waitsForConnectivity = false
     cfg.httpAdditionalHeaders = [
       "Accept": "application/json",
-      "User-Agent": "SyndicateQuant-iOS/5.3.0 (iPhone; iOS)",
+      "User-Agent": "SyndicateQuant-iOS/5.6.0 (iPhone; iOS)",
       "Accept-Language": "en-US,en;q=0.9",
     ]
     self.session = URLSession(configuration: cfg)
@@ -259,6 +259,17 @@ final class SStatsClient {
     try await get("/Odds/\(numericID)", query: [:])
   }
 
+  /// Волна D (D1): попытка получить live-котировки.
+  /// Если SStats.net не поддерживает /Odds/live/{id}, возвращаем nil — вызывающий
+  /// код сделает fallback на обычный odds(numericID:).
+  func oddsLive(numericID: Int) async throws -> JSONValue? {
+    do {
+      return try await get("/Odds/live/\(numericID)", query: [:])
+    } catch {
+      return nil
+    }
+  }
+
   func glicko(_ id: String) async throws -> JSONValue {
     try await get("/Games/glicko/\(id)", query: [:])
   }
@@ -291,6 +302,7 @@ final class SStatsClient {
     if path.hasPrefix("/Games/list") { return 6 * 3600 }
     if path.hasPrefix("/Ls/Team") { return 3600 }
     if path.hasPrefix("/Ls/GameInfo") { return 30 * 60 }
+    if path.hasPrefix("/Odds/live/") { return 30 }
     if path.hasPrefix("/Odds/") { return 5 * 60 }
     if path.hasPrefix("/Games/glicko") { return 6 * 3600 }
     return 5 * 60
@@ -444,7 +456,6 @@ final class SStatsClient {
   }
 
   /// B6: попытка достать построчный список игроков команды из матча.
-  /// Пробует несколько ключей и структур, если ничего не находит — возвращает [].
   private func parsePlayers(
     o: [String: JSONValue], stats: [String: JSONValue], side: String
   ) -> [PlayerRow] {
@@ -464,7 +475,6 @@ final class SStatsClient {
 
   private func parsePlayer(_ v: JSONValue, side: String) -> PlayerRow? {
     guard let o = v.object else { return nil }
-    // Если у объекта есть поле side/team, отфильтруем несоответствующие.
     if let team = string(o, ["side", "team", "teamSide"])?.lowercased() {
       if team.contains("home") && side == "away" { return nil }
       if team.contains("away") && side == "home" { return nil }

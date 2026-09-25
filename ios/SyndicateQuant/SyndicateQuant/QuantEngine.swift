@@ -235,7 +235,33 @@ struct QuantEngine {
         out.append(s)
       }
     }
-    return out.sorted { $0.qcs > $1.qcs }
+
+    // Волна D (D2): sharp money из LiveMonitor.
+    out = out.map { s in
+      var x = s
+      let liveKey = "\(s.market)|\(s.selection.lowercased())|\(s.line.map { String($0) } ?? "")"
+      if let cur = LiveMonitor.shared.snapshots[s.gameID],
+         let prev = LiveMonitor.shared.previousSnapshotForDebug(matchID: s.gameID),
+         let curAvg = cur.avg(forKey: liveKey),
+         let prevAvg = prev.avg(forKey: liveKey),
+         prevAvg > 1 {
+        let delta = (curAvg - prevAvg) / prevAvg
+        x.liveMovement = delta
+        let moving = cur.booksMoving(forKey: liveKey, vs: prev, threshold: 0.01)
+        if moving.count >= 3 && abs(delta) > 0.02 {
+          x.sharpMoney = true
+          x.sharpMovement = delta
+        }
+      }
+      return x
+    }
+
+    return out.sorted { a, b in
+      // Волна D (D2): sharp money приоритетнее при прочих равных.
+      if a.sharpMoney == true && b.sharpMoney != true { return true }
+      if b.sharpMoney == true && a.sharpMoney != true { return false }
+      return a.qcs > b.qcs
+    }
   }
 
   // MARK: - Model with ratings & impact
@@ -557,7 +583,12 @@ struct QuantEngine {
         !AutoExclude.isExcluded(
           league: $0.league, market: $0.market, rules: excludedRules)
       }
-      .sorted { $0.robustEV > $1.robustEV }
+      .sorted { a, b in
+        // Волна D (D2): sharp money приоритетнее при прочих равных.
+        if a.sharpMoney == true && b.sharpMoney != true { return true }
+        if b.sharpMoney == true && a.sharpMoney != true { return false }
+        return a.robustEV > b.robustEV
+      }
 
     for s in candidates {
       var maxCorr = 0.0
@@ -578,7 +609,6 @@ struct QuantEngine {
         x.stopApplied = "CAP \(Int(cap * 100))%"
       }
 
-      // Волна D (D5): конвертация в деньги, если включён режим.
       if let bankroll, bankroll > 0 {
         x.stakeMoney = x.stake * bankroll
       }
@@ -851,7 +881,6 @@ struct QuantEngine {
           let market = normalizeMarket(marketName + " " + selection)
           guard !market.isEmpty else { continue }
           let line = extractLine(selection) ?? extractLine(marketName)
-          // Волна D (D4): реальный букмекер.
           let bookmaker = string(
             p, ["bookmaker", "bookmakerName", "bookie", "bk", "book", "sportsbook"]
           ) ?? string(m, ["bookmaker", "bookmakerName", "bookie", "bk"]) ?? "sstats"

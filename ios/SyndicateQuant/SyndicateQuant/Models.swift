@@ -191,6 +191,11 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var worstOdds: Double? = nil
   var worstBook: String? = nil
   var avgOdds: Double? = nil
+
+  // Волна D (D1 + D2)
+  var sharpMoney: Bool? = nil
+  var sharpMovement: Double? = nil
+  var liveMovement: Double? = nil
 }
 
 // MARK: - Team rating (B3)
@@ -1122,7 +1127,6 @@ enum Metrics {
     return totalN > 0 ? weightedSum / Double(totalN) : 0
   }
 
-  /// Волна D (D5): bankroll — множитель для перевода P/L и стейка в деньги.
   static func equityCurve(
     _ entries: [JournalEntry],
     bankroll: Double? = nil
@@ -2133,6 +2137,291 @@ enum OddsFormatter {
       }
     }
     return (bestNum, bestDen)
+  }
+}
+
+// MARK: - Live odds monitor (Волна D: D1 + D2)
+
+/// Снимок котировок для одного матча по всем книгам.
+struct OddsSnapshot: Hashable {
+  let gameID: String
+  let numericID: Int?
+  let takenAt: Date
+  /// Ключ: "market|selection|line", значение: [bookmaker: odds]
+  let byKey: [String: [String: Double]]
+
+  /// Средняя цена по всем книгам для ключа.
+  func avg(forKey k: String) -> Double? {
+    guard let map = byKey[k], !map.isEmpty else { return nil }
+    let values = Array(map.values)
+    return values.reduce(0, +) / Double(values.count)
+  }
+
+  /// Медиана по всем книгам.
+  func median(forKey k: String) -> Double? {
+    guard let map = byKey[k], !map.isEmpty else { return nil }
+    return QuantMath.median(Array(map.values))
+  }
+
+  /// Сколько книг двигают линию в одну сторону.
+  func booksMoving(forKey k: String, vs previous: OddsSnapshot, threshold: Double)
+    -> (count: Int, direction: Int, avgDelta: Double)
+  {
+    guard let cur = byKey[k], let prev = previous.byKey[k] else {
+      return (0, 0, 0)
+    }
+    var upCount = 0
+    var downCount = 0
+    var deltaSum = 0.0
+    var n = 0
+    for (book, c) in cur {
+      guard let p = prev[book], p > 1, c > 1 else { continue }
+      let d = (c - p) / p
+      if d > threshold { upCount += 1 }
+      else if d < -threshold { downCount += 1 }
+      deltaSum += d
+      n += 1
+    }
+    if upCount > downCount {
+      return (upCount, +1, n > 0 ? deltaSum / Double(n) : 0)
+    } else if downCount > upCount {
+      return (downCount, -1, n > 0 ? deltaSum / Double(n) : 0)
+    }
+    return (0, 0, 0)
+  }
+}
+
+/// Движение одной пары (market|selection|line).
+struct LineMovement: Identifiable, Hashable {
+  var id: String { key }
+  let key: String
+  let market: String
+  let selection: String
+  let line: Double?
+  let previousAvg: Double
+  let currentAvg: Double
+  let delta: Double
+  let booksAgreeing: Int
+  let isSharp: Bool
+
+  var direction: String {
+    delta > 0 ? "▲" : (delta < 0 ? "▼" : "·")
+  }
+}
+
+/// Live-монитор. Хранит последние снимки в памяти, детектит sharp money.
+@MainActor
+final class LiveMonitor: ObservableObject {
+  static let shared = LiveMonitor()
+
+  @Published private(set) var snapshots: [String: OddsSnapshot] = [:]
+  private var previous: [String: OddsSnapshot] = [:]
+  @Published private(set) var movements: [LineMovement] = []
+  @Published private(set) var isRunning: Bool = false
+  @Published private(set) var lastTick: Date?
+  @Published private(set) var lastError: String?
+
+  /// Активная подписка: gameID → numericID.
+  private var observed: [String: Int?] = [:]
+  private var task: Task<Void, Never>?
+
+  private init() {}
+
+  // MARK: - Подписка
+
+  func observe(gameID: String, numericID: Int?) {
+    observed[gameID] = numericID
+  }
+
+  func clearObserved() {
+    observed.removeAll()
+    snapshots.removeAll()
+    previous.removeAll()
+    movements.removeAll()
+  }
+
+  /// Для QuantEngine — доступ к предыдущему снимку.
+  func previousSnapshotForDebug(matchID: String) -> OddsSnapshot? {
+    return previous[matchID]
+  }
+
+  // MARK: - Запуск/остановка
+
+  func start(settings: AppSettings) {
+    guard settings.liveMonitorEnabled else { return }
+    guard !isRunning else { return }
+    isRunning = true
+    lastError = nil
+
+    let interval = max(30, min(300, settings.liveMonitorIntervalSec))
+
+    task = Task { [weak self] in
+      await self?.tick(settings: settings)
+      while !Task.isCancelled {
+        let ns = UInt64(interval) * 1_000_000_000
+        try? await Task.sleep(nanoseconds: ns)
+        if Task.isCancelled { break }
+        await self?.tick(settings: settings)
+      }
+    }
+  }
+
+  func stop() {
+    task?.cancel()
+    task = nil
+    isRunning = false
+  }
+
+  // MARK: - Один цикл
+
+  private func tick(settings: AppSettings) async {
+    let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else {
+      lastError = "API key не задан"
+      return
+    }
+
+    let client = SStatsClient(settings: settings)
+    var newSnapshots: [String: OddsSnapshot] = [:]
+    var newMovements: [LineMovement] = []
+
+    for (gameID, numericID) in observed {
+      guard let nid = numericID else { continue }
+      var json: JSONValue?
+      if let live = try? await client.oddsLive(numericID: nid) {
+        json = live
+      }
+      if json == nil {
+        json = try? await client.odds(numericID: nid)
+      }
+      guard let raw = json else { continue }
+
+      let parsed = Self.parseOddsByBook(raw)
+      guard !parsed.isEmpty else { continue }
+
+      let snap = OddsSnapshot(
+        gameID: gameID, numericID: nid,
+        takenAt: Date(), byKey: parsed)
+
+      if let prev = previous[gameID] {
+        for (k, _) in parsed {
+          let parts = k.split(separator: "|").map(String.init)
+          let market = parts.first ?? ""
+          let selection = parts.count > 1 ? parts[1] : ""
+          let line: Double? = parts.count > 2 ? Double(parts[2]) : nil
+
+          guard let prevAvg = prev.avg(forKey: k),
+                let curAvg = snap.avg(forKey: k),
+                prevAvg > 1, curAvg > 1
+          else { continue }
+
+          let delta = (curAvg - prevAvg) / prevAvg
+          let moving = snap.booksMoving(forKey: k, vs: prev, threshold: 0.01)
+          let isSharp = moving.count >= 3 && abs(delta) > 0.02
+
+          newMovements.append(LineMovement(
+            key: k, market: market, selection: selection, line: line,
+            previousAvg: prevAvg, currentAvg: curAvg,
+            delta: delta,
+            booksAgreeing: moving.count,
+            isSharp: isSharp))
+        }
+      }
+
+      previous[gameID] = snap
+      newSnapshots[gameID] = snap
+    }
+
+    self.snapshots = newSnapshots
+    self.movements = newMovements
+      .sorted { abs($0.delta) > abs($1.delta) }
+    self.lastTick = Date()
+    if newSnapshots.isEmpty {
+      self.lastError = observed.isEmpty
+        ? "Нет активных матчей"
+        : "Не удалось получить котировки"
+    } else {
+      self.lastError = nil
+    }
+  }
+
+  // MARK: - Парсинг
+
+  /// Возвращает: "market|selection|line" → [bookmaker: odds].
+  static func parseOddsByBook(_ json: JSONValue) -> [String: [String: Double]] {
+    var out: [String: [String: Double]] = [:]
+    let items: [JSONValue] = {
+      if let arr = json.array { return arr }
+      if let dataArr = json.object?["data"]?.array { return dataArr }
+      return json.allObjects().map { .object($0) }
+    }()
+
+    for mv in items {
+      guard let m = mv.object else { continue }
+      let marketName = (m["marketName"]?.string
+        ?? m["market"]?.string
+        ?? m["market_name"]?.string
+        ?? "").lowercased()
+      guard let prices = m["odds"]?.array else { continue }
+      for pv in prices {
+        guard let p = pv.object else { continue }
+        guard let value = numberFrom(p, ["value", "odds", "price"]),
+              value > 1, value < 1000
+        else { continue }
+        let selName = (p["name"]?.string
+          ?? p["selection"]?.string
+          ?? p["outcome"]?.string
+          ?? "")
+        let market = normalizeLiveMarket(marketName + " " + selName)
+        guard !market.isEmpty else { continue }
+        let line = extractLineFrom(selName) ?? extractLineFrom(marketName)
+        let book = (p["bookmaker"]?.string
+          ?? p["bookmakerName"]?.string
+          ?? p["bookie"]?.string
+          ?? p["bk"]?.string
+          ?? m["bookmaker"]?.string
+          ?? m["bookmakerName"]?.string
+          ?? "sstats").lowercased()
+
+        let key = "\(market)|\(selName.lowercased())|\(line.map { String($0) } ?? "")"
+        var byBook = out[key] ?? [:]
+        if let existing = byBook[book] {
+          byBook[book] = max(existing, value)
+        } else {
+          byBook[book] = value
+        }
+        out[key] = byBook
+      }
+    }
+    return out
+  }
+
+  private static func normalizeLiveMarket(_ x: String) -> String {
+    let s = x.lowercased()
+    if s.contains("corner") { return "CORNERS" }
+    if s.contains("card") || s.contains("yellow") { return "CARDS" }
+    if s.contains("goal") || s.contains("total")
+        || s.contains("over") || s.contains("under") { return "GOALS" }
+    let trimmed = s.trimmingCharacters(in: .whitespaces)
+    if s.contains("1x2") || s.contains("winner") || s.contains("home")
+        || trimmed == "1" || trimmed == "x" || trimmed == "2" { return "1X2" }
+    return ""
+  }
+
+  private static func extractLineFrom(_ s: String) -> Double? {
+    let regex = try? NSRegularExpression(pattern: "([0-9]+(?:\\.[0-9]+)?)")
+    if let m = regex?.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+       let r = Range(m.range(at: 1), in: s) {
+      return Double(s[r])
+    }
+    return nil
+  }
+
+  private static func numberFrom(
+    _ o: [String: JSONValue], _ keys: [String]
+  ) -> Double? {
+    for k in keys { if let n = o[k]?.number { return n } }
+    return nil
   }
 }
 

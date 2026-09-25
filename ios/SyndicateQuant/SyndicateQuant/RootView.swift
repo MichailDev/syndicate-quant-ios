@@ -4,6 +4,7 @@ import SwiftUI
 
 struct RootView: View {
   @EnvironmentObject var settings: AppSettings
+  @ObservedObject private var liveMonitor = LiveMonitor.shared
   @Environment(\.modelContext) private var context
   @Query(sort: \JournalEntry.createdAt, order: .reverse) private var journal: [JournalEntry]
   @Query private var snapshots: [BacktestSnapshot]
@@ -58,6 +59,10 @@ struct RootView: View {
       _ = BacktestService.fetchOrCreate(in: context)
       _ = TuningService.fetchOrCreate(in: context)
       await refresh()
+    }
+    .onChange(of: settings.liveMonitorEnabled) { _, enabled in
+      if enabled { liveMonitor.start(settings: settings) }
+      else { liveMonitor.stop() }
     }
     .onReceive(NotificationCenter.default.publisher(for: .openSignal)) { note in
       if let id = note.userInfo?["signalID"] as? String {
@@ -376,6 +381,7 @@ struct RootView: View {
       }
 
       selfTuningLinkSection
+      liveMonitorSection
       leagueMarketHeatmapSection
 
       volatilitySection
@@ -464,6 +470,81 @@ struct RootView: View {
     .listStyle(.insetGrouped)
     .navigationTitle("Авто")
     .navigationBarTitleDisplayMode(.large)
+  }
+
+  @ViewBuilder
+  private var liveMonitorSection: some View {
+    Section {
+      HStack {
+        Label("Live-монитор", systemImage: "dot.radiowaves.left.and.right")
+          .font(.headline)
+        Spacer()
+        Text(liveMonitor.isRunning ? "● идёт" : "○ стоп")
+          .font(.caption)
+          .foregroundStyle(liveMonitor.isRunning ? .green : .secondary)
+      }
+      LabeledContent("Матчей под наблюдением",
+                     value: "\(liveMonitor.snapshots.count)")
+      if let t = liveMonitor.lastTick {
+        LabeledContent("Последний цикл",
+                       value: t.formatted(date: .omitted, time: .standard))
+      }
+      if let err = liveMonitor.lastError {
+        Text(err).font(.caption).foregroundStyle(.orange)
+      }
+
+      if liveMonitor.isRunning {
+        Button(role: .destructive) {
+          liveMonitor.stop()
+        } label: {
+          Label("Остановить", systemImage: "stop.circle")
+        }
+      } else {
+        Button {
+          liveMonitor.start(settings: settings)
+        } label: {
+          Label("Запустить", systemImage: "play.circle")
+        }
+        .disabled(!settings.liveMonitorEnabled || signals.isEmpty)
+      }
+    } header: {
+      Text("Live (D1)")
+    } footer: {
+      Text("Следит за активными матчами раз в \(settings.liveMonitorIntervalSec) сек. Запускается автоматически после скана, если включено в Настройках.")
+    }
+
+    if !liveMonitor.movements.isEmpty {
+      Section("Движения линии (D2)") {
+        let top = liveMonitor.movements.prefix(5)
+        ForEach(Array(top)) { m in
+          HStack(alignment: .top, spacing: 8) {
+            Text(m.direction)
+              .font(.body.bold())
+              .foregroundStyle(m.delta < 0 ? .green : (m.delta > 0 ? .red : .secondary))
+            VStack(alignment: .leading, spacing: 2) {
+              Text("\(m.market) · \(m.selection)\(m.line.map { " \($0)" } ?? "")")
+                .font(.caption)
+                .lineLimit(1)
+              Text(String(format: "%.2f → %.2f · книг: %d",
+                          m.previousAvg, m.currentAvg, m.booksAgreeing))
+                .font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if m.isSharp {
+              Text("SHARP")
+                .font(.caption2.bold())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(.purple)
+                .clipShape(Capsule())
+            }
+            Text(String(format: "%+.1f%%", m.delta * 100))
+              .font(.caption.monospacedDigit())
+              .foregroundStyle(m.delta < 0 ? .green : .red)
+          }
+        }
+      }
+    }
   }
 
   @ViewBuilder
@@ -917,6 +998,17 @@ struct RootView: View {
         LabeledContent("Размер банка",
                        value: String(format: "%.0f", settings.bankroll))
       }
+      Section("Live-монитор (D1)") {
+        LabeledContent("Статус", value: liveMonitor.isRunning ? "идёт" : "стоп")
+        LabeledContent("Матчей", value: "\(liveMonitor.snapshots.count)")
+        LabeledContent("Движений", value: "\(liveMonitor.movements.count)")
+        let sharpCount = liveMonitor.movements.filter { $0.isSharp }.count
+        LabeledContent("Sharp", value: "\(sharpCount)")
+        if let t = liveMonitor.lastTick {
+          LabeledContent("Last tick",
+                         value: t.formatted(date: .omitted, time: .standard))
+        }
+      }
       Section("Team ratings (B3)") {
         LabeledContent("Всего команд", value: "\(teamRatings.count)")
         let usable = teamRatings.filter { $0.matches >= TeamRatingService.minMatchesForUse }.count
@@ -1065,6 +1157,16 @@ struct RootView: View {
         Text("При включённом режиме стейк отображается в деньгах (2% банка = 0.02 × размер).")
           .font(.caption2).foregroundStyle(.secondary)
       }
+      Section("Live-монитор") {
+        Toggle("Следить за линией", isOn: $settings.liveMonitorEnabled)
+        if settings.liveMonitorEnabled {
+          Stepper("Интервал: \(settings.liveMonitorIntervalSec) сек",
+                  value: $settings.liveMonitorIntervalSec,
+                  in: 30...300, step: 30)
+        }
+        Text("Опрашивает /Odds/live/{id}. Если эндпоинт недоступен — использует /Odds/{id}.")
+          .font(.caption2).foregroundStyle(.secondary)
+      }
       Section("Автообновление") {
         Toggle("Фоновое обновление", isOn: $settings.autoRefresh)
         Stepper("Интервал: \(settings.refreshMinutes) мин",
@@ -1109,6 +1211,16 @@ struct RootView: View {
 
     signals = summary.signals
     lastRefresh = summary.finishedAt
+
+    // Волна D (D1): регистрируем активные матчи для live-монитора.
+    liveMonitor.clearObserved()
+    for s in signals {
+      liveMonitor.observe(gameID: s.gameID, numericID: Int(s.gameID))
+    }
+    if settings.liveMonitorEnabled && !signals.isEmpty {
+      liveMonitor.start(settings: settings)
+    }
+
     if summary.success {
       status = "Обновлено · \(signals.count) сигналов"
     } else {
@@ -1177,6 +1289,7 @@ struct SignalCard: View {
         if signal.playerImpactHome != nil || signal.playerImpactAway != nil {
           Text("PLR").foregroundStyle(.orange)
         }
+        if signal.sharpMoney == true { Text("SHARP").foregroundStyle(.purple) }
       }
       .font(.caption2).foregroundStyle(.secondary)
     }
@@ -1298,6 +1411,28 @@ struct SignalDetailView: View {
           if signal.bookmakers >= 3, avg > 0 {
             let spread = (best - worst) / avg * 100
             Text(String(format: "Разброс: %.1f%%", spread))
+              .font(.caption2).foregroundStyle(.secondary)
+          }
+        }
+      }
+
+      if let lm = signal.liveMovement {
+        Section("Live movement (D1)") {
+          LabeledContent("Средняя цена",
+                         value: String(format: "%+.2f%%", lm * 100))
+            .foregroundStyle(lm < 0 ? .green : .red)
+          if signal.sharpMoney == true, let sm = signal.sharpMovement {
+            HStack {
+              Text("Sharp money")
+              Spacer()
+              Text(String(format: "да · %+.2f%%", sm * 100))
+                .foregroundStyle(.purple)
+                .font(.subheadline.bold())
+            }
+            Text("≥3 книги одновременно двигают линию в одну сторону.")
+              .font(.caption2).foregroundStyle(.secondary)
+          } else {
+            Text("Движение односторонним не признано")
               .font(.caption2).foregroundStyle(.secondary)
           }
         }
