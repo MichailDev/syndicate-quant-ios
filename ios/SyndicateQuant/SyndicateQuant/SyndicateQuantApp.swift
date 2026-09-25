@@ -14,6 +14,8 @@ import SwiftUI
       BacktestRun.self,
       BacktestSnapshot.self,
       TeamRating.self,
+      TuningConfig.self,
+      TuningEvent.self,
     ])
     let config = ModelConfiguration(
       schema: schema, isStoredInMemoryOnly: false)

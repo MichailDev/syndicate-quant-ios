@@ -8,6 +8,8 @@ struct RootView: View {
   @Query(sort: \JournalEntry.createdAt, order: .reverse) private var journal: [JournalEntry]
   @Query private var snapshots: [BacktestSnapshot]
   @Query(sort: \TeamRating.rating, order: .reverse) private var teamRatings: [TeamRating]
+  @Query private var tuningConfigs: [TuningConfig]
+  @Query(sort: \TuningEvent.createdAt, order: .reverse) private var tuningEvents: [TuningEvent]
 
   @State private var signals: [BetSignal] = []
   @State private var status = "Готов"
@@ -23,6 +25,7 @@ struct RootView: View {
   @State private var btProgressText = ""
 
   private var currentSnapshot: BacktestSnapshot? { snapshots.first }
+  private var tuningConfig: TuningConfig? { tuningConfigs.first }
 
   private var correlationMatrix: CorrelationMatrix {
     CorrelationBuilder.build(from: journal)
@@ -44,6 +47,7 @@ struct RootView: View {
     .tint(.blue)
     .task {
       _ = BacktestService.fetchOrCreate(in: context)
+      _ = TuningService.fetchOrCreate(in: context)
       await refresh()
     }
   }
@@ -322,9 +326,11 @@ struct RootView: View {
     List {
       Section {
         Text("Backtest Service").font(.headline)
-        Text("Auto-Exclude, posterior (B2), TeamRating (B3), корреляция (B4), stop-loss (B5) и player impact (B6) — всё это опирается на данные отсюда и из журнала.")
+        Text("Auto-Exclude, posterior (B2), TeamRating (B3), корреляция (B4), stop-loss (B5), player impact (B6).")
           .font(.caption).foregroundStyle(.secondary)
       }
+
+      selfTuningLinkSection
 
       volatilitySection
       correlationSection
@@ -402,21 +408,6 @@ struct RootView: View {
 
       teamRatingsSection
 
-      Section("Задачи Волны B") {
-        Label("B1 Model Ensemble (DC+BIV+NB)", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("B2 Bayesian posterior", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("B3 Elo team strength", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("B4 Correlation matrix", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("B5 Volatility stop-loss", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-        Label("B6 Player impact в λ", systemImage: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-      }
-
       Section("Принцип") {
         Text("NO DATA → NO NUMBER → NO EDGE → NO BET")
           .font(.subheadline).bold()
@@ -430,21 +421,65 @@ struct RootView: View {
   }
 
   @ViewBuilder
+  private var selfTuningLinkSection: some View {
+    Section {
+      NavigationLink {
+        SelfTuningView()
+      } label: {
+        HStack {
+          Image(systemName: "slider.horizontal.3")
+            .foregroundStyle(.blue)
+          VStack(alignment: .leading, spacing: 2) {
+            Text("Self-Tuning панель").font(.headline)
+            if let cfg = tuningConfig {
+              Text("Активных: \(activeCount(cfg)) из 6 · порогов: 5")
+                .font(.caption).foregroundStyle(.secondary)
+            } else {
+              Text("Открыть настройки автотюнинга")
+                .font(.caption).foregroundStyle(.secondary)
+            }
+          }
+          Spacer()
+        }
+      }
+    }
+  }
+
+  private func activeCount(_ cfg: TuningConfig) -> Int {
+    var n = 0
+    if cfg.autoExcludeEnabled { n += 1 }
+    if cfg.posteriorEnabled { n += 1 }
+    if cfg.stopLossEnabled { n += 1 }
+    if cfg.correlationEnabled { n += 1 }
+    if cfg.playerImpactEnabled { n += 1 }
+    if cfg.teamRatingEnabled { n += 1 }
+    return n
+  }
+
+  @ViewBuilder
   private var volatilitySection: some View {
-    let ev = VolatilityStop.evaluate(journal)
+    let cap = tuningConfig?.stopLossCapStreak ?? VolatilityStop.defaultCapThreshold
+    let pause = tuningConfig?.stopLossPauseStreak ?? VolatilityStop.defaultPauseThreshold
+    let enabled = tuningConfig?.stopLossEnabled ?? true
+    let ev = VolatilityStop.evaluate(
+      journal, capThreshold: cap, pauseThreshold: pause)
     Section("Volatility stop (B5)") {
+      LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
       LabeledContent("Текущая серия", value: "\(ev.streak)")
-      LabeledContent("Состояние", value: ev.state.label)
-      switch ev.state {
-      case .normal:
+      LabeledContent("Состояние", value: enabled ? ev.state.label : "OFF")
+      switch (enabled, ev.state) {
+      case (false, _):
+        Text("Stop-loss отключён в Self-Tuning.")
+          .font(.caption).foregroundStyle(.secondary)
+      case (true, .cap(let v)):
+        Text("После \(cap) проигрышей подряд — стейк ограничен \(Int(v * 100))%.")
+          .font(.caption).foregroundStyle(.orange)
+      case (true, .pause):
+        Text("После \(pause) проигрышей подряд — новые ставки не создаются.")
+          .font(.caption).foregroundStyle(.red)
+      default:
         Text("Работаем в штатном режиме.")
           .font(.caption).foregroundStyle(.secondary)
-      case .cap(let v):
-        Text("После \(VolatilityStop.capThreshold) проигрышей подряд — стейк ограничен \(Int(v * 100))%.")
-          .font(.caption).foregroundStyle(.orange)
-      case .pause:
-        Text("После \(VolatilityStop.pauseThreshold) проигрышей подряд — новые ставки не создаются.")
-          .font(.caption).foregroundStyle(.red)
       }
     }
   }
@@ -452,9 +487,11 @@ struct RootView: View {
   @ViewBuilder
   private var correlationSection: some View {
     let m = correlationMatrix
+    let enabled = tuningConfig?.correlationEnabled ?? true
     Section("Correlation matrix (B4)") {
+      LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
       if m.totalPairs == 0 {
-        Text("Нужно ≥ 20 пар закрытых записей в одном дне для эмпирики. Пока используются структурные значения.")
+        Text("Нужно ≥ 20 пар закрытых записей в одном дне для эмпирики.")
           .font(.caption).foregroundStyle(.secondary)
       } else {
         LabeledContent("Пар в журнале", value: "\(m.totalPairs)")
@@ -487,10 +524,12 @@ struct RootView: View {
 
   @ViewBuilder
   private var playerImpactSection: some View {
+    let enabled = tuningConfig?.playerImpactEnabled ?? true
     Section("Player impact (B6)") {
+      LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
       Text("Применяется, когда в gameInfo есть состав (lineups) и у команды ≥ 6 игроков в истории. Отсутствие топ-8 → −5…−12% к λ.")
         .font(.caption).foregroundStyle(.secondary)
-      Text("Статус: ожидание данных от API. Ключи, которые пробуются: lineups, homeLineup/awayLineup, homePlayers/awayPlayers.")
+      Text("Ключи, которые пробуются: lineups, homeLineup/awayLineup, homePlayers/awayPlayers.")
         .font(.caption2).foregroundStyle(.secondary)
     }
   }
@@ -498,8 +537,10 @@ struct RootView: View {
   @ViewBuilder
   private var teamRatingsSection: some View {
     let top = Array(teamRatings.prefix(20))
-    if !top.isEmpty {
+    let enabled = tuningConfig?.teamRatingEnabled ?? true
+    if !top.isEmpty || !enabled {
       Section("Team ratings (B3)") {
+        LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
         Text("Elo, старт 1500, HFA 60, K=32→20. Применяются после 3 матчей.")
           .font(.caption2).foregroundStyle(.secondary)
         ForEach(top) { r in
@@ -526,9 +567,17 @@ struct RootView: View {
 
   @ViewBuilder
   private func autoExcludeSection(_ snap: BacktestSnapshot) -> some View {
-    let rules = AutoExclude.rules(from: snap)
+    let cfg = tuningConfig
+    let minROI = cfg?.autoExcludeMinROI ?? AutoExclude.defaultMinROI
+    let minBets = cfg?.autoExcludeMinBets ?? AutoExclude.defaultMinBets
+    let enabled = cfg?.autoExcludeEnabled ?? true
+    let rules = AutoExclude.rules(from: snap, minROI: minROI, minBets: minBets)
     let excluded = rules.filter { $0.excluded }
-    Section("Auto-Exclude (ROI < −5%, n≥20)") {
+    Section("Auto-Exclude") {
+      LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
+      LabeledContent("Порог",
+                     value: String(format: "ROI < %.1f%%, n ≥ %d",
+                                   minROI * 100, minBets))
       if rules.isEmpty {
         Text("Нет данных по лига+рынок (соберите базу)")
           .font(.caption).foregroundStyle(.secondary)
@@ -556,10 +605,15 @@ struct RootView: View {
 
   @ViewBuilder
   private func posteriorSection(_ snap: BacktestSnapshot) -> some View {
+    let cfg = tuningConfig
+    let enabled = cfg?.posteriorEnabled ?? true
+    let w = cfg?.posteriorWeight ?? QuantEngine.defaultPosteriorWeight
     let buckets = snap.decodedPosteriorBuckets()
     let nonEmpty = buckets.filter { $0.n > 0 }
     let usable = nonEmpty.filter { $0.n >= 20 }.count
     Section("Posterior buckets (B2)") {
+      LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
+      LabeledContent("Вес w", value: String(format: "%.2f", w))
       if nonEmpty.isEmpty {
         Text("Нет данных (соберите базу)")
           .font(.caption).foregroundStyle(.secondary)
@@ -721,15 +775,28 @@ struct RootView: View {
         LabeledContent("Avg CLV", value: String(format: "%+.2f%%", m.avgCLV * 100))
         LabeledContent("Brier", value: String(format: "%.3f", m.brier))
       }
+      Section("Self-Tuning") {
+        if let cfg = tuningConfig {
+          LabeledContent("Активных механизмов",
+                         value: "\(activeCount(cfg)) из 6")
+          LabeledContent("posteriorWeight",
+                         value: String(format: "%.2f", cfg.posteriorWeight))
+          LabeledContent("autoExcludeMinROI",
+                         value: String(format: "%.1f%%", cfg.autoExcludeMinROI * 100))
+          LabeledContent("autoExcludeMinBets",
+                         value: "\(cfg.autoExcludeMinBets)")
+          LabeledContent("stopLossCap/Pause",
+                         value: "\(cfg.stopLossCapStreak)/\(cfg.stopLossPauseStreak)")
+          LabeledContent("Событий в логе", value: "\(tuningEvents.count)")
+        } else {
+          Text("Конфиг не создан")
+            .font(.caption).foregroundStyle(.secondary)
+        }
+      }
       Section("Team ratings (B3)") {
         LabeledContent("Всего команд", value: "\(teamRatings.count)")
         let usable = teamRatings.filter { $0.matches >= TeamRatingService.minMatchesForUse }.count
         LabeledContent("С ≥ 3 матчами", value: "\(usable)")
-      }
-      Section("Volatility stop (B5)") {
-        let ev = VolatilityStop.evaluate(journal)
-        LabeledContent("Текущая серия", value: "\(ev.streak)")
-        LabeledContent("Состояние", value: ev.state.label)
       }
       Section("Correlation (B4)") {
         let m = correlationMatrix
@@ -792,12 +859,6 @@ struct RootView: View {
         Text("Quarter Kelly · max 2% · S BET до 2.5%")
           .font(.caption).foregroundStyle(.secondary)
         Text("Portfolio cap 10% bankroll в день")
-          .font(.caption).foregroundStyle(.secondary)
-        Text("Ensemble DC+BIV+NB · posterior 0.15 при n≥20")
-          .font(.caption).foregroundStyle(.secondary)
-        Text("Stop-loss: ≥4 LOSS → CAP 5%, ≥7 → PAUSE")
-          .font(.caption).foregroundStyle(.secondary)
-        Text("Empirical correlation (n≥20) · player impact (if lineups)")
           .font(.caption).foregroundStyle(.secondary)
       }
       if !diagnostics.isEmpty {
@@ -1202,6 +1263,407 @@ struct SignalDetailView: View {
       Spacer()
       Text(String(format: "%.1f", value))
         .font(.subheadline.monospacedDigit())
+    }
+  }
+}
+
+// MARK: - SelfTuningView (Волна F)
+
+struct SelfTuningView: View {
+  @Environment(\.modelContext) private var context
+  @Environment(\.dismiss) private var dismiss
+  @Query private var configs: [TuningConfig]
+  @Query(sort: \TuningEvent.createdAt, order: .reverse) private var events: [TuningEvent]
+  @Query(sort: \JournalEntry.createdAt, order: .reverse) private var journal: [JournalEntry]
+  @Query private var snapshots: [BacktestSnapshot]
+
+  @State private var rollbackMessage: String? = nil
+
+  private var config: TuningConfig? { configs.first }
+  private var snapshot: BacktestSnapshot? { snapshots.first }
+
+  private var correlationMatrix: CorrelationMatrix {
+    CorrelationBuilder.build(from: journal)
+  }
+
+  var body: some View {
+    List {
+      if let cfg = config {
+        decisionsSection(cfg)
+        thresholdsSection(cfg)
+        eventsSection
+        resetSection
+      } else {
+        Section {
+          Text("Конфиг не создан. Перезапустите приложение.")
+            .font(.caption).foregroundStyle(.secondary)
+        }
+      }
+      Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("Self-Tuning")
+    .navigationBarTitleDisplayMode(.large)
+    .onAppear {
+      if configs.isEmpty {
+        _ = TuningService.fetchOrCreate(in: context)
+      }
+    }
+  }
+
+  // MARK: - Раздел 1: Активные механизмы
+
+  @ViewBuilder
+  private func decisionsSection(_ cfg: TuningConfig) -> some View {
+    let decisions = TuningService.decisions(
+      config: cfg,
+      snapshot: snapshot,
+      journal: journal,
+      corr: correlationMatrix)
+    Section {
+      ForEach(decisions) { d in
+        VStack(alignment: .leading, spacing: 6) {
+          HStack {
+            Text(d.title).font(.subheadline.bold())
+            Spacer()
+            Toggle("", isOn: Binding(
+              get: { d.enabled },
+              set: { newValue in
+                setFlag(d.flagKey, value: newValue, in: cfg)
+              }
+            ))
+            .labelsHidden()
+          }
+          Text(d.summary).font(.caption).foregroundStyle(.secondary)
+          Text(d.detail).font(.caption2).foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 2)
+      }
+    } header: {
+      Text("Активные механизмы")
+    } footer: {
+      Text("Отключённый механизм не применяется при следующем скане.")
+    }
+  }
+
+  private func setFlag(_ key: String, value: Bool, in cfg: TuningConfig) {
+    let before = currentFlagValue(key, cfg)
+    switch key {
+    case "autoExcludeEnabled": cfg.autoExcludeEnabled = value
+    case "posteriorEnabled": cfg.posteriorEnabled = value
+    case "stopLossEnabled": cfg.stopLossEnabled = value
+    case "correlationEnabled": cfg.correlationEnabled = value
+    case "playerImpactEnabled": cfg.playerImpactEnabled = value
+    case "teamRatingEnabled": cfg.teamRatingEnabled = value
+    default: return
+    }
+    cfg.updatedAt = Date()
+    TuningService.log(
+      context: context,
+      kind: "toggle",
+      target: key,
+      before: before ? "on" : "off",
+      after: value ? "on" : "off",
+      note: "Переключение флага")
+  }
+
+  private func currentFlagValue(_ key: String, _ cfg: TuningConfig) -> Bool {
+    switch key {
+    case "autoExcludeEnabled": return cfg.autoExcludeEnabled
+    case "posteriorEnabled": return cfg.posteriorEnabled
+    case "stopLossEnabled": return cfg.stopLossEnabled
+    case "correlationEnabled": return cfg.correlationEnabled
+    case "playerImpactEnabled": return cfg.playerImpactEnabled
+    case "teamRatingEnabled": return cfg.teamRatingEnabled
+    default: return false
+    }
+  }
+
+  // MARK: - Раздел 2: Пороги
+
+  @ViewBuilder
+  private func thresholdsSection(_ cfg: TuningConfig) -> some View {
+    Section {
+      thresholdRow(
+        "posteriorWeight",
+        label: "Вес posterior",
+        value: String(format: "%.2f", cfg.posteriorWeight),
+        before: { String(format: "%.2f", cfg.posteriorWeight) },
+        after: { newStr in
+          if let v = Double(newStr) {
+            cfg.posteriorWeight = max(0.0, min(0.5, v))
+          }
+        },
+        delta: { cfg.posteriorWeight = max(0.0, min(0.5, cfg.posteriorWeight + $0)) },
+        step: 0.05,
+        rangeLabel: "0.00 – 0.50")
+
+      thresholdRow(
+        "autoExcludeMinROI",
+        label: "Auto-Exclude min ROI",
+        value: String(format: "%.1f%%", cfg.autoExcludeMinROI * 100),
+        before: { String(format: "%.4f", cfg.autoExcludeMinROI) },
+        after: { newStr in
+          if let v = Double(newStr) {
+            cfg.autoExcludeMinROI = max(-0.5, min(0.0, v))
+          }
+        },
+        delta: { cfg.autoExcludeMinROI = max(-0.5, min(0.0, cfg.autoExcludeMinROI + $0)) },
+        step: 0.005,
+        rangeLabel: "−50% … 0%")
+
+      thresholdRow(
+        "autoExcludeMinBets",
+        label: "Auto-Exclude min n",
+        value: "\(cfg.autoExcludeMinBets)",
+        before: { "\(cfg.autoExcludeMinBets)" },
+        after: { newStr in
+          if let v = Int(newStr) {
+            cfg.autoExcludeMinBets = max(5, min(200, v))
+          }
+        },
+        delta: { cfg.autoExcludeMinBets = max(5, min(200, cfg.autoExcludeMinBets + $0)) },
+        step: 5,
+        rangeLabel: "5 – 200")
+
+      thresholdRow(
+        "stopLossCapStreak",
+        label: "Stop-loss: cap после N LOSS",
+        value: "\(cfg.stopLossCapStreak)",
+        before: { "\(cfg.stopLossCapStreak)" },
+        after: { newStr in
+          if let v = Int(newStr) {
+            cfg.stopLossCapStreak = max(2, min(10, v))
+          }
+        },
+        delta: { cfg.stopLossCapStreak = max(2, min(10, cfg.stopLossCapStreak + $0)) },
+        step: 1,
+        rangeLabel: "2 – 10")
+
+      thresholdRow(
+        "stopLossPauseStreak",
+        label: "Stop-loss: pause после N LOSS",
+        value: "\(cfg.stopLossPauseStreak)",
+        before: { "\(cfg.stopLossPauseStreak)" },
+        after: { newStr in
+          if let v = Int(newStr) {
+            cfg.stopLossPauseStreak = max(cfg.stopLossCapStreak + 1, min(15, v))
+          }
+        },
+        delta: { cfg.stopLossPauseStreak = max(cfg.stopLossCapStreak + 1, min(15, cfg.stopLossPauseStreak + $0)) },
+        step: 1,
+        rangeLabel: "> cap · … · 15")
+    } header: {
+      Text("Пороги")
+    } footer: {
+      Text("Изменения применяются со следующего скана. Каждое изменение пишется в журнал ниже.")
+    }
+  }
+
+  @ViewBuilder
+  private func thresholdRow(
+    _ key: String,
+    label: String,
+    value: String,
+    before: @escaping () -> String,
+    after: @escaping (String) -> Void,
+    delta: @escaping (Int) -> Void,
+    step: Double,
+    rangeLabel: String
+  ) -> some View {
+    let intStep = Int(step)
+    VStack(alignment: .leading, spacing: 6) {
+      HStack {
+        Text(label).font(.subheadline)
+        Spacer()
+        Text(value)
+          .font(.subheadline.monospacedDigit().bold())
+          .foregroundStyle(.blue)
+      }
+      HStack(spacing: 8) {
+        Button {
+          let b = before()
+          if step < 1 {
+            delta(-1)
+            after(String(format: "%.4f", currentNumber(key) - step))
+          } else {
+            delta(-max(1, intStep))
+          }
+          let a = String(format: "%.4f", currentNumber(key))
+          TuningService.log(
+            context: context,
+            kind: "threshold",
+            target: key,
+            before: b,
+            after: a,
+            note: label)
+        } label: {
+          Image(systemName: "minus.circle.fill")
+            .foregroundStyle(.blue)
+        }
+        .buttonStyle(.plain)
+
+        Button {
+          let b = before()
+          if step < 1 {
+            delta(1)
+            after(String(format: "%.4f", currentNumber(key) + step))
+          } else {
+            delta(max(1, intStep))
+          }
+          let a = String(format: "%.4f", currentNumber(key))
+          TuningService.log(
+            context: context,
+            kind: "threshold",
+            target: key,
+            before: b,
+            after: a,
+            note: label)
+        } label: {
+          Image(systemName: "plus.circle.fill")
+            .foregroundStyle(.blue)
+        }
+        .buttonStyle(.plain)
+
+        Spacer()
+        Text(rangeLabel).font(.caption2).foregroundStyle(.secondary)
+      }
+    }
+    .padding(.vertical, 2)
+  }
+
+  private func currentNumber(_ key: String) -> Double {
+    guard let cfg = config else { return 0 }
+    switch key {
+    case "posteriorWeight": return cfg.posteriorWeight
+    case "autoExcludeMinROI": return cfg.autoExcludeMinROI
+    case "autoExcludeMinBets": return Double(cfg.autoExcludeMinBets)
+    case "stopLossCapStreak": return Double(cfg.stopLossCapStreak)
+    case "stopLossPauseStreak": return Double(cfg.stopLossPauseStreak)
+    default: return 0
+    }
+  }
+
+  // MARK: - Раздел 3: Журнал изменений
+
+  @ViewBuilder
+  private var eventsSection: some View {
+    Section {
+      Button {
+        if let rb = TuningService.rollbackLastThreshold(in: context) {
+          rollbackMessage = "Откат: \(rb.target) → \(rb.beforeValue)"
+        } else {
+          rollbackMessage = "Нет изменений для откатa"
+        }
+      } label: {
+        Label("Откатить последнее изменение", systemImage: "arrow.uturn.backward")
+      }
+
+      if let msg = rollbackMessage {
+        Text(msg).font(.caption).foregroundStyle(.secondary)
+      }
+
+      if events.isEmpty {
+        Text("Журнал пуст")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        ForEach(events.prefix(30)) { e in
+          HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+              HStack(spacing: 6) {
+                Text(kindLabel(e.kind))
+                  .font(.caption2.bold())
+                  .foregroundStyle(kindColor(e.kind))
+                Text(e.target).font(.caption.monospaced())
+              }
+              HStack(spacing: 4) {
+                Text(e.beforeValue)
+                  .font(.caption2.monospacedDigit())
+                  .foregroundStyle(.secondary)
+                Image(systemName: "arrow.right").font(.caption2)
+                  .foregroundStyle(.secondary)
+                Text(e.afterValue)
+                  .font(.caption2.monospacedDigit())
+                  .foregroundStyle(.primary)
+              }
+              if !e.note.isEmpty {
+                Text(e.note).font(.caption2).foregroundStyle(.tertiary)
+              }
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+              Text(e.createdAt.formatted(date: .omitted, time: .shortened))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+              if e.rolledBack {
+                Text("откатано")
+                  .font(.caption2).foregroundStyle(.orange)
+              }
+            }
+          }
+          .padding(.vertical, 2)
+        }
+      }
+    } header: {
+      Text("Журнал изменений")
+    } footer: {
+      Text("Показываются последние 30 событий. Откат восстанавливает значение из beforeValue и помечает событие откатанным.")
+    }
+  }
+
+  private func kindLabel(_ k: String) -> String {
+    switch k {
+    case "toggle": return "TOGGLE"
+    case "threshold": return "THRESH"
+    case "rollback": return "ROLL"
+    case "auto": return "AUTO"
+    default: return k.uppercased()
+    }
+  }
+
+  private func kindColor(_ k: String) -> Color {
+    switch k {
+    case "toggle": return .blue
+    case "threshold": return .purple
+    case "rollback": return .orange
+    case "auto": return .green
+    default: return .gray
+    }
+  }
+
+  // MARK: - Раздел 4: Сброс
+
+  @ViewBuilder
+  private var resetSection: some View {
+    Section {
+      Button(role: .destructive) {
+        guard let cfg = config else { return }
+        let before = "custom"
+        cfg.autoExcludeEnabled = true
+        cfg.posteriorEnabled = true
+        cfg.stopLossEnabled = true
+        cfg.correlationEnabled = true
+        cfg.playerImpactEnabled = true
+        cfg.teamRatingEnabled = true
+        cfg.posteriorWeight = 0.15
+        cfg.autoExcludeMinROI = -0.05
+        cfg.autoExcludeMinBets = 20
+        cfg.stopLossCapStreak = 4
+        cfg.stopLossPauseStreak = 7
+        cfg.updatedAt = Date()
+        TuningService.log(
+          context: context,
+          kind: "threshold",
+          target: "all",
+          before: before,
+          after: "defaults",
+          note: "Сброс к дефолтам")
+        rollbackMessage = "Сброшено к дефолтам"
+      } label: {
+        Label("Сбросить к дефолтам", systemImage: "arrow.clockwise")
+      }
+    } header: {
+      Text("Сброс")
     }
   }
 }

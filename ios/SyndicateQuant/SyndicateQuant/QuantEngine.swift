@@ -55,7 +55,7 @@ struct QuantEngine {
   static let sharpBooks = ["pinnacle", "betfair", "sbo", "sbobet", "marathon"]
 
   static let posteriorMinN = 20
-  static let posteriorWeight = 0.15
+  static let defaultPosteriorWeight = 0.15
 
   // MARK: - Matches
 
@@ -139,7 +139,7 @@ struct QuantEngine {
     return recordFromGame(game, teamID: targetID, isHome: targetID == hid)
   }
 
-  // MARK: - Model (public API, без ratings/lineups — для backtest)
+  // MARK: - Public model() для backtest
 
   func model(home: [TeamRecord], away: [TeamRecord], glicko: JSONValue? = nil) -> MatchModel? {
     modelWithRatings(
@@ -155,10 +155,10 @@ struct QuantEngine {
     homeHistory: [TeamRecord], awayHistory: [TeamRecord],
     glicko: JSONValue? = nil,
     posteriorBuckets: [PosteriorBucket] = [],
+    posteriorWeight: Double = QuantEngine.defaultPosteriorWeight,
     teamRatings: (home: Double?, away: Double?) = (nil, nil),
     upcomingLineups: (home: [String], away: [String])? = nil
   ) -> [BetSignal] {
-    // B6: player impact
     let hImpact = playerImpact(
       history: homeHistory, expectedIDs: upcomingLineups?.home ?? [])
     let aImpact = playerImpact(
@@ -225,7 +225,8 @@ struct QuantEngine {
         sharp: sharp, modelOutcomes: matchModel.outcomes, modelName: modelName,
         sampleClass: sampleClass,
         homeSample: homeHistory.count, awaySample: awayHistory.count,
-        posteriorBuckets: posteriorBuckets) {
+        posteriorBuckets: posteriorBuckets,
+        posteriorWeight: posteriorWeight) {
         if hImpact < 0.999 || aImpact < 0.999 {
           s.playerImpactHome = hImpact
           s.playerImpactAway = aImpact
@@ -236,7 +237,7 @@ struct QuantEngine {
     return out.sorted { $0.qcs > $1.qcs }
   }
 
-  // MARK: - Model with ratings & player impact
+  // MARK: - Model with ratings & impact
 
   private func modelWithRatings(
     home: [TeamRecord], away: [TeamRecord], glicko: JSONValue?,
@@ -303,10 +304,8 @@ struct QuantEngine {
       ensembleAvgXG: avgXG)
   }
 
-  // MARK: - B6: player impact
+  // MARK: - Player impact
 
-  /// Возвращает множитель λ на основе отсутствия ключевых игроков.
-  /// Если данных о составах нет → 1.0.
   private func playerImpact(
     history: [TeamRecord], expectedIDs: [String]
   ) -> Double {
@@ -380,21 +379,22 @@ struct QuantEngine {
     modelOutcomes: (home: Double, draw: Double, away: Double),
     modelName: String, sampleClass: SampleClass,
     homeSample: Int, awaySample: Int,
-    posteriorBuckets: [PosteriorBucket]
+    posteriorBuckets: [PosteriorBucket],
+    posteriorWeight: Double
   ) -> BetSignal? {
 
     let pRaw = p
     var pFinal = p
-    var posteriorWeight: Double = 0
+    var appliedWeight: Double = 0
     var posteriorSource: String? = nil
     if !posteriorBuckets.isEmpty {
       let idx = min(9, max(0, Int(p * 10.0)))
       if idx < posteriorBuckets.count {
         let b = posteriorBuckets[idx]
         if b.n >= Self.posteriorMinN {
-          let w = Self.posteriorWeight
+          let w = max(0, min(0.5, posteriorWeight))
           pFinal = (1 - w) * p + w * b.factHitRate
-          posteriorWeight = w
+          appliedWeight = w
           posteriorSource = String(
             format: "P %.0f–%.0f%% · n=%d",
             b.probabilityLow * 100, b.probabilityHigh * 100, b.n)
@@ -469,7 +469,7 @@ struct QuantEngine {
       portfolioCorrelation: 0, correlationReason: "")
 
     signal.probabilityRaw = pRaw
-    signal.posteriorWeight = posteriorWeight > 0 ? posteriorWeight : nil
+    signal.posteriorWeight = appliedWeight > 0 ? appliedWeight : nil
     signal.posteriorSource = posteriorSource
     return signal
   }
@@ -571,12 +571,10 @@ struct QuantEngine {
     return chosen
   }
 
-  /// B4: если для пары есть эмпирика (n≥20), используем её. Иначе — hardcoded.
   private func correlation(
     _ a: BetSignal, _ b: BetSignal,
     matrix: CorrelationMatrix?
   ) -> Double {
-    // Same game — жёстко, эмпирику не строим (данных мало).
     if a.gameID == b.gameID {
       if a.market == b.market { return 0.82 }
       let pair = Set([a.market, b.market])
@@ -589,8 +587,6 @@ struct QuantEngine {
         || a.away == b.home || a.away == b.away {
       return 0.20
     }
-
-    // B4: эмпирическая корреляция.
     if let m = matrix {
       let mk = [a.market, b.market].sorted().joined(separator: "|")
       if let corr = m.marketPairs[mk] { return corr }

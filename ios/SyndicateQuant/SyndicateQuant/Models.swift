@@ -180,7 +180,6 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var stopApplied: String? = nil
   var stakeBeforeStop: Double? = nil
 
-  // B6: диагностика player impact.
   var playerImpactHome: Double? = nil
   var playerImpactAway: Double? = nil
 }
@@ -206,7 +205,262 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
-// MARK: - Volatility stop (B5)
+// MARK: - Tuning config (Волна F)
+
+@Model final class TuningConfig {
+  @Attribute(.unique) var id: String
+
+  // Флаги механизмов (UI-переключаемые).
+  var autoExcludeEnabled: Bool
+  var posteriorEnabled: Bool
+  var stopLossEnabled: Bool
+  var correlationEnabled: Bool
+  var playerImpactEnabled: Bool
+  var teamRatingEnabled: Bool
+
+  // Пороги.
+  var posteriorWeight: Double
+  var autoExcludeMinROI: Double
+  var autoExcludeMinBets: Int
+  var stopLossCapStreak: Int
+  var stopLossPauseStreak: Int
+
+  var updatedAt: Date
+
+  init(id: String = "current") {
+    self.id = id
+    self.autoExcludeEnabled = true
+    self.posteriorEnabled = true
+    self.stopLossEnabled = true
+    self.correlationEnabled = true
+    self.playerImpactEnabled = true
+    self.teamRatingEnabled = true
+
+    self.posteriorWeight = 0.15
+    self.autoExcludeMinROI = -0.05
+    self.autoExcludeMinBets = 20
+    self.stopLossCapStreak = 4
+    self.stopLossPauseStreak = 7
+
+    self.updatedAt = Date()
+  }
+}
+
+@Model final class TuningEvent {
+  @Attribute(.unique) var id: String
+  var createdAt: Date
+  var kind: String       // "toggle" | "threshold" | "rollback" | "auto"
+  var target: String     // "posteriorWeight", "autoExcludeEnabled", ...
+  var beforeValue: String
+  var afterValue: String
+  var note: String
+  var rolledBack: Bool
+
+  init(
+    id: String = UUID().uuidString,
+    createdAt: Date = Date(),
+    kind: String,
+    target: String,
+    beforeValue: String,
+    afterValue: String,
+    note: String = "",
+    rolledBack: Bool = false
+  ) {
+    self.id = id
+    self.createdAt = createdAt
+    self.kind = kind
+    self.target = target
+    self.beforeValue = beforeValue
+    self.afterValue = afterValue
+    self.note = note
+    self.rolledBack = rolledBack
+  }
+}
+
+struct AutoDecision: Identifiable, Hashable {
+  var id: String
+  var title: String
+  var summary: String
+  var detail: String
+  var enabled: Bool
+  var flagKey: String   // для toggle
+}
+
+@MainActor
+enum TuningService {
+  static func fetchOrCreate(in context: ModelContext) -> TuningConfig {
+    let descriptor = FetchDescriptor<TuningConfig>()
+    if let existing = try? context.fetch(descriptor).first {
+      return existing
+    }
+    let cfg = TuningConfig()
+    context.insert(cfg)
+    try? context.save()
+    return cfg
+  }
+
+  static func log(
+    context: ModelContext,
+    kind: String,
+    target: String,
+    before: String,
+    after: String,
+    note: String = ""
+  ) {
+    let e = TuningEvent(
+      kind: kind, target: target,
+      beforeValue: before, afterValue: after, note: note)
+    context.insert(e)
+    try? context.save()
+  }
+
+  static func recentEvents(
+    context: ModelContext, limit: Int = 30
+  ) -> [TuningEvent] {
+    var descriptor = FetchDescriptor<TuningEvent>(
+      sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+    descriptor.fetchLimit = limit
+    return (try? context.fetch(descriptor)) ?? []
+  }
+
+  /// Откат последнего изменения порога.
+  static func rollbackLastThreshold(in context: ModelContext) -> TuningEvent? {
+    let descriptor = FetchDescriptor<TuningEvent>(
+      sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+    guard let events = try? context.fetch(descriptor) else { return nil }
+    guard let last = events.first(where: {
+      ($0.kind == "threshold" || $0.kind == "toggle") && !$0.rolledBack
+    }) else { return nil }
+
+    let cfg = fetchOrCreate(in: context)
+    switch last.target {
+    case "posteriorWeight":
+      cfg.posteriorWeight = Double(last.beforeValue) ?? cfg.posteriorWeight
+    case "autoExcludeMinROI":
+      cfg.autoExcludeMinROI = Double(last.beforeValue) ?? cfg.autoExcludeMinROI
+    case "autoExcludeMinBets":
+      cfg.autoExcludeMinBets = Int(last.beforeValue) ?? cfg.autoExcludeMinBets
+    case "stopLossCapStreak":
+      cfg.stopLossCapStreak = Int(last.beforeValue) ?? cfg.stopLossCapStreak
+    case "stopLossPauseStreak":
+      cfg.stopLossPauseStreak = Int(last.beforeValue) ?? cfg.stopLossPauseStreak
+    case "autoExcludeEnabled":
+      cfg.autoExcludeEnabled = Bool(last.beforeValue) ?? cfg.autoExcludeEnabled
+    case "posteriorEnabled":
+      cfg.posteriorEnabled = Bool(last.beforeValue) ?? cfg.posteriorEnabled
+    case "stopLossEnabled":
+      cfg.stopLossEnabled = Bool(last.beforeValue) ?? cfg.stopLossEnabled
+    case "correlationEnabled":
+      cfg.correlationEnabled = Bool(last.beforeValue) ?? cfg.correlationEnabled
+    case "playerImpactEnabled":
+      cfg.playerImpactEnabled = Bool(last.beforeValue) ?? cfg.playerImpactEnabled
+    case "teamRatingEnabled":
+      cfg.teamRatingEnabled = Bool(last.beforeValue) ?? cfg.teamRatingEnabled
+    default:
+      break
+    }
+    cfg.updatedAt = Date()
+    last.rolledBack = true
+    try? context.save()
+    return last
+  }
+
+  /// Снимок решений, показываемый в панели Self-Tuning.
+  static func decisions(
+    config: TuningConfig,
+    snapshot: BacktestSnapshot?,
+    journal: [JournalEntry],
+    corr: CorrelationMatrix
+  ) -> [AutoDecision] {
+    var out: [AutoDecision] = []
+
+    // Auto-Exclude
+    let rules = snapshot.map {
+      AutoExclude.rules(
+        from: $0,
+        minROI: config.autoExcludeMinROI,
+        minBets: config.autoExcludeMinBets)
+    } ?? []
+    let activeRules = rules.filter { $0.excluded }.count
+    out.append(AutoDecision(
+      id: "autoexclude",
+      title: "Auto-Exclude",
+      summary: config.autoExcludeEnabled
+        ? "\(activeRules) активных правил"
+        : "выключено",
+      detail: String(format: "Порог: ROI < %.1f%% при n ≥ %d",
+                     config.autoExcludeMinROI * 100,
+                     config.autoExcludeMinBets),
+      enabled: config.autoExcludeEnabled,
+      flagKey: "autoExcludeEnabled"))
+
+    // Posterior
+    let buckets = snapshot?.decodedPosteriorBuckets() ?? []
+    let usable = buckets.filter { $0.n >= 20 }.count
+    out.append(AutoDecision(
+      id: "posterior",
+      title: "Bayesian posterior",
+      summary: config.posteriorEnabled
+        ? "\(usable) бакетов (n≥20)"
+        : "выключено",
+      detail: String(format: "p_adj = (1 − %.2f)·p + %.2f·p_post",
+                     config.posteriorWeight, config.posteriorWeight),
+      enabled: config.posteriorEnabled,
+      flagKey: "posteriorEnabled"))
+
+    // Stop-loss
+    let streak = VolatilityStop.evaluate(
+      journal,
+      capThreshold: config.stopLossCapStreak,
+      pauseThreshold: config.stopLossPauseStreak)
+    out.append(AutoDecision(
+      id: "stoploss",
+      title: "Volatility stop",
+      summary: config.stopLossEnabled
+        ? "\(streak.streak) проигрышей · \(streak.state.label)"
+        : "выключено",
+      detail: "Cap ≥ \(config.stopLossCapStreak) → 5%; Pause ≥ \(config.stopLossPauseStreak)",
+      enabled: config.stopLossEnabled,
+      flagKey: "stopLossEnabled"))
+
+    // Correlation
+    out.append(AutoDecision(
+      id: "correlation",
+      title: "Correlation matrix",
+      summary: config.correlationEnabled
+        ? "\(corr.marketPairsN.count + corr.leaguePairsN.count) пар (n≥20)"
+        : "выключено",
+      detail: "Эмпирические φ-коэффициенты из журнала; fallback — структурные",
+      enabled: config.correlationEnabled,
+      flagKey: "correlationEnabled"))
+
+    // Player impact
+    out.append(AutoDecision(
+      id: "playerimpact",
+      title: "Player impact",
+      summary: config.playerImpactEnabled
+        ? "ждём составы от API"
+        : "выключено",
+      detail: "λ × 0.88…1.00 в зависимости от отсутствия топ-8",
+      enabled: config.playerImpactEnabled,
+      flagKey: "playerImpactEnabled"))
+
+    // Team rating
+    out.append(AutoDecision(
+      id: "teamrating",
+      title: "Team rating (Elo)",
+      summary: config.teamRatingEnabled
+        ? "активно (≥ 3 матчей на команду)"
+        : "выключено",
+      detail: "Старт 1500, HFA 60, K=32→20; влияет на λ через glickoAdjust",
+      enabled: config.teamRatingEnabled,
+      flagKey: "teamRatingEnabled"))
+
+    return out
+  }
+}
+
+// MARK: - Volatility stop (B5, параметризовано под F)
 
 enum VolatilityState: Equatable {
   case normal
@@ -231,11 +485,16 @@ enum VolatilityState: Equatable {
 }
 
 enum VolatilityStop {
-  static let capThreshold = 4
-  static let pauseThreshold = 7
-  static let capValue = 0.05
+  static let defaultCapThreshold = 4
+  static let defaultPauseThreshold = 7
+  static let defaultCapValue = 0.05
 
-  static func evaluate(_ journal: [JournalEntry]) -> (streak: Int, state: VolatilityState) {
+  static func evaluate(
+    _ journal: [JournalEntry],
+    capThreshold: Int = defaultCapThreshold,
+    pauseThreshold: Int = defaultPauseThreshold,
+    capValue: Double = defaultCapValue
+  ) -> (streak: Int, state: VolatilityState) {
     let sorted = journal
       .filter { $0.status == "CLOSED" }
       .sorted { $0.createdAt > $1.createdAt }
@@ -689,13 +948,17 @@ extension BacktestSnapshot {
   }
 }
 
-// MARK: - Auto-Exclude
+// MARK: - Auto-Exclude (параметризовано под F)
 
 enum AutoExclude {
-  static let minBets = 20
-  static let minROI = -0.05
+  static let defaultMinBets = 20
+  static let defaultMinROI = -0.05
 
-  static func rules(from snapshot: BacktestSnapshot?) -> [AutoExcludeRule] {
+  static func rules(
+    from snapshot: BacktestSnapshot?,
+    minROI: Double = defaultMinROI,
+    minBets: Int = defaultMinBets
+  ) -> [AutoExcludeRule] {
     guard let snapshot else { return [] }
     let stats = snapshot.decodedLeagueMarketStats()
     return stats.map { (key, s) in
@@ -1481,7 +1744,7 @@ final class BacktestService {
   }
 }
 
-// MARK: - ScanCoordinator (B2 + B3 + B4 + B5 + B6 + G6)
+// MARK: - ScanCoordinator (слушает TuningConfig)
 
 @MainActor
 final class ScanCoordinator {
@@ -1500,9 +1763,9 @@ final class ScanCoordinator {
     var success: Bool = false
     var lossStreak: Int = 0
     var volatilityLabel: String = "NORMAL"
-    // B4/B6 diagnostics
     var correlationPairs: Int = 0
     var lineupsFound: Int = 0
+    var tuningNote: String? = nil
   }
 
   func scan(
@@ -1526,10 +1789,16 @@ final class ScanCoordinator {
     }
 
     let container = AppDependencies.shared.container
-    let ratingContext = container.map { ModelContext($0) }
     let journalContext = container.map { ModelContext($0) }
+    let ratingContext = container.map { ModelContext($0) }
 
-    // B4: корреляционная матрица из журнала.
+    // F: читаем конфиг тюнинга.
+    let tuning: TuningConfig = {
+      guard let ctx = journalContext else { return TuningConfig() }
+      return TuningService.fetchOrCreate(in: ctx)
+    }()
+
+    // B4: корреляция из журнала.
     let corrMatrix: CorrelationMatrix = {
       guard let ctx = journalContext else { return .empty }
       let descriptor = FetchDescriptor<JournalEntry>()
@@ -1538,17 +1807,39 @@ final class ScanCoordinator {
     }()
     summary.correlationPairs = corrMatrix.marketPairsN.count + corrMatrix.leaguePairsN.count
 
-    // B5: серия проигрышей из журнала.
+    // B5: серия проигрышей.
     let streak: (streak: Int, state: VolatilityState) = {
       guard let ctx = journalContext else { return (0, .normal) }
       let descriptor = FetchDescriptor<JournalEntry>()
       guard let entries = try? ctx.fetch(descriptor) else { return (0, .normal) }
-      return VolatilityStop.evaluate(entries)
+      return VolatilityStop.evaluate(
+        entries,
+        capThreshold: tuning.stopLossCapStreak,
+        pauseThreshold: tuning.stopLossPauseStreak)
     }()
     summary.lossStreak = streak.streak
-    summary.volatilityLabel = streak.state.label
-    if streak.streak > 0 {
+    summary.volatilityLabel = tuning.stopLossEnabled ? streak.state.label : "OFF"
+
+    // F: применяем флаги.
+    if !tuning.stopLossEnabled {
+      summary.notes.append("Self-Tuning: stop-loss отключён")
+    } else if streak.streak > 0 {
       summary.notes.append("LossStreak: \(streak.streak) · \(streak.state.label)")
+    }
+    if !tuning.autoExcludeEnabled {
+      summary.notes.append("Self-Tuning: Auto-Exclude отключён")
+    }
+    if !tuning.posteriorEnabled {
+      summary.notes.append("Self-Tuning: posterior отключён")
+    }
+    if !tuning.correlationEnabled {
+      summary.notes.append("Self-Tuning: correlation отключён")
+    }
+    if !tuning.playerImpactEnabled {
+      summary.notes.append("Self-Tuning: player impact отключён")
+    }
+    if !tuning.teamRatingEnabled {
+      summary.notes.append("Self-Tuning: TeamRating отключён")
     }
 
     do {
@@ -1566,16 +1857,26 @@ final class ScanCoordinator {
       }
       let matches = all.prefix(resolvedSettings.scanMatches)
 
-      // B2: posterior buckets из снапшота.
-      let posteriorBuckets = Self.loadPosteriorBuckets()
+      // B2: posterior buckets (если включён).
+      let posteriorBuckets: [PosteriorBucket] = tuning.posteriorEnabled
+        ? Self.loadPosteriorBuckets()
+        : []
       let usableBuckets = posteriorBuckets.filter { $0.n >= 20 }.count
       if usableBuckets > 0 {
         summary.notes.append("Posterior: \(usableBuckets) надёжных бакетов")
       }
 
-      // G6: Auto-Exclude
-      let excludedRules = Self.loadExcludedRules()
+      // G6: Auto-Exclude (если включён).
+      let excludedRules: [AutoExcludeRule] = tuning.autoExcludeEnabled
+        ? Self.loadExcludedRules(
+            minROI: tuning.autoExcludeMinROI,
+            minBets: tuning.autoExcludeMinBets)
+        : []
       let excludedCount = excludedRules.filter { $0.excluded }.count
+
+      // B5: stopLoss state по конфигу.
+      let stopState: VolatilityState = tuning.stopLossEnabled
+        ? streak.state : .normal
 
       var signalsOut: [BetSignal] = []
       var count = 0
@@ -1597,23 +1898,29 @@ final class ScanCoordinator {
         }
         let glicko = try? await client.glicko(match.id)
 
-        // B3: локальные рейтинги.
+        // B3: локальные рейтинги (если включён).
         let ratings: (Double?, Double?) = {
-          guard let ctx = ratingContext else { return (nil, nil) }
+          guard tuning.teamRatingEnabled, let ctx = ratingContext else {
+            return (nil, nil)
+          }
           return (
             TeamRatingService.usableRating(for: h, context: ctx),
             TeamRatingService.usableRating(for: a, context: ctx)
           )
         }()
 
-        // B6: ожидаемые составы из gameInfo (если есть).
-        let lineups = Self.parseUpcomingLineups(from: info)
+        // B6: ожидаемые составы (если включён).
+        let lineups: (home: [String], away: [String])? = {
+          guard tuning.playerImpactEnabled else { return nil }
+          return Self.parseUpcomingLineups(from: info)
+        }()
         if lineups != nil { lineupsFound += 1 }
 
         let s = engine.signals(
           match: match, info: info, oddsJSON: oddsFromInfo,
           homeHistory: hs, awayHistory: awayRecords, glicko: glicko,
           posteriorBuckets: posteriorBuckets,
+          posteriorWeight: tuning.posteriorWeight,
           teamRatings: (home: ratings.0, away: ratings.1),
           upcomingLineups: lineups)
         signalsOut.append(contentsOf: s)
@@ -1635,7 +1942,7 @@ final class ScanCoordinator {
         summary.notes.append("Auto-Exclude: правил \(excludedCount), попаданий 0")
       }
 
-      if summary.correlationPairs > 0 {
+      if summary.correlationPairs > 0 && tuning.correlationEnabled {
         summary.notes.append("Correlation: \(summary.correlationPairs) пар из журнала")
       }
 
@@ -1643,8 +1950,8 @@ final class ScanCoordinator {
       summary.signals = engine.portfolio(
         filtered,
         excludedRules: excludedRules,
-        stopLoss: streak.state,
-        correlationMatrix: corrMatrix)
+        stopLoss: stopState,
+        correlationMatrix: tuning.correlationEnabled ? corrMatrix : nil)
       summary.finishedAt = Date()
       summary.success = true
 
@@ -1663,11 +1970,13 @@ final class ScanCoordinator {
     return result.success
   }
 
-  private static func loadExcludedRules() -> [AutoExcludeRule] {
+  private static func loadExcludedRules(
+    minROI: Double, minBets: Int
+  ) -> [AutoExcludeRule] {
     guard let container = AppDependencies.shared.container else { return [] }
     let context = ModelContext(container)
     let snap = BacktestService.fetchOrCreate(in: context)
-    return AutoExclude.rules(from: snap)
+    return AutoExclude.rules(from: snap, minROI: minROI, minBets: minBets)
   }
 
   private static func loadPosteriorBuckets() -> [PosteriorBucket] {
@@ -1677,21 +1986,17 @@ final class ScanCoordinator {
     return snap.decodedPosteriorBuckets()
   }
 
-  /// B6: достаёт ожидаемый состав из gameInfo, если он там есть.
-  /// Возвращает nil, если данных нет — тогда impact не применяется.
   private static func parseUpcomingLineups(
     from info: JSONValue
   ) -> (home: [String], away: [String])? {
     let data = info.object?["data"]?.object ?? info.object ?? [:]
 
-    // Вариант 1: { lineups: { home: [...], away: [...] } }
     if let obj = data["lineups"]?.object {
       let h = extractIDs(obj["home"]?.array ?? obj["homeTeam"]?.array ?? [])
       let a = extractIDs(obj["away"]?.array ?? obj["awayTeam"]?.array ?? [])
       if !h.isEmpty || !a.isEmpty { return (h, a) }
     }
 
-    // Вариант 2: { lineups: [ {teamId, players:[...]}, {teamId, players:[...]} ] }
     if let arr = data["lineups"]?.array, arr.count >= 2 {
       let hTeamID = data["homeTeamId"]?.string
         ?? data["homeTeam"]?.object?["id"]?.string
@@ -1714,7 +2019,6 @@ final class ScanCoordinator {
       if !h.isEmpty || !a.isEmpty { return (h, a) }
     }
 
-    // Вариант 3: homeLineup / awayLineup
     let hArr = data["homeLineup"]?.array
       ?? data["homePlayers"]?.array
       ?? data["homeSquad"]?.array
