@@ -2,6 +2,28 @@ import Charts
 import SwiftData
 import SwiftUI
 
+// [8.4] Общий форматтер даты/времени начала матча
+private let matchStartFormatter: DateFormatter = {
+  let f = DateFormatter()
+  f.dateFormat = "dd.MM · HH:mm"
+  f.timeZone = .current
+  return f
+}()
+
+private func formatMatchStart(_ date: Date?) -> String? {
+  guard let date else { return nil }
+  return matchStartFormatter.string(from: date)
+}
+
+private func formatMatchStartLong(_ date: Date?) -> String? {
+  guard let date else { return nil }
+  let f = DateFormatter()
+  f.dateStyle = .medium
+  f.timeStyle = .short
+  f.timeZone = .current
+  return f.string(from: date)
+}
+
 struct RootView: View {
   @EnvironmentObject var settings: AppSettings
   @ObservedObject private var liveMonitor = LiveMonitor.shared
@@ -268,6 +290,15 @@ struct RootView: View {
           .padding(.horizontal, 8).padding(.vertical, 3)
           .background(.thinMaterial).clipShape(Capsule())
       }
+      // [8.4] Дата начала матча
+      if let s = formatMatchStart(e.matchStart) {
+        HStack(spacing: 4) {
+          Image(systemName: "clock")
+          Text(s)
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.secondary)
+      }
       Text("\(e.league) · \(e.market) · \(e.selection)\(e.line.map { " \($0)" } ?? "")")
         .font(.subheadline).foregroundStyle(.secondary)
       HStack(spacing: 12) {
@@ -429,8 +460,6 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
-  // MARK: Волна E (E5): сравнение моделей
-
   @ViewBuilder
   private var modelComparisonSection: some View {
     let list = currentSnapshot?.decodedModelComparison() ?? []
@@ -558,8 +587,6 @@ struct RootView: View {
     return n
   }
 
-  // [7.26] Heatmap: 1X2-колонка убрана, добавлены CORNERS и CARDS.
-  // Данные появятся после пересборки базы (нужен патч Models.swift).
   @ViewBuilder
   private var leagueMarketHeatmapSection: some View {
     let stats = currentSnapshot?.decodedLeagueMarketStats() ?? [:]
@@ -1231,6 +1258,15 @@ struct SignalCard: View {
           .background(classificationColor(signal.classification).opacity(0.25))
           .clipShape(Capsule())
       }
+      // [8.4] Дата/время начала матча
+      if let s = formatMatchStart(signal.startTime) {
+        HStack(spacing: 4) {
+          Image(systemName: "clock")
+          Text(s)
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.secondary)
+      }
       Text(marketLine).font(.subheadline).foregroundStyle(.secondary)
       HStack(alignment: .top, spacing: 14) {
         metric("Odds", OddsFormatter.format(signal.odds, as: oddsFormat))
@@ -1245,7 +1281,6 @@ struct SignalCard: View {
         Text("MS \(String(format: "%.0f", signal.ms))")
         Text("Sample \(signal.sampleClass)")
         Text("\(signal.bookmakers)b")
-        // [7.28] Источник котировки для углов/карточек
         if let src = signal.oddsSource {
           Text(src).foregroundStyle(.blue)
         }
@@ -1265,7 +1300,6 @@ struct SignalCard: View {
     .padding(.vertical, 6)
   }
 
-  // [7.27] В marketLine добавлен источник котировки для углов/карточек.
   private var marketLine: String {
     let linePart: String = signal.line.map { " \($0)" } ?? ""
     var base = "\(signal.league) · \(signal.market) · \(signal.selection)\(linePart)"
@@ -1321,13 +1355,16 @@ struct SignalDetailView: View {
         LabeledContent("Хозяева", value: signal.home)
         LabeledContent("Гости", value: signal.away)
         LabeledContent("Лига", value: signal.league)
+        // [8.4] Начало матча
+        if let s = formatMatchStartLong(signal.startTime) {
+          LabeledContent("Начало", value: s)
+        }
         LabeledContent("Рынок", value: signal.market)
         LabeledContent("Выбор", value: selectionLine)
       }
 
       matchPreviewSection
 
-      // [7.29] Источник котировки для углов и карточек
       if let src = signal.oddsSource {
         Section("Источник котировки") {
           LabeledContent("Источник", value: src)
@@ -1550,31 +1587,46 @@ struct SignalDetailView: View {
 
   @ViewBuilder
   private var matchPreviewSection: some View {
-    Section("Форма (последние матчи)") {
+    Section("Форма (последние 5 матчей)") {
       if previewLoading && homeHistory.isEmpty && awayHistory.isEmpty {
         HStack {
           ProgressView().scaleEffect(0.8)
-          Text("Загружаю последние матчи…")
+          Text("Загружаю последние 5 матчей…")
             .font(.caption).foregroundStyle(.secondary)
         }
       } else if let err = previewError {
         Text(err).font(.caption).foregroundStyle(.secondary)
       } else {
-        teamFormBlock(title: signal.home, records: homeHistory, accent: .blue)
-        teamFormBlock(title: signal.away, records: awayHistory, accent: .purple)
+        marketFormBlock(title: signal.home, records: homeHistory,
+                        accent: .blue, market: signal.market)
+        marketFormBlock(title: signal.away, records: awayHistory,
+                        accent: .purple, market: signal.market)
+        Text(marketHintLine)
+          .font(.caption2).foregroundStyle(.tertiary)
       }
     }
   }
 
+  // [8.4] Подсказка, что показываем
+  private var marketHintLine: String {
+    switch signal.market {
+    case "CORNERS": return "Показан тотал углов обеих команд в каждом матче (свои + соперника)."
+    case "CARDS":   return "Показан тотал ЖК обеих команд в каждом матче (свои + соперника)."
+    default:        return "Показан счёт каждого матча и результат (В/Н/П)."
+    }
+  }
+
   @ViewBuilder
-  private func teamFormBlock(title: String, records: [TeamRecord], accent: Color) -> some View {
+  private func marketFormBlock(title: String, records: [TeamRecord],
+                               accent: Color, market: String) -> some View {
     let last5 = Array(records.prefix(5))
     VStack(alignment: .leading, spacing: 6) {
       HStack {
         Text(title).font(.subheadline.bold()).foregroundStyle(accent)
         Spacer()
         if !last5.isEmpty {
-          Text(formSummary(last5)).font(.caption.monospacedDigit())
+          Text(summaryFor(market: market, records: last5))
+            .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
         }
       }
@@ -1582,7 +1634,9 @@ struct SignalDetailView: View {
         Text("Нет данных").font(.caption2).foregroundStyle(.secondary)
       } else {
         HStack(spacing: 6) {
-          ForEach(Array(last5.enumerated()), id: \.offset) { (_, r) in formBadge(r) }
+          ForEach(Array(last5.enumerated()), id: \.offset) { (_, r) in
+            formBadge(r, market: market)
+          }
           Spacer()
         }
       }
@@ -1590,33 +1644,89 @@ struct SignalDetailView: View {
     .padding(.vertical, 2)
   }
 
-  private func formSummary(_ records: [TeamRecord]) -> String {
-    var w = 0, d = 0, l = 0
-    for r in records {
-      guard let gf = r.gf, let ga = r.ga else { continue }
-      if gf > ga { w += 1 } else if gf == ga { d += 1 } else { l += 1 }
+  // [8.4] Сводка: для CORNERS / CARDS — средний тотал, для GOALS — W/D/L
+  private func summaryFor(market: String, records: [TeamRecord]) -> String {
+    switch market {
+    case "CORNERS":
+      let vals = records.compactMap { r -> Double? in
+        guard let c = r.corners, let oc = r.oppCorners else { return nil }
+        return c + oc
+      }
+      guard !vals.isEmpty else { return "avg —" }
+      let avg = vals.reduce(0, +) / Double(vals.count)
+      return String(format: "avg %.1f", avg)
+    case "CARDS":
+      let vals = records.compactMap { r -> Double? in
+        guard let c = r.cards, let oc = r.oppCards else { return nil }
+        return c + oc
+      }
+      guard !vals.isEmpty else { return "avg —" }
+      let avg = vals.reduce(0, +) / Double(vals.count)
+      return String(format: "avg %.1f", avg)
+    default:
+      var w = 0, d = 0, l = 0
+      for r in records {
+        guard let gf = r.gf, let ga = r.ga else { continue }
+        if gf > ga { w += 1 } else if gf == ga { d += 1 } else { l += 1 }
+      }
+      return "\(w)В · \(d)Н · \(l)П"
     }
-    return "\(w)В · \(d)Н · \(l)П"
   }
 
-  private func formBadge(_ r: TeamRecord) -> some View {
-    let gf = r.gf ?? 0
-    let ga = r.ga ?? 0
-    let (resultChar, color): (String, Color) = {
-      if gf > ga { return ("В", .green) }
-      if gf == ga { return ("Н", .orange) }
-      return ("П", .red)
-    }()
-    return VStack(spacing: 1) {
-      Text(resultChar).font(.caption2.bold())
-      Text("\(Int(gf)):\(Int(ga))").font(.caption2.monospacedDigit())
-      Text(r.isHome ? "Д" : "Г").font(.caption2).opacity(0.6)
+  // [8.4] Бейдж: для CORNERS / CARDS — тотал за матч, для GOALS — счёт + результат
+  @ViewBuilder
+  private func formBadge(_ r: TeamRecord, market: String) -> some View {
+    switch market {
+    case "CORNERS":
+      let total: Double? = {
+        guard let c = r.corners, let oc = r.oppCorners else { return nil }
+        return c + oc
+      }()
+      let value = total.map { String(format: "%.0f", $0) } ?? "—"
+      VStack(spacing: 1) {
+        Text(value).font(.caption2.bold())
+        Text("угл").font(.caption2).opacity(0.6)
+        Text(r.isHome ? "Д" : "Г").font(.caption2).opacity(0.6)
+      }
+      .frame(width: 38, height: 46)
+      .background(Color.blue.opacity(0.20))
+      .clipShape(RoundedRectangle(cornerRadius: 6))
+
+    case "CARDS":
+      let total: Double? = {
+        guard let c = r.cards, let oc = r.oppCards else { return nil }
+        return c + oc
+      }()
+      let value = total.map { String(format: "%.0f", $0) } ?? "—"
+      VStack(spacing: 1) {
+        Text(value).font(.caption2.bold())
+        Text("ЖК").font(.caption2).opacity(0.6)
+        Text(r.isHome ? "Д" : "Г").font(.caption2).opacity(0.6)
+      }
+      .frame(width: 38, height: 46)
+      .background(Color.orange.opacity(0.20))
+      .clipShape(RoundedRectangle(cornerRadius: 6))
+
+    default:
+      let gf = r.gf ?? 0
+      let ga = r.ga ?? 0
+      let (resultChar, color): (String, Color) = {
+        if gf > ga { return ("В", .green) }
+        if gf == ga { return ("Н", .orange) }
+        return ("П", .red)
+      }()
+      VStack(spacing: 1) {
+        Text(resultChar).font(.caption2.bold())
+        Text("\(Int(gf)):\(Int(ga))").font(.caption2.monospacedDigit())
+        Text(r.isHome ? "Д" : "Г").font(.caption2).opacity(0.6)
+      }
+      .frame(width: 38, height: 46)
+      .background(color.opacity(0.20))
+      .clipShape(RoundedRectangle(cornerRadius: 6))
     }
-    .frame(width: 38, height: 46)
-    .background(color.opacity(0.20))
-    .clipShape(RoundedRectangle(cornerRadius: 6))
   }
 
+  // [8.4] Используем обогащённую историю (с corners/cards из /Games/{id})
   private func loadPreview() async {
     if previewLoading { return }
     previewLoading = true
@@ -1647,8 +1757,8 @@ struct SignalDetailView: View {
         previewError = "Не удалось определить команды"; return
       }
 
-      async let hFetch = client.fetchTeamHistory(teamID: hID, count: 5)
-      async let aFetch = client.fetchTeamHistory(teamID: aID, count: 5)
+      async let hFetch = client.fetchTeamHistoryEnriched(teamID: hID, count: 5)
+      async let aFetch = client.fetchTeamHistoryEnriched(teamID: aID, count: 5)
       let (h, a) = await (hFetch, aFetch)
       homeHistory = h; awayHistory = a
       if h.isEmpty && a.isEmpty {
@@ -1703,6 +1813,10 @@ struct JournalEntryDetailView: View {
         LabeledContent("Хозяева", value: entry.home)
         LabeledContent("Гости", value: entry.away)
         LabeledContent("Лига", value: entry.league)
+        // [8.4] Начало матча
+        if let s = formatMatchStartLong(entry.matchStart) {
+          LabeledContent("Начало", value: s)
+        }
         LabeledContent("Рынок", value: entry.market)
         LabeledContent("Выбор", value: selectionLine)
       }
@@ -1768,7 +1882,7 @@ struct JournalEntryDetailView: View {
   }
 }
 
-// MARK: - SelfTuningView
+// MARK: - SelfTuningView (без изменений)
 
 struct SelfTuningView: View {
   @Environment(\.modelContext) private var context

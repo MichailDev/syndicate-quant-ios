@@ -72,7 +72,6 @@ actor ResponseCache {
 }
 
 // MARK: - Rate Limiter
-// SStats.net: 30 запросов/мин без ключа. 1.5 сек → ~40/мин, безопасно.
 
 actor RateLimiter {
   static let shared = RateLimiter()
@@ -144,21 +143,18 @@ final class NetworkMonitor: @unchecked Sendable {
   }
 }
 
-// MARK: - [7.3] Market ID constants
-// SStats.net: подтверждено на /Odds/{id} и /Games/{id} (2026-09).
-// 1X2 (1) сохранён как константа для settle исторических записей журнала,
-// но в генерации новых сигналов не используется.
+// MARK: - Market ID constants
 
 enum MarketID {
-  static let matchWinner   = 1   // 1X2 (только для settle старых записей)
-  static let goals         = 5   // Total Goals (основной)
-  static let goalsHome     = 16  // Total - Home
-  static let goalsAway     = 17  // Total - Away
-  static let totalCorners  = 45  // Corners Over Under
-  static let totalCards    = 80  // Cards Over/Under (только Betano)
+  static let matchWinner   = 1
+  static let goals         = 5
+  static let goalsHome     = 16
+  static let goalsAway     = 17
+  static let totalCorners  = 45
+  static let totalCards    = 80
 }
 
-// MARK: - [7.1] Bookmaker models for `/Odds/{id}`
+// MARK: - Bookmaker models for `/Odds/{id}`
 
 struct RawPrice: Codable, Hashable {
   let name: String
@@ -178,12 +174,9 @@ struct BookmakerOdds: Codable, Hashable, Identifiable {
   let odds: [RawMarket]
 }
 
-// MARK: - [7.2] Odds lookup helpers
+// MARK: - Odds lookup helpers
 
 enum OddsQuery {
-  /// Найти цену в одном букмекере по (marketId, selection, line).
-  /// selection сравнивается по вхождению в name (case-insensitive).
-  /// line — если задана, из name извлекается число и сверяется.
   static func find(marketId: Int,
                    selection: String,
                    line: Double?,
@@ -213,7 +206,7 @@ enum OddsQuery {
   }
 }
 
-// MARK: - SStatsClient (SStats.net actual API)
+// MARK: - SStatsClient
 
 final class SStatsClient {
   private let baseURL: String
@@ -239,7 +232,6 @@ final class SStatsClient {
 
   // MARK: - Public API
 
-  /// Сегодняшние матчи: `/Games/list?Date=YYYY-MM-DD&TimeZone=3`
   func listToday() async throws -> JSONValue {
     try await get("/Games/list", query: [
       "Date": Self.dateString(Date()),
@@ -249,7 +241,6 @@ final class SStatsClient {
     ])
   }
 
-  /// Матчи за конкретную дату.
   func listOn(date: Date, upcoming: Bool = false) async throws -> JSONValue {
     var q: [String: String] = [
       "Date": Self.dateString(date),
@@ -261,8 +252,6 @@ final class SStatsClient {
     return try await get("/Games/list", query: q)
   }
 
-  /// Завершённые матчи за диапазон. Пагинация `Offset`.
-  /// API отдаёт максимум 1000 за раз.
   func listGamesRange(
     from: Date, to: Date, limit: Int = 1000, offset: Int = 0
   ) async throws -> JSONValue {
@@ -277,14 +266,12 @@ final class SStatsClient {
     ])
   }
 
-  /// Обратная совместимость.
   func listRange(
     from: Date, to: Date, limit: Int = 1000, offset: Int = 0
   ) async throws -> JSONValue {
     try await listGamesRange(from: from, to: to, limit: limit, offset: offset)
   }
 
-  /// История команды: `/Games/list?Team={id}&Ended=true&Limit=N&Order=-1`
   func listTeam(_ teamID: String, limit: Int = 25) async throws -> JSONValue {
     try await get("/Games/list", query: [
       "Team": teamID,
@@ -295,27 +282,19 @@ final class SStatsClient {
     ])
   }
 
-  /// Полные данные матча: `/Games/{id}`
   func gameInfo(_ id: String) async throws -> JSONValue {
     try await get("/Games/\(id)", query: ["TimeZone": "3"])
   }
 
-  /// Glicko 2: `/Games/glicko/{id}`
   func glicko(_ id: String) async throws -> JSONValue {
     try await get("/Games/glicko/\(id)", query: [:])
   }
 
-  /// [7.4] Полные котировки по букмекерам: `/Odds/{gameId}`.
-  /// Возвращает массив `BookmakerOdds` (bookmakerId, bookmakerName, odds[]).
-  /// Обновлено: этот эндпоинт существует и отдаёт ВСЕ рынки,
-  /// включая углы (45) и карточки (80), которых НЕТ в /Games/{id}.
   func fullOdds(gameId: Int) async throws -> [BookmakerOdds] {
     let json = try await get("/Odds/\(gameId)", query: [:])
     return Self.parseBookmakers(from: json)
   }
 
-  /// Парсер ответа `/Odds/{id}`. Структура:
-  /// { "status": "OK", "count": N, "data": [ { "bookmakerId":..,"bookmakerName":"..","odds":[{marketId,marketName,odds:[{name,value}]}] } ] }
   static func parseBookmakers(from json: JSONValue) -> [BookmakerOdds] {
     let arr = json.object?["data"]?.array ?? json.array ?? []
     var out: [BookmakerOdds] = []
@@ -351,8 +330,6 @@ final class SStatsClient {
     return out
   }
 
-  /// [7.5] Best available price по всем букмекерам.
-  /// Возвращает (value, bookmakerName) или nil.
   static func bestPrice(marketId: Int,
                         selection: String,
                         line: Double?,
@@ -372,7 +349,6 @@ final class SStatsClient {
     return best
   }
 
-  /// [7.6] Цена конкретного букмекера (например, Pinnacle id=4) — для sharp-line.
   static func sharpPrice(marketId: Int,
                          selection: String,
                          line: Double?,
@@ -388,15 +364,10 @@ final class SStatsClient {
     return (v, b.bookmakerName)
   }
 
-  /// ID Pinnacle в SStats.net — 4 (подтверждено /Odds/1183255).
   static let pinnacleBookmakerId = 4
 
-  /// Live: в SStats.net не поддерживается. nil → fallback на odds(numericID:).
   func oddsLive(numericID: Int) async throws -> JSONValue? { return nil }
 
-  /// Коэффициенты: /Games/{id} содержит marketId 1, 2, 5, 12, 16, 17.
-  /// Для углов (45) и карточек (80) используйте `fullOdds(gameId:)`.
-  /// Метод оставлен для обратной совместимости с существующим кодом.
   func odds(numericID: Int) async throws -> JSONValue {
     try await get("/Games/\(numericID)", query: ["TimeZone": "3"])
   }
@@ -424,12 +395,36 @@ final class SStatsClient {
     } catch { return [] }
   }
 
+  /// [8.1] Обогащённая история: принудительно тянет /Games/{id} для последних
+  /// N матчей команды, чтобы получить corners / yellowCards / redCards
+  /// (в /Games/list их нет). Используется в SignalDetailView для превью
+  /// по конкретному рынку.
+  func fetchTeamHistoryEnriched(teamID: String, count: Int = 5) async -> [TeamRecord] {
+    do {
+      let list = try await listTeam(teamID, limit: max(count * 2, 15))
+      let ids = matches(from: list).prefix(count).map { $0.id }
+      let engine = QuantEngine()
+      var out: [TeamRecord] = []
+      var seen = Set<String>()
+      for id in ids {
+        guard !seen.contains(id) else { continue }
+        seen.insert(id)
+        if let payload = try? await gameInfo(id),
+           let rec = engine.teamRecord(from: payload, targetID: teamID) {
+          out.append(rec)
+        }
+        try? await Task.sleep(for: .milliseconds(300))
+      }
+      return out.sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+    } catch { return [] }
+  }
+
   // MARK: - Cache policy
 
   private static func ttl(for path: String) -> TimeInterval {
     if path.hasPrefix("/Games/list") { return 15 * 60 }
     if path.hasPrefix("/Games/glicko") { return 6 * 3600 }
-    if path.hasPrefix("/Odds/") { return 30 * 60 }   // [7.7]
+    if path.hasPrefix("/Odds/") { return 30 * 60 }
     if path.hasPrefix("/Games/") { return 30 * 60 }
     return 5 * 60
   }

@@ -62,7 +62,6 @@ struct QuantEngine {
     for item in items {
       guard let o = item.object else { continue }
 
-      // ID: numeric "id" имеет приоритет; "flashId" — fallback.
       let numericID = intValue(o, ["id", "gameId"])
       let idStr: String
       if let nid = numericID {
@@ -96,8 +95,6 @@ struct QuantEngine {
     var out: [String: [TeamRecord]] = [:]
     for item in items {
       guard let o = item.object else { continue }
-      // [7.20] Список не содержит statistics, но если вдруг передали полный
-      // /Games/{id} — извлекаем.
       let stats = o["statistics"]?.object ?? [:]
       if let hid = teamID(o, "home"),
          let rec = recordFromGame(o, statistics: stats, teamID: hid, isHome: true) {
@@ -114,8 +111,6 @@ struct QuantEngine {
     return out
   }
 
-  // [7.20] Извлекаем corners / cards / fouls / xg из statistics.
-  // Если statistics пустой (например из /Games/list) — поля остаются nil.
   private func recordFromGame(
     _ o: [String: JSONValue],
     statistics: [String: JSONValue] = [:],
@@ -127,7 +122,7 @@ struct QuantEngine {
     let ga = number(o, [opp + "FTResult", opp + "Result"])
     guard gf != nil || ga != nil else { return nil }
 
-    let Pref = pref.capitalized   // "Home" / "Away"
+    let Pref = pref.capitalized
     let Opp  = opp.capitalized
 
     return TeamRecord(
@@ -166,9 +161,6 @@ struct QuantEngine {
                      teamRatings: (nil, nil), playerImpact: (1.0, 1.0))
   }
 
-  // [7.16] Новый параметр fullOdds — котировки из /Odds/{id}.
-  // Default [] — старые вызовы продолжают работать, но углы/карточки
-  // не генерируются.
   func signals(
     match: Match, info: JSONValue, oddsJSON: JSONValue,
     fullOdds: [BookmakerOdds] = [],
@@ -189,9 +181,6 @@ struct QuantEngine {
       teamRatings: teamRatings, playerImpact: (hImpact, aImpact))
     else { return [] }
 
-    // [7.17] Собираем котировки из двух источников:
-    //   • oddsJSON — /Games/{id}, только Goals/1X2 (1X2 теперь отфильтрован)
-    //   • fullOdds — /Odds/{id}, углы (Pinnacle) и карточки (best available)
     var quotes = parseQuotes(oddsJSON)
     quotes.append(contentsOf: parseCornersCardsQuotes(fullOdds))
 
@@ -231,7 +220,6 @@ struct QuantEngine {
         p = computeCardsProbability(q: q, records: homeHistory + awayHistory, ref: ref)
         modelName = "NB+REFEREE+RSI"
       } else if q.market == "CORNERS" {
-        // [7.18] Total corners = сумма (corners + oppCorners) по всем матчам.
         let totals = (homeHistory + awayHistory).compactMap { r -> Double? in
           guard let c = r.corners, let oc = r.oppCorners else { return nil }
           return c + oc
@@ -350,7 +338,6 @@ struct QuantEngine {
     }
   }
 
-  // [7.19] Считаем total cards = cards + oppCards по всем матчам.
   private func computeCardsProbability(q: Quote, records: [TeamRecord],
                                        ref: RefProfile) -> Double {
     let totals = records.compactMap { r -> Double? in
@@ -467,12 +454,13 @@ struct QuantEngine {
     signal.worstBook = worstQuote?.bookmaker
     signal.avgOdds = avgOdds
 
-    // [7.21] Источник котировки для углов / карточек.
     if q.market == "CORNERS" {
       signal.oddsSource = "Pinnacle (sharp)"
     } else if q.market == "CARDS" {
       signal.oddsSource = "Best (\(q.bookmaker))"
     }
+    // [8.3] Дата/время начала матча
+    signal.startTime = match.start
     return signal
   }
 
@@ -699,12 +687,6 @@ struct QuantEngine {
     return max(0.1, base * (1 - w) + ref * w)
   }
 
-  private func countVariance(_ r: [TeamRecord],
-                             _ kp: (TeamRecord) -> Double?) -> Double {
-    let x = r.compactMap(kp)
-    return QuantMath.variance(x) ?? max(1, QuantMath.mean(x) ?? 1)
-  }
-
   private func totalProbability(_ q: Quote, mean: Double, variance: Double) -> Double {
     guard let line = q.line else { return min(0.9, max(0.1, 1 - exp(-mean))) }
     let s = q.selection.lowercased()
@@ -751,7 +733,7 @@ struct QuantEngine {
     return max(0, min(100, score))
   }
 
-  // MARK: - parseQuotes — теперь с marketId
+  // MARK: - parseQuotes
 
   private func parseQuotes(_ json: JSONValue) -> [Quote] {
     var out: [Quote] = []
@@ -793,16 +775,10 @@ struct QuantEngine {
     return out
   }
 
-  // [7.22] Парсит /Odds/{id} → котировки углов и карточек.
-  //   • Углы (marketId 45): только Pinnacle (bookmakerId = 4), т.к.
-  //     edge считаем против sharp-линии.
-  //   • Карточки (marketId 80): best available по всем букмекерам
-  //     (в реальных ответах их 1 — Betano).
   private func parseCornersCardsQuotes(_ books: [BookmakerOdds]) -> [Quote] {
     guard !books.isEmpty else { return [] }
     var out: [Quote] = []
 
-    // Corners: только Pinnacle
     if let pin = books.first(where: { $0.bookmakerId == SStatsClient.pinnacleBookmakerId }),
        let market = pin.odds.first(where: { $0.marketId == MarketID.totalCorners }) {
       for p in market.odds {
@@ -814,7 +790,6 @@ struct QuantEngine {
       }
     }
 
-    // Cards: best available по (name + line)
     var best: [String: (value: Double, name: String, line: Double?, book: String)] = [:]
     for b in books {
       guard let market = b.odds.first(where: { $0.marketId == MarketID.totalCards })
@@ -834,9 +809,6 @@ struct QuantEngine {
     return out
   }
 
-  // [7.17] 1X2 (marketId 1) намеренно исключён — этот рынок больше
-  // не генерирует сигналов. Существующие записи в журнале с market=1X2
-  // продолжат settle-иться через JournalService.
   static func marketFromId(_ id: Int?) -> String {
     guard let id else { return "" }
     switch id {
@@ -877,8 +849,6 @@ struct QuantEngine {
                       disagreement: dis, sharpClose: sm, sharpOpen: nil)
   }
 
-  // [7.17] Убран "1X2" из fallback — там был "home/draw/away", что давало
-  // ложные срабатывания. Теперь только GOALS/CORNERS/CARDS.
   private func normalizeMarket(_ x: String) -> String {
     let s = x.lowercased()
     if s.contains("corner") { return "CORNERS" }
