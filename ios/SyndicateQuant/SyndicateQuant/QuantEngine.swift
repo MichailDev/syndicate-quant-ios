@@ -22,31 +22,20 @@ struct TeamRecord: Hashable, Codable {
 }
 
 struct PlayerRow: Hashable, Codable {
-  var id: String
-  var name: String
-  var minutes: Double
-  var xg: Double
-  var xa: Double
-  var goals: Double
-  var assists: Double
-  var shots: Double
-  var sot: Double
-  var starts: Int
+  var id: String; var name: String
+  var minutes: Double; var xg: Double; var xa: Double
+  var goals: Double; var assists: Double
+  var shots: Double; var sot: Double; var starts: Int
 }
+
 struct RefProfile {
-  var n: Int
-  var cards: Double?
-  var fouls: Double?
-  var confidence: Double
-  var rsi: Double
+  var n: Int; var cards: Double?; var fouls: Double?
+  var confidence: Double; var rsi: Double
 }
 struct SharpGuard {
-  var score: Double = 0
-  var movement: Double = 0
-  var sharpMovement: Double = 0
-  var disagreement: Double = 0
-  var sharpClose: Double?
-  var sharpOpen: Double?
+  var score: Double = 0; var movement: Double = 0
+  var sharpMovement: Double = 0; var disagreement: Double = 0
+  var sharpClose: Double?; var sharpOpen: Double?
 }
 
 struct QuantEngine {
@@ -72,19 +61,31 @@ struct QuantEngine {
     var result: [Match] = []
     for item in items {
       guard let o = item.object else { continue }
-      guard let idStr = string(o, ["id", "flashId", "gameid", "game_id"]),
-            !idStr.isEmpty
-      else { continue }
-      guard let home = teamName(o, "home"), let away = teamName(o, "away")
-      else { continue }
+
+      // ID: numeric "id" имеет приоритет; "flashId" — fallback.
+      let numericID = intValue(o, ["id", "gameId"])
+      let idStr: String
+      if let nid = numericID {
+        idStr = String(nid)
+      } else if let f = string(o, ["flashId", "flashid"]), !f.isEmpty {
+        idStr = f
+      } else {
+        continue
+      }
+
+      guard let home = teamName(o, "home"),
+            let away = teamName(o, "away") else { continue }
       let league = leagueName(o) ?? "Unknown"
+      let status = intValue(o, ["status"])
+
       let m = Match(
         id: idStr, home: home, away: away, league: league, start: date(o),
         homeID: teamID(o, "home"), awayID: teamID(o, "away"),
         homeFT: number(o, ["homeFTResult", "homeResult"]),
         awayFT: number(o, ["awayFTResult", "awayResult"]),
         oddsJSON: o["odds"],
-        numericID: intValue(o, ["id", "gameId"]))
+        numericID: numericID,
+        status: status)
       if !result.contains(where: { $0.id == idStr }) { result.append(m) }
     }
     return result
@@ -121,13 +122,11 @@ struct QuantEngine {
     return TeamRecord(
       id: string(o, ["id"]) ?? UUID().uuidString,
       date: date(o), gf: gf, ga: ga,
-      corners: nil, oppCorners: nil,
-      cards: nil, oppCards: nil,
-      fouls: nil, oppFouls: nil,
-      shots: nil, sot: nil, possession: nil, xg: nil, oppXg: nil,
+      corners: nil, oppCorners: nil, cards: nil, oppCards: nil,
+      fouls: nil, oppFouls: nil, shots: nil, sot: nil,
+      possession: nil, xg: nil, oppXg: nil,
       referee: string(o, ["refereeName", "referee"]),
-      isHome: isHome,
-      players: [])
+      isHome: isHome, players: [])
   }
 
   func teamRecord(from payload: JSONValue, targetID: String) -> TeamRecord? {
@@ -139,16 +138,10 @@ struct QuantEngine {
     return recordFromGame(game, teamID: targetID, isHome: targetID == hid)
   }
 
-  // MARK: - Public model()
-
   func model(home: [TeamRecord], away: [TeamRecord], glicko: JSONValue? = nil) -> MatchModel? {
-    modelWithRatings(
-      home: home, away: away, glicko: glicko,
-      teamRatings: (nil, nil),
-      playerImpact: (1.0, 1.0))
+    modelWithRatings(home: home, away: away, glicko: glicko,
+                     teamRatings: (nil, nil), playerImpact: (1.0, 1.0))
   }
-
-  // MARK: - Signals
 
   func signals(
     match: Match, info: JSONValue, oddsJSON: JSONValue,
@@ -159,15 +152,14 @@ struct QuantEngine {
     teamRatings: (home: Double?, away: Double?) = (nil, nil),
     upcomingLineups: (home: [String], away: [String])? = nil
   ) -> [BetSignal] {
-    let hImpact = playerImpact(
-      history: homeHistory, expectedIDs: upcomingLineups?.home ?? [])
-    let aImpact = playerImpact(
-      history: awayHistory, expectedIDs: upcomingLineups?.away ?? [])
+    let hImpact = playerImpact(history: homeHistory,
+                               expectedIDs: upcomingLineups?.home ?? [])
+    let aImpact = playerImpact(history: awayHistory,
+                               expectedIDs: upcomingLineups?.away ?? [])
 
     guard let matchModel = modelWithRatings(
       home: homeHistory, away: awayHistory, glicko: glicko,
-      teamRatings: teamRatings,
-      playerImpact: (hImpact, aImpact))
+      teamRatings: teamRatings, playerImpact: (hImpact, aImpact))
     else { return [] }
 
     let quotes = parseQuotes(oddsJSON)
@@ -184,11 +176,8 @@ struct QuantEngine {
     let consensusScore = min(100.0, Double(max(quotes.count, 1)) * 12.0)
     let freshnessScore = 90.0
     let definitionScore = 85.0
-    let dcs = 0.30 * sourceScore
-      + 0.25 * sampleScore
-      + 0.20 * consensusScore
-      + 0.15 * freshnessScore
-      + 0.10 * definitionScore
+    let dcs = 0.30 * sourceScore + 0.25 * sampleScore
+      + 0.20 * consensusScore + 0.15 * freshnessScore + 0.10 * definitionScore
 
     let totalDist = QuantMath.totalDistribution(matchModel.matrix)
 
@@ -200,7 +189,6 @@ struct QuantEngine {
 
       let p: Double
       let modelName: String
-      // Волна D (D3): голоса моделей.
       var voteCount: Int? = nil
       var voteDetail: String? = nil
 
@@ -215,18 +203,14 @@ struct QuantEngine {
         p = totalProbabilityFromDistribution(q, dist: totalDist)
         modelName = "ENSEMBLE(DC/BIV/NB)+MC"
       } else if q.market == "CARDS" {
-        p = computeCardsProbability(
-          q: q, records: homeHistory + awayHistory, ref: ref)
+        p = computeCardsProbability(q: q, records: homeHistory + awayHistory, ref: ref)
         modelName = "POISSON/NB+REFEREE+RSI"
       } else if q.market == "CORNERS" {
         let mean = meanCount(homeHistory + awayHistory, \.corners) ?? 10.0
-        p = totalProbability(
-          q, mean: mean,
+        p = totalProbability(q, mean: mean,
           variance: countVariance(homeHistory + awayHistory, \.corners))
         modelName = "POISSON/NB+PRESSURE"
-      } else {
-        continue
-      }
+      } else { continue }
 
       if var s = finish(
         match: match, q: q, p: p, dcs: dcs, quotes: qs,
@@ -237,8 +221,7 @@ struct QuantEngine {
         posteriorWeight: posteriorWeight,
         modelVote: voteCount) {
         if hImpact < 0.999 || aImpact < 0.999 {
-          s.playerImpactHome = hImpact
-          s.playerImpactAway = aImpact
+          s.playerImpactHome = hImpact; s.playerImpactAway = aImpact
         }
         s.modelVote = voteCount
         s.modelVoteDetail = voteDetail
@@ -253,29 +236,21 @@ struct QuantEngine {
     }
   }
 
-  // MARK: - Model with ratings & impact
-
   private func modelWithRatings(
     home: [TeamRecord], away: [TeamRecord], glicko: JSONValue?,
     teamRatings: (home: Double?, away: Double?),
     playerImpact: (home: Double, away: Double)
   ) -> MatchModel? {
     guard let base = estimateLambdas(home, away) else { return nil }
-    let ph = playerAssembly(home)
-    let pa = playerAssembly(away)
-    let player = (
-      base.0 * ph.factor * playerImpact.home,
-      base.1 * pa.factor * playerImpact.away
-    )
+    let ph = playerAssembly(home); let pa = playerAssembly(away)
+    let player = (base.0 * ph.factor * playerImpact.home,
+                  base.1 * pa.factor * playerImpact.away)
     let final = glickoAdjust(player, teamRatings: teamRatings, glickoJSON: glicko)
 
     let maxGoals = 12
-    let dcMatrix = QuantMath.dixonColes(
-      final.0, final.1, rho: -0.055, maxGoals: maxGoals)
-    let bivarMatrix = QuantMath.bivariatePoisson(
-      final.0, final.1, l3: 0.05, maxGoals: maxGoals)
-    let nbMatrix = QuantMath.dixonColes(
-      final.0, final.1, rho: -0.020, maxGoals: maxGoals)
+    let dcMatrix = QuantMath.dixonColes(final.0, final.1, rho: -0.055, maxGoals: maxGoals)
+    let bivarMatrix = QuantMath.bivariatePoisson(final.0, final.1, l3: 0.05, maxGoals: maxGoals)
+    let nbMatrix = QuantMath.dixonColes(final.0, final.1, rho: -0.020, maxGoals: maxGoals)
 
     let oDC = QuantMath.outcomes(dcMatrix)
     let oBiv = QuantMath.outcomes(bivarMatrix)
@@ -283,19 +258,13 @@ struct QuantEngine {
 
     let combined = home + away
     let xgValues = combined.compactMap { $0.xg }
-    let avgXG: Double? = xgValues.isEmpty
-      ? nil
+    let avgXG: Double? = xgValues.isEmpty ? nil
       : xgValues.reduce(0, +) / Double(xgValues.count)
 
-    var wDC = 0.55
-    var wBiv = 0.25
-    var wNB = 0.20
+    var wDC = 0.55; var wBiv = 0.25; var wNB = 0.20
     if let ax = avgXG {
-      if ax < 1.0 {
-        wDC = 0.30; wBiv = 0.55; wNB = 0.15
-      } else if ax > 1.8 {
-        wDC = 0.40; wBiv = 0.10; wNB = 0.50
-      }
+      if ax < 1.0 { wDC = 0.30; wBiv = 0.55; wNB = 0.15 }
+      else if ax > 1.8 { wDC = 0.40; wBiv = 0.10; wNB = 0.50 }
     }
     let wSum = wDC + wBiv + wNB
     wDC /= wSum; wBiv /= wSum; wNB /= wSum
@@ -310,8 +279,7 @@ struct QuantEngine {
     else { primaryMatrix = nbMatrix }
 
     return MatchModel(
-      lh: final.0, la: final.1,
-      baseLH: base.0, baseLA: base.1,
+      lh: final.0, la: final.1, baseLH: base.0, baseLA: base.1,
       baseMatrix: dcMatrix, playerMatrix: dcMatrix, matrix: primaryMatrix,
       outcomes: (ensembleHome, ensembleDraw, ensembleAway),
       components: [oDC.home, oDC.draw, oDC.away, ensembleHome, ensembleDraw, ensembleAway],
@@ -323,70 +291,53 @@ struct QuantEngine {
       outcomesNB: (oNB.home, oNB.draw, oNB.away))
   }
 
-  // MARK: - Vote (Волна D: D3)
-
-  /// Считает голоса 4 моделей: DC, BIV, NB, Ensemble.
-  /// Голос "за" = p(side) > market + 1% (модель видит value на выбранной стороне).
-  private func vote1X2(
-    q: Quote, model: MatchModel, market: Double
-  ) -> (count: Int, detail: String) {
+  private func vote1X2(q: Quote, model: MatchModel, market: Double)
+    -> (count: Int, detail: String) {
     let threshold = 0.01
     let side = q.selectionKey
-
     func pick(_ t: (home: Double, draw: Double, away: Double)) -> Double {
       switch side {
       case "1": return t.home
       case "X": return t.draw
-      default:  return t.away
+      default: return t.away
       }
     }
+    let hits = [
+      ("DC", pick(model.outcomesDC)),
+      ("BIV", pick(model.outcomesBIV)),
+      ("NB", pick(model.outcomesNB)),
+      ("ENS", pick(model.outcomes))
+    ].filter { $0.1 > market + threshold }.map { $0.0 }
 
-    let pDC  = pick(model.outcomesDC)
-    let pBIV = pick(model.outcomesBIV)
-    let pNB  = pick(model.outcomesNB)
-    let pENS = pick(model.outcomes)
+    let misses = [
+      ("DC", pick(model.outcomesDC)),
+      ("BIV", pick(model.outcomesBIV)),
+      ("NB", pick(model.outcomesNB)),
+      ("ENS", pick(model.outcomes))
+    ].filter { $0.1 <= market + threshold }.map { $0.0 }
 
-    var hits: [String] = []
-    var misses: [String] = []
-    for (name, p) in [("DC", pDC), ("BIV", pBIV), ("NB", pNB), ("ENS", pENS)] {
-      if p > market + threshold { hits.append(name) }
-      else { misses.append(name) }
-    }
-    let detail = "\(hits.joined(separator: " ")) | \(misses.joined(separator: " "))"
-    return (hits.count, detail.isEmpty ? nil_dummy() : detail)
+    return (hits.count, "\(hits.joined(separator: " ")) | \(misses.joined(separator: " "))")
   }
 
-  private func nil_dummy() -> String { "" }
-
-  // MARK: - Player impact
-
-  private func playerImpact(
-    history: [TeamRecord], expectedIDs: [String]
-  ) -> Double {
+  private func playerImpact(history: [TeamRecord], expectedIDs: [String]) -> Double {
     guard !expectedIDs.isEmpty else { return 1.0 }
     let pa = playerAssembly(history)
     guard pa.playersUsed >= 6, !pa.top.isEmpty else { return 1.0 }
-
     let expectedSet = Set(expectedIDs.map { $0.lowercased() })
-
     var missing = 0
     for p in pa.top {
       let idMatch = expectedSet.contains(p.id.lowercased())
       let nameMatch = !p.name.isEmpty && expectedSet.contains(p.name.lowercased())
       if !idMatch && !nameMatch { missing += 1 }
     }
-
     if missing <= 2 { return 1.0 }
     if missing == 3 { return 0.95 }
     if missing == 4 { return 0.92 }
     return 0.88
   }
 
-  // MARK: - Probability calculations
-
-  private func compute1X2Probability(
-    q: Quote, model: MatchModel, n: Int, seed: UInt64
-  ) -> Double {
+  private func compute1X2Probability(q: Quote, model: MatchModel,
+                                     n: Int, seed: UInt64) -> Double {
     let mc = QuantMath.monteCarloOutcome(model.matrix, n: n, seed: seed)
     let modelSide: Double
     switch q.selectionKey {
@@ -414,18 +365,14 @@ struct QuantEngine {
     }
   }
 
-  private func computeCardsProbability(
-    q: Quote, records: [TeamRecord], ref: RefProfile
-  ) -> Double {
+  private func computeCardsProbability(q: Quote, records: [TeamRecord],
+                                       ref: RefProfile) -> Double {
     var mean = meanCount(records, \.cards) ?? 4.0
     if ref.n >= 6, let rv = ref.cards {
       mean = blendRef(base: mean, ref: rv, n: ref.n)
     }
-    return totalProbability(
-      q, mean: mean, variance: countVariance(records, \.cards))
+    return totalProbability(q, mean: mean, variance: countVariance(records, \.cards))
   }
-
-  // MARK: - Finish
 
   private func finish(
     match: Match, q: Quote, p: Double,
@@ -437,7 +384,6 @@ struct QuantEngine {
     posteriorWeight: Double,
     modelVote: Int? = nil
   ) -> BetSignal? {
-
     let pRaw = p
     var pFinal = p
     var appliedWeight: Double = 0
@@ -450,8 +396,7 @@ struct QuantEngine {
           let w = max(0, min(0.5, posteriorWeight))
           pFinal = (1 - w) * p + w * b.factHitRate
           appliedWeight = w
-          posteriorSource = String(
-            format: "P %.0f–%.0f%% · n=%d",
+          posteriorSource = String(format: "P %.0f–%.0f%% · n=%d",
             b.probabilityLow * 100, b.probabilityHigh * 100, b.n)
         }
       }
@@ -464,46 +409,37 @@ struct QuantEngine {
     let oddsList = quotes.map { $0.odds }
     let bestQuote = quotes.max(by: { $0.odds < $1.odds })
     let worstQuote = quotes.min(by: { $0.odds < $1.odds })
-    let avgOdds: Double? = oddsList.isEmpty
-      ? nil
+    let avgOdds: Double? = oddsList.isEmpty ? nil
       : oddsList.reduce(0, +) / Double(oddsList.count)
 
-    let interval = QuantMath.probabilityInterval(
-      pFinal, sample: min(homeSample, awaySample), dcs: dcs, marketMAD: marketMAD)
-
-    let robustP = QuantMath.confidenceAdjustedProbability(
-      pFinal, uncertainty: interval.uncertainty)
+    let interval = QuantMath.probabilityInterval(pFinal,
+      sample: min(homeSample, awaySample), dcs: dcs, marketMAD: marketMAD)
+    let robustP = QuantMath.confidenceAdjustedProbability(pFinal,
+      uncertainty: interval.uncertainty)
 
     let ev = QuantMath.ev(p: pFinal, odds: q.odds)
     var robustEV = QuantMath.ev(p: robustP, odds: q.odds)
 
     var ms = marketScore(qs: quotes.count, odds: q.odds, sharp: sharp)
-    if sharp.disagreement > 0.05 {
-      ms = max(0, ms - 15)
-      robustEV *= 0.70
-    }
+    if sharp.disagreement > 0.05 { ms = max(0, ms - 15); robustEV *= 0.70 }
 
     let fair = 1 / max(pFinal, 0.001)
     let extreme = q.odds > fair * 1.25
     let anomaly = q.odds > fair * 1.35
     let conflict = abs(pFinal - marketProbability) > 0.25
+    if extreme || anomaly || conflict { robustEV = -abs(robustEV) }
 
-    if extreme || anomaly || conflict {
-      robustEV = -abs(robustEV)
-    }
-
-    let mes = computeMES(
-      ev: ev, robustEV: robustEV, q: q, p: pFinal, modelOutcomes: modelOutcomes)
+    let mes = computeMES(ev: ev, robustEV: robustEV, q: q,
+                         p: pFinal, modelOutcomes: modelOutcomes)
 
     let ts = max(20, min(100, 100 - interval.uncertainty * 220))
     let rs = max(0, 100 * (1 - interval.uncertainty))
     let qcs = 0.30 * mes + 0.20 * dcs + 0.20 * ms + 0.15 * ts + 0.15 * rs
 
-    let classification = classify(
-      ev: ev, robustEV: robustEV, qcs: qcs, ms: ms, dcs: dcs,
-      anomaly: anomaly, extreme: extreme, conflict: conflict,
-      modelVote: modelVote)
-
+    let classification = classify(ev: ev, robustEV: robustEV, qcs: qcs,
+                                  ms: ms, dcs: dcs, anomaly: anomaly,
+                                  extreme: extreme, conflict: conflict,
+                                  modelVote: modelVote)
     guard classification != "X NO BET" else { return nil }
 
     let band = UncertaintyBand.from(interval.uncertainty)
@@ -524,8 +460,7 @@ struct QuantEngine {
       dcs: dcs, ms: ms, mes: mes, ts: ts, rs: rs, qcs: qcs,
       sampleClass: sampleClass.rawValue,
       homeSample: homeSample, awaySample: awaySample,
-      uncertainty: interval.uncertainty,
-      uncertaintyBand: band.label,
+      uncertainty: interval.uncertainty, uncertaintyBand: band.label,
       marketProbability: marketProbability, marketMAD: marketMAD,
       probabilityLow: interval.low, probabilityHigh: interval.high,
       kellyFraction: fullKelly, quarterKelly: quarterKelly, stakeCap: stakeCap,
@@ -534,22 +469,16 @@ struct QuantEngine {
     signal.probabilityRaw = pRaw
     signal.posteriorWeight = appliedWeight > 0 ? appliedWeight : nil
     signal.posteriorSource = posteriorSource
-
     signal.bestOdds = bestQuote?.odds
     signal.bestBook = bestQuote?.bookmaker
     signal.worstOdds = worstQuote?.odds
     signal.worstBook = worstQuote?.bookmaker
     signal.avgOdds = avgOdds
-
     return signal
   }
 
-  // MARK: - MES
-
-  private func computeMES(
-    ev: Double, robustEV: Double, q: Quote, p: Double,
-    modelOutcomes: (home: Double, draw: Double, away: Double)
-  ) -> Double {
+  private func computeMES(ev: Double, robustEV: Double, q: Quote, p: Double,
+                          modelOutcomes: (home: Double, draw: Double, away: Double)) -> Double {
     let edge = max(0, ev)
     let robustBonus: Double = robustEV > 0 ? 15 : 0
     let agreementBonus: Double
@@ -560,36 +489,19 @@ struct QuantEngine {
       case "X": modelSelected = modelOutcomes.draw
       default:  modelSelected = modelOutcomes.away
       }
-      let agreement = max(0, 1 - abs(p - modelSelected))
-      agreementBonus = agreement * 25
-    } else {
-      agreementBonus = 15
-    }
-    let raw = 30 + edge * 500 + robustBonus + agreementBonus
-    return max(0, min(100, raw))
+      agreementBonus = max(0, 1 - abs(p - modelSelected)) * 25
+    } else { agreementBonus = 15 }
+    return max(0, min(100, 30 + edge * 500 + robustBonus + agreementBonus))
   }
 
-  // MARK: - Classification (с учётом голосов D3)
-
-  private func classify(
-    ev: Double, robustEV: Double, qcs: Double, ms: Double, dcs: Double,
-    anomaly: Bool, extreme: Bool, conflict: Bool,
-    modelVote: Int? = nil
-  ) -> String {
+  private func classify(ev: Double, robustEV: Double, qcs: Double,
+                        ms: Double, dcs: Double,
+                        anomaly: Bool, extreme: Bool, conflict: Bool,
+                        modelVote: Int? = nil) -> String {
     if anomaly || extreme || conflict { return "X NO BET" }
-
-    // Волна D (D3): блокируем S/A BET при недостаточном согласии моделей.
-    // S BET требует 4/4, A BET требует ≥3/4.
-    // При 2/4 — максимум B LEAN, при <2 — максимум C WATCH.
-    let canS: Bool
-    let canA: Bool
-    if let v = modelVote {
-      canS = (v >= 4)
-      canA = (v >= 3)
-    } else {
-      canS = true
-      canA = true
-    }
+    let canS: Bool; let canA: Bool
+    if let v = modelVote { canS = (v >= 4); canA = (v >= 3) }
+    else { canS = true; canA = true }
 
     if canS && robustEV > 0 && ev >= 0.07 && qcs >= 85 && ms >= 50 && dcs >= 60 {
       return "S BET"
@@ -602,17 +514,12 @@ struct QuantEngine {
     return "X NO BET"
   }
 
-  // MARK: - Portfolio
-
-  func portfolio(
-    _ signals: [BetSignal],
-    excludedRules: [AutoExcludeRule] = [],
-    stopLoss: VolatilityState = .normal,
-    correlationMatrix: CorrelationMatrix? = nil,
-    bankroll: Double? = nil
-  ) -> [BetSignal] {
+  func portfolio(_ signals: [BetSignal],
+                 excludedRules: [AutoExcludeRule] = [],
+                 stopLoss: VolatilityState = .normal,
+                 correlationMatrix: CorrelationMatrix? = nil,
+                 bankroll: Double? = nil) -> [BetSignal] {
     if stopLoss.isPause { return [] }
-
     var chosen: [BetSignal] = []
     var totalExposure = 0.0
     let dailyCap = 0.10
@@ -622,10 +529,8 @@ struct QuantEngine {
       .filter { $0.robustEV > 0 }
       .filter { $0.qcs >= 78 }
       .filter { $0.dcs >= 60 }
-      .filter {
-        !AutoExclude.isExcluded(
-          league: $0.league, market: $0.market, rules: excludedRules)
-      }
+      .filter { !AutoExclude.isExcluded(league: $0.league, market: $0.market,
+                                        rules: excludedRules) }
       .sorted { a, b in
         if a.sharpMoney == true && b.sharpMoney != true { return true }
         if b.sharpMoney == true && a.sharpMoney != true { return false }
@@ -633,14 +538,11 @@ struct QuantEngine {
       }
 
     for s in candidates {
-      var maxCorr = 0.0
-      var reason = ""
+      var maxCorr = 0.0; var reason = ""
       for prev in chosen {
         let c = correlation(s, prev, matrix: correlationMatrix)
-        if c > maxCorr {
-          maxCorr = c
-          reason = correlationReason(s, prev, corr: c, matrix: correlationMatrix)
-        }
+        if c > maxCorr { maxCorr = c
+          reason = correlationReason(s, prev, corr: c, matrix: correlationMatrix) }
       }
       if maxCorr >= 0.65 { continue }
 
@@ -650,10 +552,7 @@ struct QuantEngine {
         x.stake = min(s.stake, cap)
         x.stopApplied = "CAP \(Int(cap * 100))%"
       }
-
-      if let bankroll, bankroll > 0 {
-        x.stakeMoney = x.stake * bankroll
-      }
+      if let bankroll, bankroll > 0 { x.stakeMoney = x.stake * bankroll }
 
       guard totalExposure + x.stake <= dailyCap else { continue }
       x.portfolioCorrelation = maxCorr
@@ -665,10 +564,8 @@ struct QuantEngine {
     return chosen
   }
 
-  private func correlation(
-    _ a: BetSignal, _ b: BetSignal,
-    matrix: CorrelationMatrix?
-  ) -> Double {
+  private func correlation(_ a: BetSignal, _ b: BetSignal,
+                           matrix: CorrelationMatrix?) -> Double {
     if a.gameID == b.gameID {
       if a.market == b.market { return 0.82 }
       let pair = Set([a.market, b.market])
@@ -678,9 +575,7 @@ struct QuantEngine {
       return 0.35
     }
     if a.home == b.home || a.home == b.away
-        || a.away == b.home || a.away == b.away {
-      return 0.20
-    }
+        || a.away == b.home || a.away == b.away { return 0.20 }
     if let m = matrix {
       let mk = [a.market, b.market].sorted().joined(separator: "|")
       if let corr = m.marketPairs[mk] { return corr }
@@ -690,10 +585,8 @@ struct QuantEngine {
     return 0.03
   }
 
-  private func correlationReason(
-    _ a: BetSignal, _ b: BetSignal,
-    corr: Double, matrix: CorrelationMatrix?
-  ) -> String {
+  private func correlationReason(_ a: BetSignal, _ b: BetSignal,
+                                 corr: Double, matrix: CorrelationMatrix?) -> String {
     if a.gameID == b.gameID && a.market == b.market { return "same market" }
     if a.gameID == b.gameID { return "same game" }
     if a.home == b.home || a.home == b.away
@@ -707,53 +600,40 @@ struct QuantEngine {
     return "independent"
   }
 
-  // MARK: - Model helpers
+  // MARK: - Helpers
 
-  private func estimateLambdas(
-    _ h: [TeamRecord], _ a: [TeamRecord]
-  ) -> (Double, Double)? {
+  private func estimateLambdas(_ h: [TeamRecord], _ a: [TeamRecord])
+    -> (Double, Double)? {
     let hHome = h.filter { $0.isHome }
     let aAway = a.filter { !$0.isHome }
-
     func shrink(_ x: [Double?]) -> Double? {
       QuantMath.shrink(x.compactMap { $0 }, baseline: nil, k: 8)
     }
-
     let hGfHome = shrink(hHome.map { $0.gf })
     let hGfAll = shrink(h.map { $0.gf })
     let hAtt = hGfHome ?? hGfAll
-
     let hGaHome = shrink(hHome.map { $0.ga })
     let hGaAll = shrink(h.map { $0.ga })
     let hDef = hGaHome ?? hGaAll
-
     let aGfAway = shrink(aAway.map { $0.gf })
     let aGfAll = shrink(a.map { $0.gf })
     let aAtt = aGfAway ?? aGfAll
-
     let aGaAway = shrink(aAway.map { $0.ga })
     let aGaAll = shrink(a.map { $0.ga })
     let aDef = aGaAway ?? aGaAll
-
     guard let hAttV = hAtt, let hDefV = hDef,
-          let aAttV = aAtt, let aDefV = aDef
-    else { return nil }
-
-    let hXg = shrink(h.map { $0.xg })
-    let aXg = shrink(a.map { $0.xg })
+          let aAttV = aAtt, let aDefV = aDef else { return nil }
+    let hXg = shrink(h.map { $0.xg }); let aXg = shrink(a.map { $0.xg })
     let hAttFinal = hXg.map { 0.6 * $0 + 0.4 * hAttV } ?? hAttV
     let aAttFinal = aXg.map { 0.6 * $0 + 0.4 * aAttV } ?? aAttV
-
     let lh = max(0.08, 0.55 * hAttFinal + 0.45 * aDefV + 0.15)
     let la = max(0.08, 0.55 * aAttFinal + 0.45 * hDefV)
     return (lh, la)
   }
 
-  private func glickoAdjust(
-    _ pair: (Double, Double),
-    teamRatings: (home: Double?, away: Double?),
-    glickoJSON: JSONValue?
-  ) -> (Double, Double) {
+  private func glickoAdjust(_ pair: (Double, Double),
+                            teamRatings: (home: Double?, away: Double?),
+                            glickoJSON: JSONValue?) -> (Double, Double) {
     if let h = teamRatings.home, let a = teamRatings.away {
       let diff = (h + 60) - a
       let expectedHome = 1.0 / (1.0 + pow(10.0, -diff / 400.0))
@@ -763,8 +643,7 @@ struct QuantEngine {
     }
     guard let json = glickoJSON,
           let ph = firstNumber(json, ["homeWinProbability"]),
-          let pa = firstNumber(json, ["awayWinProbability"])
-    else { return pair }
+          let pa = firstNumber(json, ["awayWinProbability"]) else { return pair }
     let edge = max(-1, min(1, ph - pa))
     let f = max(-0.12, min(0.12, 0.20 * edge))
     return (pair.0 * (1 + f), pair.1 * (1 - f))
@@ -785,10 +664,8 @@ struct QuantEngine {
       .filter { $0.minutes >= 180 }
       .map { p -> (PlayerAgg, Double) in
         let per90 = 90.0 / max(p.minutes, 1)
-        let score = 0.55 * p.xg * per90
-          + 0.25 * p.xa * per90
-          + 0.12 * p.sot * per90
-          + 0.08 * p.goals * per90
+        let score = 0.55 * p.xg * per90 + 0.25 * p.xa * per90
+          + 0.12 * p.sot * per90 + 0.08 * p.goals * per90
         return (p, score)
       }
       .sorted { $0.1 > $1.1 }
@@ -801,12 +678,10 @@ struct QuantEngine {
     }
     let repl = scored.dropFirst(8).prefix(8).map { $0.1 }
     let replAvg = repl.isEmpty ? 0.0 : repl.reduce(0, +) / Double(repl.count)
-    let gap = max(-1.0, min(1.0,
-      (baseline - replAvg) / max(0.5, abs(baseline) + 0.5)))
+    let gap = max(-1.0, min(1.0, (baseline - replAvg) / max(0.5, abs(baseline) + 0.5)))
     let factor = max(0.94, min(1.06, 1.0 + 0.025 * gap))
-    return PlayerAssembly(
-      factor: factor, baseline: baseline,
-      playersUsed: scored.count, top: top.map { $0.0 })
+    return PlayerAssembly(factor: factor, baseline: baseline,
+                          playersUsed: scored.count, top: top.map { $0.0 })
   }
 
   private func refereeProfile(_ records: [TeamRecord], _ name: String?) -> RefProfile {
@@ -818,20 +693,15 @@ struct QuantEngine {
     }
     let cards = r.map { ($0.cards ?? 0) + ($0.oppCards ?? 0) }
     let allCards = records.compactMap { ($0.cards ?? 0) + ($0.oppCards ?? 0) }
-
     let leagueMean = QuantMath.mean(allCards) ?? 4.0
     let totalCardsInt = Int(cards.reduce(0, +))
     let totalGames = max(cards.count, 1)
-    let shrunkAvg = QuantMath.betaShrink(
-      totalCardsInt, totalGames * 4, priorMean: leagueMean / 8.0, priorStrength: 4) * 8.0
-
-    let rsi = QuantMath.refereeRSI(
-      cardsPerGame: shrunkAvg, leagueMean: leagueMean, n: cards.count)
-
-    return RefProfile(
-      n: r.count, cards: shrunkAvg, fouls: nil,
-      confidence: min(100, Double(r.count) / 15 * 100),
-      rsi: rsi)
+    let shrunkAvg = QuantMath.betaShrink(totalCardsInt, totalGames * 4,
+      priorMean: leagueMean / 8.0, priorStrength: 4) * 8.0
+    let rsi = QuantMath.refereeRSI(cardsPerGame: shrunkAvg,
+      leagueMean: leagueMean, n: cards.count)
+    return RefProfile(n: r.count, cards: shrunkAvg, fouls: nil,
+      confidence: min(100, Double(r.count) / 15 * 100), rsi: rsi)
   }
 
   private func blendRef(base: Double, ref: Double, n: Int) -> Double {
@@ -839,42 +709,32 @@ struct QuantEngine {
     return max(0.1, base * (1 - w) + ref * w)
   }
 
-  private func meanCount(
-    _ r: [TeamRecord], _ kp: (TeamRecord) -> Double?
-  ) -> Double? {
+  private func meanCount(_ r: [TeamRecord], _ kp: (TeamRecord) -> Double?) -> Double? {
     QuantMath.shrink(r.compactMap(kp), baseline: nil, k: 8)
   }
 
-  private func countVariance(
-    _ r: [TeamRecord], _ kp: (TeamRecord) -> Double?
-  ) -> Double {
+  private func countVariance(_ r: [TeamRecord],
+                             _ kp: (TeamRecord) -> Double?) -> Double {
     let x = r.compactMap(kp)
     return QuantMath.variance(x) ?? max(1, QuantMath.mean(x) ?? 1)
   }
 
   private func totalProbability(_ q: Quote, mean: Double, variance: Double) -> Double {
-    guard let line = q.line else {
-      return min(0.9, max(0.1, 1 - exp(-mean)))
-    }
+    guard let line = q.line else { return min(0.9, max(0.1, 1 - exp(-mean))) }
     let s = q.selection.lowercased()
     let isUnder = s.contains("under") || s.hasPrefix("u")
     let over = distributionOver(mean: mean, variance: variance, line: line)
     return isUnder ? 1 - over : over
   }
 
-  private func distributionOver(
-    mean: Double, variance: Double, line: Double
-  ) -> Double {
+  private func distributionOver(mean: Double, variance: Double,
+                                line: Double) -> Double {
     let lines = QuantMath.splitQuarterLine(line)
-
     if lines.count == 1 {
       return singleLineOver(mean: mean, variance: variance, line: lines[0])
     }
-
-    let l1 = lines[0]
-    let l2 = lines[1]
-    let p1 = singleLineOver(mean: mean, variance: variance, line: l1)
-    let p2 = singleLineOver(mean: mean, variance: variance, line: l2)
+    let p1 = singleLineOver(mean: mean, variance: variance, line: lines[0])
+    let p2 = singleLineOver(mean: mean, variance: variance, line: lines[1])
     return 0.5 * p1 + 0.5 * p2
   }
 
@@ -891,8 +751,8 @@ struct QuantEngine {
     }
     let m = QuantMath.dixonColes(mean / 2, mean / 2, rho: 0, maxGoals: 20)
     let seedValue = UInt64(abs(Int(mean * 100)) + 17)
-    return QuantMath.monteCarloTotal(
-      m, line: line, n: 20000, seed: seedValue, over: true)
+    return QuantMath.monteCarloTotal(m, line: line, n: 20000,
+                                     seed: seedValue, over: true)
   }
 
   private func marketScore(qs: Int, odds: Double, sharp: SharpGuard) -> Double {
@@ -905,34 +765,56 @@ struct QuantEngine {
     return max(0, min(100, score))
   }
 
-  // MARK: - Odds parsing
+  // MARK: - parseQuotes — теперь с marketId
 
   private func parseQuotes(_ json: JSONValue) -> [Quote] {
     var out: [Quote] = []
-    if let arr = json.array {
-      for mv in arr {
-        guard let m = mv.object else { continue }
-        let marketName = string(m, ["marketName", "market", "market_name"]) ?? ""
-        guard let prices = m["odds"]?.array else { continue }
-        for pv in prices {
-          guard let p = pv.object else { continue }
-          guard let value = number(p, ["value", "odds", "price"]),
-                value > 1, value < 100
-          else { continue }
-          let selection = string(p, ["name", "selection", "outcome"]) ?? ""
-          let market = normalizeMarket(marketName + " " + selection)
-          guard !market.isEmpty else { continue }
-          let line = extractLine(selection) ?? extractLine(marketName)
-          let bookmaker = string(
-            p, ["bookmaker", "bookmakerName", "bookie", "bk", "book", "sportsbook"]
-          ) ?? string(m, ["bookmaker", "bookmakerName", "bookie", "bk"]) ?? "sstats"
-          out.append(Quote(
-            market: market, selection: selection, line: line,
-            odds: value, bookmaker: bookmaker))
-        }
+    let arr: [JSONValue]
+    if let a = json.array { arr = a }
+    else if let d = json.object?["data"]?.array { arr = d }
+    else if let d = json.object?["odds"]?.array { arr = d }
+    else { return [] }
+
+    for mv in arr {
+      guard let m = mv.object else { continue }
+      let marketId = m["marketId"]?.number.map { Int($0) }
+      let marketName = string(m, ["marketName", "market", "market_name"]) ?? ""
+
+      // marketId имеет приоритет (marketName может быть null)
+      let marketFromId = Self.marketFromId(marketId)
+
+      guard let prices = m["odds"]?.array else { continue }
+      for pv in prices {
+        guard let p = pv.object else { continue }
+        guard let value = number(p, ["value", "odds", "price"]),
+              value > 1, value < 1000 else { continue }
+
+        let selection = string(p, ["name", "selection", "outcome"]) ?? ""
+        let market = !marketFromId.isEmpty
+          ? marketFromId
+          : normalizeMarket(marketName + " " + selection)
+        guard !market.isEmpty else { continue }
+
+        let line = extractLine(selection) ?? extractLine(marketName)
+        let bookmaker = string(p,
+          ["bookmaker", "bookmakerName", "bookie", "bk", "book", "sportsbook"])
+          ?? string(m, ["bookmaker", "bookmakerName", "bookie", "bk"])
+          ?? "sstats"
+
+        out.append(Quote(market: market, selection: selection,
+                         line: line, odds: value, bookmaker: bookmaker))
       }
     }
     return out
+  }
+
+  static func marketFromId(_ id: Int?) -> String {
+    guard let id else { return "" }
+    switch id {
+    case 1: return "1X2"
+    case 5, 16, 17: return "GOALS"
+    default: return ""
+    }
   }
 
   private func extractLine(_ s: String) -> Double? {
@@ -959,9 +841,8 @@ struct QuantEngine {
     var score = 35.0
     if qs.count >= 4 { score += 25 }
     if dis <= 0.03 { score += 20 }
-    return SharpGuard(
-      score: score, movement: 0, sharpMovement: 0,
-      disagreement: dis, sharpClose: sm, sharpOpen: nil)
+    return SharpGuard(score: score, movement: 0, sharpMovement: 0,
+                      disagreement: dis, sharpClose: sm, sharpOpen: nil)
   }
 
   private func normalizeMarket(_ x: String) -> String {
@@ -971,7 +852,8 @@ struct QuantEngine {
     if s.contains("goal") || s.contains("total")
         || s.contains("over") || s.contains("under") { return "GOALS" }
     let trimmed = s.trimmingCharacters(in: .whitespaces)
-    if s.contains("1x2") || s.contains("winner") || s.contains("home")
+    if s.contains("1x2") || s.contains("winner")
+        || s.contains("home") || s.contains("draw") || s.contains("away")
         || trimmed == "1" || trimmed == "x" || trimmed == "2" {
       return "1X2"
     }
@@ -982,22 +864,16 @@ struct QuantEngine {
 
   private func teamName(_ o: [String: JSONValue], _ side: String) -> String? {
     if let team = o[side + "Team"]?.object,
-       let name = team["name"]?.string {
-      return name
-    }
+       let name = team["name"]?.string { return name }
     return string(o, [side, side + "team", side + "_team"])
   }
 
   private func leagueName(_ o: [String: JSONValue]) -> String? {
     if let season = o["season"]?.object,
        let league = season["league"]?.object,
-       let name = league["name"]?.string {
-      return name
-    }
+       let name = league["name"]?.string { return name }
     if let league = o["league"]?.object,
-       let name = league["name"]?.string {
-      return name
-    }
+       let name = league["name"]?.string { return name }
     return string(o, ["league", "tournament"])
   }
 
@@ -1008,9 +884,9 @@ struct QuantEngine {
 
   private func teamID(_ o: [String: JSONValue], _ side: String) -> String? {
     if let x = o[side + "Team"]?.object {
+      if let n = x["id"]?.number { return String(Int(n)) }
       if let s = string(x, ["id", "teamid", "team_id", "flashid"]),
          !s.isEmpty { return s }
-      if let n = x["id"]?.number { return String(Int(n)) }
     }
     if let s = string(o, [side + "TeamId", side + "Id"]), !s.isEmpty { return s }
     if let n = o[side + "TeamId"]?.number { return String(Int(n)) }
@@ -1050,42 +926,27 @@ struct QuantEngine {
 }
 
 struct MatchModel {
-  var lh: Double
-  var la: Double
-  var baseLH: Double
-  var baseLA: Double
-  var baseMatrix: Matrix2D
-  var playerMatrix: Matrix2D
-  var matrix: Matrix2D
+  var lh: Double; var la: Double
+  var baseLH: Double; var baseLA: Double
+  var baseMatrix: Matrix2D; var playerMatrix: Matrix2D; var matrix: Matrix2D
   var outcomes: (home: Double, draw: Double, away: Double)
   var components: [Double]
-  var playerHome: PlayerAssembly
-  var playerAway: PlayerAssembly
+  var playerHome: PlayerAssembly; var playerAway: PlayerAssembly
   var ensembleWeights: (dc: Double, biv: Double, nb: Double) = (0, 0, 0)
   var ensembleAvgXG: Double? = nil
-
-  // Волна D (D3): отдельные выходы моделей для голосования.
   var outcomesDC: (home: Double, draw: Double, away: Double) = (0, 0, 0)
   var outcomesBIV: (home: Double, draw: Double, away: Double) = (0, 0, 0)
   var outcomesNB: (home: Double, draw: Double, away: Double) = (0, 0, 0)
 }
 struct PlayerAssembly {
-  var factor: Double
-  var baseline: Double
-  var playersUsed: Int
-  var top: [PlayerAgg]
+  var factor: Double; var baseline: Double
+  var playersUsed: Int; var top: [PlayerAgg]
 }
 struct PlayerAgg: Hashable, Codable {
-  var id: String
-  var name: String = ""
-  var minutes = 0.0
-  var xg = 0.0
-  var xa = 0.0
-  var goals = 0.0
-  var assists = 0.0
-  var shots = 0.0
-  var sot = 0.0
-  var games = 0
+  var id: String; var name: String = ""
+  var minutes = 0.0; var xg = 0.0; var xa = 0.0
+  var goals = 0.0; var assists = 0.0
+  var shots = 0.0; var sot = 0.0; var games = 0
 }
 extension Quote {
   var selectionKey: String {

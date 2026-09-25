@@ -124,6 +124,7 @@ struct Match: Identifiable, Codable, Hashable {
   var awayFT: Double?
   var oddsJSON: JSONValue?
   var numericID: Int?
+  var status: Int? = nil
 }
 
 struct Quote: Codable, Hashable {
@@ -230,20 +231,17 @@ struct BetSignal: Identifiable, Codable, Hashable {
 
 @Model final class TuningConfig {
   @Attribute(.unique) var id: String
-
   var autoExcludeEnabled: Bool
   var posteriorEnabled: Bool
   var stopLossEnabled: Bool
   var correlationEnabled: Bool
   var playerImpactEnabled: Bool
   var teamRatingEnabled: Bool
-
   var posteriorWeight: Double
   var autoExcludeMinROI: Double
   var autoExcludeMinBets: Int
   var stopLossCapStreak: Int
   var stopLossPauseStreak: Int
-
   var updatedAt: Date
 
   init(id: String = "current") {
@@ -254,13 +252,11 @@ struct BetSignal: Identifiable, Codable, Hashable {
     self.correlationEnabled = true
     self.playerImpactEnabled = true
     self.teamRatingEnabled = true
-
     self.posteriorWeight = 0.15
     self.autoExcludeMinROI = -0.05
     self.autoExcludeMinBets = 20
     self.stopLossCapStreak = 4
     self.stopLossPauseStreak = 7
-
     self.updatedAt = Date()
   }
 }
@@ -279,34 +275,25 @@ struct BetSignal: Identifiable, Codable, Hashable {
        kind: String, target: String,
        beforeValue: String, afterValue: String,
        note: String = "", rolledBack: Bool = false) {
-    self.id = id
-    self.createdAt = createdAt
-    self.kind = kind
-    self.target = target
-    self.beforeValue = beforeValue
-    self.afterValue = afterValue
-    self.note = note
-    self.rolledBack = rolledBack
+    self.id = id; self.createdAt = createdAt
+    self.kind = kind; self.target = target
+    self.beforeValue = beforeValue; self.afterValue = afterValue
+    self.note = note; self.rolledBack = rolledBack
   }
 }
 
 struct AutoDecision: Identifiable, Hashable {
-  var id: String
-  var title: String
-  var summary: String
-  var detail: String
-  var enabled: Bool
-  var flagKey: String
+  var id: String; var title: String; var summary: String
+  var detail: String; var enabled: Bool; var flagKey: String
 }
 
 @MainActor
 enum TuningService {
   static func fetchOrCreate(in context: ModelContext) -> TuningConfig {
-    let descriptor = FetchDescriptor<TuningConfig>()
-    if let existing = try? context.fetch(descriptor).first { return existing }
+    let d = FetchDescriptor<TuningConfig>()
+    if let existing = try? context.fetch(d).first { return existing }
     let cfg = TuningConfig()
-    context.insert(cfg)
-    try? context.save()
+    context.insert(cfg); try? context.save()
     return cfg
   }
 
@@ -314,8 +301,7 @@ enum TuningService {
                   before: String, after: String, note: String = "") {
     let e = TuningEvent(kind: kind, target: target,
                         beforeValue: before, afterValue: after, note: note)
-    context.insert(e)
-    try? context.save()
+    context.insert(e); try? context.save()
   }
 
   static func recentEvents(context: ModelContext, limit: Int = 30) -> [TuningEvent] {
@@ -365,20 +351,15 @@ enum TuningService {
     return last
   }
 
-  static func decisions(config: TuningConfig,
-                        snapshot: BacktestSnapshot?,
-                        journal: [JournalEntry],
-                        corr: CorrelationMatrix) -> [AutoDecision] {
+  static func decisions(config: TuningConfig, snapshot: BacktestSnapshot?,
+                        journal: [JournalEntry], corr: CorrelationMatrix) -> [AutoDecision] {
     var out: [AutoDecision] = []
-
     let rules = snapshot.map {
-      AutoExclude.rules(from: $0,
-                        minROI: config.autoExcludeMinROI,
+      AutoExclude.rules(from: $0, minROI: config.autoExcludeMinROI,
                         minBets: config.autoExcludeMinBets)
     } ?? []
     let activeRules = rules.filter { $0.excluded }.count
-    out.append(AutoDecision(
-      id: "autoexclude", title: "Auto-Exclude",
+    out.append(AutoDecision(id: "autoexclude", title: "Auto-Exclude",
       summary: config.autoExcludeEnabled ? "\(activeRules) активных правил" : "выключено",
       detail: String(format: "Порог: ROI < %.1f%% при n ≥ %d",
                      config.autoExcludeMinROI * 100, config.autoExcludeMinBets),
@@ -386,8 +367,7 @@ enum TuningService {
 
     let buckets = snapshot?.decodedPosteriorBuckets() ?? []
     let usable = buckets.filter { $0.n >= 20 }.count
-    out.append(AutoDecision(
-      id: "posterior", title: "Bayesian posterior",
+    out.append(AutoDecision(id: "posterior", title: "Bayesian posterior",
       summary: config.posteriorEnabled ? "\(usable) бакетов (n≥20)" : "выключено",
       detail: String(format: "p_adj = (1 − %.2f)·p + %.2f·p_post",
                      config.posteriorWeight, config.posteriorWeight),
@@ -396,30 +376,24 @@ enum TuningService {
     let streak = VolatilityStop.evaluate(journal,
       capThreshold: config.stopLossCapStreak,
       pauseThreshold: config.stopLossPauseStreak)
-    out.append(AutoDecision(
-      id: "stoploss", title: "Volatility stop",
+    out.append(AutoDecision(id: "stoploss", title: "Volatility stop",
       summary: config.stopLossEnabled
-        ? "\(streak.streak) проигрышей · \(streak.state.label)"
-        : "выключено",
+        ? "\(streak.streak) проигрышей · \(streak.state.label)" : "выключено",
       detail: "Cap ≥ \(config.stopLossCapStreak) → 5%; Pause ≥ \(config.stopLossPauseStreak)",
       enabled: config.stopLossEnabled, flagKey: "stopLossEnabled"))
 
-    out.append(AutoDecision(
-      id: "correlation", title: "Correlation matrix",
+    out.append(AutoDecision(id: "correlation", title: "Correlation matrix",
       summary: config.correlationEnabled
-        ? "\(corr.marketPairsN.count + corr.leaguePairsN.count) пар (n≥20)"
-        : "выключено",
+        ? "\(corr.marketPairsN.count + corr.leaguePairsN.count) пар (n≥20)" : "выключено",
       detail: "Эмпирические φ-коэффициенты из журнала; fallback — структурные",
       enabled: config.correlationEnabled, flagKey: "correlationEnabled"))
 
-    out.append(AutoDecision(
-      id: "playerimpact", title: "Player impact",
+    out.append(AutoDecision(id: "playerimpact", title: "Player impact",
       summary: config.playerImpactEnabled ? "ждём составы от API" : "выключено",
       detail: "λ × 0.88…1.00 в зависимости от отсутствия топ-8",
       enabled: config.playerImpactEnabled, flagKey: "playerImpactEnabled"))
 
-    out.append(AutoDecision(
-      id: "teamrating", title: "Team rating (Elo)",
+    out.append(AutoDecision(id: "teamrating", title: "Team rating (Elo)",
       summary: config.teamRatingEnabled ? "активно (≥ 3 матчей на команду)" : "выключено",
       detail: "Старт 1500, HFA 60, K=32→20; влияет на λ через glickoAdjust",
       enabled: config.teamRatingEnabled, flagKey: "teamRatingEnabled"))
@@ -431,10 +405,7 @@ enum TuningService {
 // MARK: - Volatility stop
 
 enum VolatilityState: Equatable {
-  case normal
-  case cap(Double)
-  case pause
-
+  case normal, cap(Double), pause
   var label: String {
     switch self {
     case .normal: return "NORMAL"
@@ -487,13 +458,11 @@ enum TeamRatingService {
     let diff = (home + homeAdvantage) - away
     return 1.0 / (1.0 + pow(10.0, -diff / 400.0))
   }
-
   static func kFactor(matches: Int) -> Double {
     if matches >= kDecayAfter { return kMin }
     let t = Double(matches) / Double(kDecayAfter)
     return kBase + (kMin - kBase) * t
   }
-
   @discardableResult
   static func update(context: ModelContext,
                      homeTeamID: String, homeName: String,
@@ -502,27 +471,21 @@ enum TeamRatingService {
     -> (deltaHome: Double, deltaAway: Double)? {
     guard !homeTeamID.isEmpty, !awayTeamID.isEmpty,
           homeTeamID != awayTeamID else { return nil }
-
     let h = fetchOrCreate(context, teamID: homeTeamID, name: homeName)
     let a = fetchOrCreate(context, teamID: awayTeamID, name: awayName)
-
     let expectedHome = expectedHome(home: h.rating, away: a.rating)
     let outcomeHome: Double
     if homeGoals > awayGoals { outcomeHome = 1.0 }
     else if homeGoals == awayGoals { outcomeHome = 0.5 }
     else { outcomeHome = 0.0 }
     let outcomeAway = 1.0 - outcomeHome
-
     let deltaH = kFactor(matches: h.matches) * (outcomeHome - expectedHome)
     let deltaA = kFactor(matches: a.matches) * (outcomeAway - (1 - expectedHome))
-
     h.rating += deltaH; h.matches += 1; h.lastDelta = deltaH; h.updatedAt = Date()
     a.rating += deltaA; a.matches += 1; a.lastDelta = deltaA; a.updatedAt = Date()
-
     try? context.save()
     return (deltaH, deltaA)
   }
-
   static func fetchOrCreate(_ context: ModelContext,
                             teamID: String, name: String) -> TeamRating {
     let d = FetchDescriptor<TeamRating>(predicate: #Predicate { $0.teamID == teamID })
@@ -534,7 +497,6 @@ enum TeamRatingService {
     context.insert(r)
     return r
   }
-
   static func usableRating(for teamID: String, context: ModelContext) -> Double? {
     let d = FetchDescriptor<TeamRating>(predicate: #Predicate { $0.teamID == teamID })
     guard let r = try? context.fetch(d).first,
@@ -543,7 +505,7 @@ enum TeamRatingService {
   }
 }
 
-// MARK: - Correlation matrix
+// MARK: - Correlation
 
 struct CorrelationMatrix: Codable, Hashable {
   var marketPairs: [String: Double]
@@ -552,7 +514,6 @@ struct CorrelationMatrix: Codable, Hashable {
   var leaguePairsN: [String: Int]
   var totalPairs: Int
   var lastUpdated: Date
-
   static let empty = CorrelationMatrix(
     marketPairs: [:], leaguePairs: [:],
     marketPairsN: [:], leaguePairsN: [:],
@@ -561,7 +522,6 @@ struct CorrelationMatrix: Codable, Hashable {
 
 enum CorrelationBuilder {
   static let minPairs = 20
-
   static func build(from journal: [JournalEntry]) -> CorrelationMatrix {
     let closed = journal.filter {
       $0.status == "CLOSED" && ($0.result == "WIN" || $0.result == "LOSS")
@@ -600,17 +560,13 @@ enum CorrelationBuilder {
 
     func toCorr(_ s: [String: (both: Double, a: Double, b: Double, n: Int)])
       -> ([String: Double], [String: Int]) {
-      var corr: [String: Double] = [:]
-      var ns: [String: Int] = [:]
+      var corr: [String: Double] = [:]; var ns: [String: Int] = [:]
       for (k, v) in s where v.n >= minPairs {
         let n = Double(v.n)
-        let pAB = v.both / n
-        let pA = v.a / n
-        let pB = v.b / n
+        let pAB = v.both / n; let pA = v.a / n; let pB = v.b / n
         let denom = sqrt(pA * (1 - pA) * pB * (1 - pB))
         let phi = denom > 1e-9 ? (pAB - pA * pB) / denom : 0
-        corr[k] = max(-1, min(1, phi))
-        ns[k] = v.n
+        corr[k] = max(-1, min(1, phi)); ns[k] = v.n
       }
       return (corr, ns)
     }
@@ -618,10 +574,9 @@ enum CorrelationBuilder {
     let (mc, mn) = toCorr(marketSum)
     let (lc, ln) = toCorr(leagueSum)
 
-    return CorrelationMatrix(
-      marketPairs: mc, leaguePairs: lc,
-      marketPairsN: mn, leaguePairsN: ln,
-      totalPairs: totalPairs, lastUpdated: Date())
+    return CorrelationMatrix(marketPairs: mc, leaguePairs: lc,
+                             marketPairsN: mn, leaguePairsN: ln,
+                             totalPairs: totalPairs, lastUpdated: Date())
   }
 }
 
@@ -650,10 +605,8 @@ enum CorrelationBuilder {
   var closingOdds: Double?
   var clv: Double?
   var profit: Double?
-
   var openingOdds: Double?
   var movement: Double?
-
   var stakeMoney: Double?
 
   init(signal: BetSignal, status: String = "OPEN") {
@@ -693,15 +646,10 @@ enum CorrelationBuilder {
   var createdAt: Date
   init(id: String, predicted: Double, actual: Double, market: String,
        createdAt: Date = Date()) {
-    self.id = id
-    self.predicted = predicted
-    self.actual = actual
-    self.market = market
-    self.createdAt = createdAt
+    self.id = id; self.predicted = predicted; self.actual = actual
+    self.market = market; self.createdAt = createdAt
   }
 }
-
-// MARK: - BacktestRun (legacy)
 
 @Model final class BacktestRun {
   @Attribute(.unique) var id: String
@@ -728,55 +676,32 @@ enum CorrelationBuilder {
        profit: Double, staked: Double, roi: Double, yieldPct: Double,
        hitRate: Double, maxDrawdown: Double, maxLosingStreak: Int,
        sharpe: Double, brier: Double, logLoss: Double, avgCLV: Double) {
-    self.id = id
-    self.createdAt = createdAt
-    self.matches = matches
-    self.bets = bets
-    self.wins = wins
-    self.losses = losses
-    self.pushes = pushes
-    self.profit = profit
-    self.staked = staked
-    self.roi = roi
-    self.yieldPct = yieldPct
-    self.hitRate = hitRate
-    self.maxDrawdown = maxDrawdown
-    self.maxLosingStreak = maxLosingStreak
-    self.sharpe = sharpe
-    self.brier = brier
-    self.logLoss = logLoss
-    self.avgCLV = avgCLV
+    self.id = id; self.createdAt = createdAt
+    self.matches = matches; self.bets = bets
+    self.wins = wins; self.losses = losses; self.pushes = pushes
+    self.profit = profit; self.staked = staked; self.roi = roi
+    self.yieldPct = yieldPct; self.hitRate = hitRate
+    self.maxDrawdown = maxDrawdown; self.maxLosingStreak = maxLosingStreak
+    self.sharpe = sharpe; self.brier = brier
+    self.logLoss = logLoss; self.avgCLV = avgCLV
   }
 }
 
-// MARK: - Backtest snapshot
+// MARK: - Stored segment stats
 
 struct StoredSegmentStats: Codable, Hashable {
-  var bets: Int
-  var wins: Int
-  var losses: Int
-  var pushes: Int
-  var profit: Double
-  var staked: Double
-  var roi: Double
-  var yieldPct: Double
-  var hitRate: Double
-  var avgOdds: Double
+  var bets: Int; var wins: Int; var losses: Int; var pushes: Int
+  var profit: Double; var staked: Double
+  var roi: Double; var yieldPct: Double; var hitRate: Double; var avgOdds: Double
 
   init() {
     bets = 0; wins = 0; losses = 0; pushes = 0
-    profit = 0; staked = 0; roi = 0; yieldPct = 0
-    hitRate = 0; avgOdds = 0
+    profit = 0; staked = 0; roi = 0; yieldPct = 0; hitRate = 0; avgOdds = 0
   }
-
   init(bets: Int, wins: Int, losses: Int, pushes: Int,
        profit: Double, staked: Double, avgOdds: Double) {
-    self.bets = bets
-    self.wins = wins
-    self.losses = losses
-    self.pushes = pushes
-    self.profit = profit
-    self.staked = staked
+    self.bets = bets; self.wins = wins; self.losses = losses; self.pushes = pushes
+    self.profit = profit; self.staked = staked
     self.roi = staked > 0 ? profit / staked : 0
     self.yieldPct = self.roi
     let dec = wins + losses
@@ -802,8 +727,6 @@ struct AutoExcludeRule: Codable, Hashable, Identifiable {
   var excluded: Bool
 }
 
-// MARK: - Model comparison (Волна E, E5)
-
 struct ModelComparison: Codable, Hashable, Identifiable {
   var id: String { name }
   var name: String
@@ -826,7 +749,6 @@ struct ModelComparison: Codable, Hashable, Identifiable {
   var buildProgress: Double
   var buildStatus: String
   var lastError: String?
-
   var perLeagueJSON: Data?
   var perMarketJSON: Data?
   var perLeagueMarketJSON: Data?
@@ -835,7 +757,6 @@ struct ModelComparison: Codable, Hashable, Identifiable {
   var classificationJSON: Data?
   var posteriorJSON: Data?
   var modelComparisonJSON: Data?
-
   var avgROI: Double
   var avgCLV: Double
   var brier: Double
@@ -845,31 +766,16 @@ struct ModelComparison: Codable, Hashable, Identifiable {
   var profitFactor: Double
 
   init(id: String = "current") {
-    self.id = id
-    self.version = 1
-    self.builtAt = nil
-    self.fromDate = nil
-    self.toDate = nil
-    self.totalMatches = 0
-    self.totalBets = 0
-    self.buildProgress = 0
-    self.buildStatus = "idle"
-    self.lastError = nil
-    self.perLeagueJSON = nil
-    self.perMarketJSON = nil
-    self.perLeagueMarketJSON = nil
-    self.evBucketsJSON = nil
-    self.oddsBucketsJSON = nil
-    self.classificationJSON = nil
-    self.posteriorJSON = nil
-    self.modelComparisonJSON = nil
-    self.avgROI = 0
-    self.avgCLV = 0
-    self.brier = 0
-    self.logLoss = 0
-    self.sharpe = 0
-    self.sortino = 0
-    self.profitFactor = 0
+    self.id = id; self.version = 1
+    self.builtAt = nil; self.fromDate = nil; self.toDate = nil
+    self.totalMatches = 0; self.totalBets = 0
+    self.buildProgress = 0; self.buildStatus = "idle"; self.lastError = nil
+    self.perLeagueJSON = nil; self.perMarketJSON = nil
+    self.perLeagueMarketJSON = nil; self.evBucketsJSON = nil
+    self.oddsBucketsJSON = nil; self.classificationJSON = nil
+    self.posteriorJSON = nil; self.modelComparisonJSON = nil
+    self.avgROI = 0; self.avgCLV = 0; self.brier = 0; self.logLoss = 0
+    self.sharpe = 0; self.sortino = 0; self.profitFactor = 0
   }
 }
 
@@ -913,7 +819,6 @@ extension BacktestSnapshot {
 enum AutoExclude {
   static let defaultMinBets = 20
   static let defaultMinROI = -0.05
-
   static func rules(from snapshot: BacktestSnapshot?,
                     minROI: Double = defaultMinROI,
                     minBets: Int = defaultMinBets) -> [AutoExcludeRule] {
@@ -928,7 +833,6 @@ enum AutoExclude {
                              bets: s.bets, roi: s.roi, excluded: ex)
     }.sorted { $0.roi < $1.roi }
   }
-
   static func isExcluded(league: String, market: String,
                          rules: [AutoExcludeRule]) -> Bool {
     rules.contains { r in
@@ -945,42 +849,32 @@ struct AppStats {
   var profit = 0.0; var staked = 0.0
 }
 
-// MARK: - JournalMetrics & Metrics
+// MARK: - Metrics
 
 struct JournalMetrics {
-  var totalEntries = 0
-  var closedEntries = 0
-  var wins = 0
-  var losses = 0
-  var pushes = 0
-  var voids = 0
-  var profit = 0.0
-  var staked = 0.0
-  var avgCLV = 0.0
-  var clvCount = 0
-  var brier = 0.0
-  var logLoss = 0.0
+  var totalEntries = 0; var closedEntries = 0
+  var wins = 0; var losses = 0; var pushes = 0; var voids = 0
+  var profit = 0.0; var staked = 0.0
+  var avgCLV = 0.0; var clvCount = 0
+  var brier = 0.0; var logLoss = 0.0
   var calibration: [CalibrationBucket] = []
 
   var roi: Double { staked > 0 ? profit / staked : 0 }
   var yieldPct: Double { roi }
-  var hitRate: Double { wins + losses > 0 ? Double(wins) / Double(wins + losses) : 0 }
+  var hitRate: Double {
+    wins + losses > 0 ? Double(wins) / Double(wins + losses) : 0
+  }
   var pending: Int { totalEntries - closedEntries }
 }
 
 struct CalibrationBucket: Identifiable {
-  let id: String
-  let midpoint: Double
-  let predicted: Double
-  let actual: Double
-  let count: Int
+  let id: String; let midpoint: Double
+  let predicted: Double; let actual: Double; let count: Int
 }
 
 struct EquityPoint: Identifiable, Hashable {
-  let id: String
-  let date: Date
-  let cumulativeProfit: Double
-  let cumulativeStaked: Double
+  let id: String; let date: Date
+  let cumulativeProfit: Double; let cumulativeStaked: Double
   let bets: Int
 }
 
@@ -991,12 +885,8 @@ enum Metrics {
     let closed = entries.filter { $0.status == "CLOSED" }
     m.closedEntries = closed.count
 
-    var brierSum = 0.0
-    var logLossSum = 0.0
-    var brierCount = 0
-    var clvSum = 0.0
-    var clvCount = 0
-
+    var brierSum = 0.0; var logLossSum = 0.0; var brierCount = 0
+    var clvSum = 0.0; var clvCount = 0
     var bucketPredicted: [Int: Double] = [:]
     var bucketActual: [Int: Double] = [:]
     var bucketCount: [Int: Int] = [:]
@@ -1027,13 +917,11 @@ enum Metrics {
         bucketCount[bucket, default: 0] += 1
       }
     }
-
     if clvCount > 0 { m.avgCLV = clvSum / Double(clvCount) }
     if brierCount > 0 {
       m.brier = brierSum / Double(brierCount)
       m.logLoss = logLossSum / Double(brierCount)
     }
-
     var buckets: [CalibrationBucket] = []
     for i in 0..<10 {
       guard let n = bucketCount[i], n > 0 else { continue }
@@ -1049,8 +937,7 @@ enum Metrics {
 
   static func calibrationError(_ m: JournalMetrics) -> Double {
     guard !m.calibration.isEmpty else { return 0 }
-    var weightedSum = 0.0
-    var totalN = 0
+    var weightedSum = 0.0; var totalN = 0
     for b in m.calibration {
       weightedSum += abs(b.predicted - b.actual) * Double(b.count)
       totalN += b.count
@@ -1066,8 +953,7 @@ enum Metrics {
     guard !closed.isEmpty else { return [] }
 
     var curve: [EquityPoint] = []
-    var cumProfit = 0.0
-    var cumStaked = 0.0
+    var cumProfit = 0.0; var cumStaked = 0.0
     let mult = bankroll ?? 1.0
     for (i, e) in closed.enumerated() {
       cumProfit += (e.profit ?? 0) * mult
@@ -1083,22 +969,22 @@ enum Metrics {
 
 enum JournalService {
   @MainActor
-  static func settleOpenEntries(context: ModelContext,
-                                client: SStatsClient)
+  static func settleOpenEntries(context: ModelContext, client: SStatsClient)
     async -> (closed: Int, failed: Int) {
     let descriptor = FetchDescriptor<JournalEntry>()
     guard let all = try? context.fetch(descriptor) else { return (0, 0) }
     let open = all.filter { $0.status == "OPEN" }
-    var closed = 0
-    var failed = 0
+    var closed = 0; var failed = 0
 
     for entry in open {
       guard let info = try? await client.gameInfo(entry.gameID) else {
         failed += 1; continue
       }
-      guard let data = info.object?["data"]?.object,
-            let game = data["game"]?.object,
-            let hFT = number(game, ["homeFTResult", "homeResult"]),
+      // /Games/{id} → {data: {game: {...}}} либо {data: {...}}
+      let data = info.object?["data"]?.object ?? info.object ?? [:]
+      let game = data["game"]?.object ?? data
+
+      guard let hFT = number(game, ["homeFTResult", "homeResult"]),
             let aFT = number(game, ["awayFTResult", "awayResult"])
       else { continue }
 
@@ -1125,10 +1011,8 @@ enum JournalService {
           awayTeamID: aID, awayName: entry.away,
           homeGoals: hFT, awayGoals: aFT)
       }
-
-      try? await Task.sleep(for: .milliseconds(120))
+      try? await Task.sleep(for: .milliseconds(300))
     }
-
     try? context.save()
     return (closed, failed)
   }
@@ -1174,15 +1058,17 @@ enum JournalService {
 
     for mv in oddsArr {
       guard let m = mv.object else { continue }
+      let marketId = m["marketId"]?.number.map { Int($0) }
       let marketName = (m["marketName"]?.string ?? "").lowercased()
-      let normalized = normalizeMarket(marketName)
+      let normalized = normalizeMarketByIDAndName(marketId, marketName)
       guard normalized == targetMarket else { continue }
       guard let prices = m["odds"]?.array else { continue }
 
       for pv in prices {
         guard let p = pv.object,
               let selName = p["name"]?.string?.lowercased(),
-              let value = number(p, ["value", "odds", "price"]), value > 1
+              let value = number(p, ["value", "odds", "price"]),
+              value > 1
         else { continue }
         if let line = targetLine {
           if !containsLine(selName, line: line) { continue }
@@ -1201,28 +1087,34 @@ enum JournalService {
     return nil
   }
 
+  private static func normalizeMarketByIDAndName(_ id: Int?, _ name: String) -> String {
+    if let id {
+      switch id {
+      case 1: return "1X2"
+      case 5, 16, 17: return "GOALS"
+      default: return ""
+      }
+    }
+    if name.contains("corner") { return "CORNERS" }
+    if name.contains("card") || name.contains("yellow") { return "CARDS" }
+    if name.contains("goal") || name.contains("total")
+        || name.contains("over") || name.contains("under") { return "GOALS" }
+    if name.contains("1x2") || name.contains("winner") { return "1X2" }
+    return ""
+  }
+
   private static func extractTeamIDs(from game: [String: JSONValue])
     -> (home: String?, away: String?) {
     func extract(_ side: String) -> String? {
-      if let s = game[side + "TeamId"]?.string, !s.isEmpty { return s }
-      if let s = game[side + "TeamID"]?.string, !s.isEmpty { return s }
-      if let n = game[side + "TeamId"]?.number { return String(Int(n)) }
       if let t = game[side + "Team"]?.object {
-        if let s = t["id"]?.string, !s.isEmpty { return s }
         if let n = t["id"]?.number { return String(Int(n)) }
+        if let s = t["id"]?.string, !s.isEmpty { return s }
       }
+      if let s = game[side + "TeamId"]?.string, !s.isEmpty { return s }
+      if let n = game[side + "TeamId"]?.number { return String(Int(n)) }
       return nil
     }
     return (extract("home"), extract("away"))
-  }
-
-  private static func normalizeMarket(_ s: String) -> String {
-    if s.contains("corner") { return "CORNERS" }
-    if s.contains("card") || s.contains("yellow") { return "CARDS" }
-    if s.contains("goal") || s.contains("total")
-        || s.contains("over") || s.contains("under") { return "GOALS" }
-    if s.contains("1x2") || s.contains("winner") { return "1X2" }
-    return ""
   }
 
   private static func containsLine(_ s: String, line: Double) -> Bool {
@@ -1249,7 +1141,7 @@ final class AppDependencies {
   private init() {}
 }
 
-// MARK: - BacktestService
+// MARK: - BacktestService (с пагинацией)
 
 @MainActor
 final class BacktestService {
@@ -1258,8 +1150,9 @@ final class BacktestService {
 
   static let yearsBack = 2
   static let monthsPerYear = 12
-  static let oddsFetchCap = 500
-  static let gamesPerRequest = 2000
+  static let gamesPerRequest = 1000     // API max
+  static let maxPagesPerMonth = 20      // предохранитель
+  static let oddsFetchCap = 1500
 
   private var isBuilding = false
 
@@ -1321,25 +1214,46 @@ final class BacktestService {
       guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
       let periodEnd = min(nextMonth, toDate)
       let monthProgress = Double(monthIndex) / Double(totalMonths) * 0.70
-      progress(monthProgress, "Сбор \(monthIndex + 1)/\(totalMonths)")
+      progress(monthProgress,
+               "Сбор \(monthIndex + 1)/\(totalMonths) · матчей: \(allMatches.count)")
 
-      do {
-        let json = try await client.listGamesRange(
-          from: cursor, to: periodEnd, limit: Self.gamesPerRequest)
+      // ПАГИНАЦИЯ: API отдаёт максимум 1000 за раз
+      var monthItems: [JSONValue] = []
+      var pageOffset = 0
+      var pageCount = 0
+
+      while pageCount < Self.maxPagesPerMonth {
+        do {
+          let r = try await client.listGamesRange(
+            from: cursor, to: periodEnd,
+            limit: Self.gamesPerRequest, offset: pageOffset)
+          let items = r.object?["data"]?.array ?? []
+          if items.isEmpty { break }
+          monthItems.append(contentsOf: items)
+          pageOffset += Self.gamesPerRequest
+          pageCount += 1
+          if items.count < Self.gamesPerRequest { break }
+          try? await Task.sleep(for: .milliseconds(700))
+        } catch {
+          print("[BT] month \(monthIndex) page \(pageCount) error: \(error.localizedDescription)")
+          break
+        }
+      }
+
+      if !monthItems.isEmpty {
+        let json = JSONValue.object(["data": .array(monthItems)])
         let monthMatches = engine.matches(from: json)
           .filter { !Self.isExcluded($0) }
           .filter { Self.isInPool($0.league) }
           .filter { $0.homeFT != nil && $0.awayFT != nil }
           .filter { m in
             if seenIDs.contains(m.id) { return false }
-            seenIDs.insert(m.id)
-            return true
+            seenIDs.insert(m.id); return true
           }
         allMatches.append(contentsOf: monthMatches)
         let records = engine.allRecords(from: json)
         for (k, v) in records { allHistories[k, default: []].append(contentsOf: v) }
-      } catch {
-        print("[BT] month \(monthIndex) failed: \(error.localizedDescription)")
+        print("[BT] month \(monthIndex): pages=\(pageCount), raw=\(monthItems.count), filtered=\(monthMatches.count), total=\(allMatches.count)")
       }
 
       cursor = nextMonth
@@ -1365,7 +1279,10 @@ final class BacktestService {
       var mm = m
       if let nid = mm.numericID {
         if let o = try? await client.odds(numericID: nid) {
-          mm.oddsJSON = o.object?["data"]
+          // /Games/{id} → {data: {..., odds: [...]}}
+          let data = o.object?["data"]?.object ?? o.object ?? [:]
+          let game = data["game"]?.object ?? data
+          mm.oddsJSON = game["odds"] ?? data["odds"]
         }
         if i % 20 == 0 {
           let p = 0.70 + (Double(i) / Double(max(cap, 1))) * 0.15
@@ -1378,9 +1295,9 @@ final class BacktestService {
 
     guard !prepared.isEmpty else {
       snapshot.buildStatus = "failed"
-      snapshot.lastError = "Нет матчей с odds"
+      snapshot.lastError = "Нет матчей с odds (матчей: \(allMatches.count), историй: \(allHistories.count))"
       try? context.save()
-      progress(0, "Нет матчей с odds")
+      progress(0, "Нет матчей с odds (собрано: \(allMatches.count))")
       return false
     }
 
@@ -1455,98 +1372,111 @@ final class BacktestService {
     let fromDate = lastTo
     let toDate = Date()
 
-    do {
-      let json = try await client.listGamesRange(
-        from: fromDate, to: toDate, limit: Self.gamesPerRequest)
-
-      let newMatches = engine.matches(from: json)
-        .filter { !Self.isExcluded($0) }
-        .filter { Self.isInPool($0.league) }
-        .filter { $0.homeFT != nil && $0.awayFT != nil }
-
-      var prepared: [Match] = []
-      for m in newMatches {
-        var mm = m
-        if mm.oddsJSON?.array?.isEmpty != false, let nid = mm.numericID {
-          if let o = try? await client.odds(numericID: nid) {
-            mm.oddsJSON = o.object?["data"]
-          }
-          try? await Task.sleep(for: .milliseconds(400))
-        }
-        if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
-      }
-
-      guard !prepared.isEmpty else {
-        print("[BT] updateIncremental: нет новых матчей с odds")
-        snapshot.toDate = toDate
-        try? context.save()
-        return true
-      }
-
-      let records = engine.allRecords(from: json)
-      var sortedRecords = records
-      for (k, v) in sortedRecords {
-        sortedRecords[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
-      }
-
-      let delta = backtester.run(matches: prepared, histories: sortedRecords)
-      let encoder = JSONEncoder()
-
-      let oldLeagues = snapshot.decodedLeagueStats()
-      let oldMarkets = snapshot.decodedMarketStats()
-      let oldEV = snapshot.decodedEVBuckets()
-      let oldOdds = snapshot.decodedOddsBuckets()
-      let oldClass = snapshot.decodedClassification()
-
-      let newLeagues = Self.mergeSegmentDict(
-        oldLeagues, delta.perLeague.mapValues { Self.toStored($0) })
-      let newMarkets = Self.mergeSegmentDict(
-        oldMarkets, delta.perMarket.mapValues { Self.toStored($0) })
-      let newEV = Self.mergeSegmentDict(
-        oldEV, delta.byEVBucket.mapValues { Self.toStored($0) })
-      let newOdds = Self.mergeSegmentDict(
-        oldOdds, delta.byOddsBand.mapValues { Self.toStored($0) })
-      let newClass = Self.mergeSegmentDict(
-        oldClass, delta.byClassification.mapValues { Self.toStored($0) })
-
-      snapshot.perLeagueJSON = try? encoder.encode(newLeagues)
-      snapshot.perMarketJSON = try? encoder.encode(newMarkets)
-      snapshot.evBucketsJSON = try? encoder.encode(newEV)
-      snapshot.oddsBucketsJSON = try? encoder.encode(newOdds)
-      snapshot.classificationJSON = try? encoder.encode(newClass)
-
-      let oldPosterior = snapshot.decodedPosteriorBuckets()
-      let newPosterior = Self.mergePosterior(
-        old: oldPosterior,
-        delta: Self.buildPosteriorBuckets(from: delta.betRecords))
-      snapshot.posteriorJSON = try? encoder.encode(newPosterior)
-
-      snapshot.totalMatches += delta.matches
-      snapshot.totalBets += delta.bets
-      snapshot.toDate = toDate
-      snapshot.builtAt = Date()
-      try? context.save()
-
-      print("[BT] updateIncremental: +\(delta.bets) ставок, +\(delta.matches) матчей")
-      return true
-    } catch {
-      print("[BT] updateIncremental failed: \(error.localizedDescription)")
-      return false
+    // Пагинация
+    var monthItems: [JSONValue] = []
+    var pageOffset = 0
+    var pageCount = 0
+    while pageCount < Self.maxPagesPerMonth {
+      do {
+        let r = try await client.listGamesRange(
+          from: fromDate, to: toDate,
+          limit: Self.gamesPerRequest, offset: pageOffset)
+        let items = r.object?["data"]?.array ?? []
+        if items.isEmpty { break }
+        monthItems.append(contentsOf: items)
+        pageOffset += Self.gamesPerRequest
+        pageCount += 1
+        if items.count < Self.gamesPerRequest { break }
+        try? await Task.sleep(for: .milliseconds(700))
+      } catch { break }
     }
+
+    guard !monthItems.isEmpty else {
+      snapshot.toDate = toDate
+      try? context.save()
+      return true
+    }
+
+    let json = JSONValue.object(["data": .array(monthItems)])
+    let newMatches = engine.matches(from: json)
+      .filter { !Self.isExcluded($0) }
+      .filter { Self.isInPool($0.league) }
+      .filter { $0.homeFT != nil && $0.awayFT != nil }
+
+    var prepared: [Match] = []
+    for m in newMatches {
+      var mm = m
+      if mm.oddsJSON?.array?.isEmpty != false, let nid = mm.numericID {
+        if let o = try? await client.odds(numericID: nid) {
+          let data = o.object?["data"]?.object ?? o.object ?? [:]
+          let game = data["game"]?.object ?? data
+          mm.oddsJSON = game["odds"] ?? data["odds"]
+        }
+        try? await Task.sleep(for: .milliseconds(400))
+      }
+      if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
+    }
+
+    guard !prepared.isEmpty else {
+      snapshot.toDate = toDate
+      try? context.save()
+      return true
+    }
+
+    let records = engine.allRecords(from: json)
+    var sortedRecords = records
+    for (k, v) in sortedRecords {
+      sortedRecords[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+    }
+
+    let delta = backtester.run(matches: prepared, histories: sortedRecords)
+    let encoder = JSONEncoder()
+
+    let newLeagues = Self.mergeSegmentDict(
+      snapshot.decodedLeagueStats(), delta.perLeague.mapValues { Self.toStored($0) })
+    let newMarkets = Self.mergeSegmentDict(
+      snapshot.decodedMarketStats(), delta.perMarket.mapValues { Self.toStored($0) })
+    let newEV = Self.mergeSegmentDict(
+      snapshot.decodedEVBuckets(), delta.byEVBucket.mapValues { Self.toStored($0) })
+    let newOdds = Self.mergeSegmentDict(
+      snapshot.decodedOddsBuckets(), delta.byOddsBand.mapValues { Self.toStored($0) })
+    let newClass = Self.mergeSegmentDict(
+      snapshot.decodedClassification(), delta.byClassification.mapValues { Self.toStored($0) })
+
+    snapshot.perLeagueJSON = try? encoder.encode(newLeagues)
+    snapshot.perMarketJSON = try? encoder.encode(newMarkets)
+    snapshot.evBucketsJSON = try? encoder.encode(newEV)
+    snapshot.oddsBucketsJSON = try? encoder.encode(newOdds)
+    snapshot.classificationJSON = try? encoder.encode(newClass)
+
+    let oldPosterior = snapshot.decodedPosteriorBuckets()
+    let newPosterior = Self.mergePosterior(
+      old: oldPosterior,
+      delta: Self.buildPosteriorBuckets(from: delta.betRecords))
+    snapshot.posteriorJSON = try? encoder.encode(newPosterior)
+
+    snapshot.totalMatches += delta.matches
+    snapshot.totalBets += delta.bets
+    snapshot.toDate = toDate
+    snapshot.builtAt = Date()
+    try? context.save()
+
+    print("[BT] updateIncremental: +\(delta.bets) ставок, +\(delta.matches) матчей")
+    return true
   }
 
   static func fetchOrCreate(in context: ModelContext) -> BacktestSnapshot {
     let d = FetchDescriptor<BacktestSnapshot>()
     if let existing = try? context.fetch(d).first { return existing }
     let snap = BacktestSnapshot()
-    context.insert(snap)
-    try? context.save()
+    context.insert(snap); try? context.save()
     return snap
   }
 
   static func toStored(_ s: SegmentStats) -> StoredSegmentStats {
-    StoredSegmentStats(bets: s.bets, wins: s.wins, losses: s.losses, pushes: s.pushes,
-                       profit: s.profit, staked: s.staked, avgOdds: s.avgOdds)
+    StoredSegmentStats(bets: s.bets, wins: s.wins, losses: s.losses,
+                       pushes: s.pushes, profit: s.profit, staked: s.staked,
+                       avgOdds: s.avgOdds)
   }
 
   static func mergeSegmentDict(
@@ -1562,16 +1492,16 @@ final class BacktestService {
   }
 
   static func merge(_ a: StoredSegmentStats, _ b: StoredSegmentStats) -> StoredSegmentStats {
-    let newBets = a.bets + b.bets
-    let newWins = a.wins + b.wins
-    let newLosses = a.losses + b.losses
-    let newPushes = a.pushes + b.pushes
-    let newProfit = a.profit + b.profit
-    let newStaked = a.staked + b.staked
+    let nb = a.bets + b.bets
+    let nw = a.wins + b.wins
+    let nl = a.losses + b.losses
+    let np = a.pushes + b.pushes
+    let npr = a.profit + b.profit
+    let ns = a.staked + b.staked
     let oddsSum = a.avgOdds * Double(a.bets) + b.avgOdds * Double(b.bets)
-    let newAvgOdds = newBets > 0 ? oddsSum / Double(newBets) : 0
-    return StoredSegmentStats(bets: newBets, wins: newWins, losses: newLosses,
-      pushes: newPushes, profit: newProfit, staked: newStaked, avgOdds: newAvgOdds)
+    let navg = nb > 0 ? oddsSum / Double(nb) : 0
+    return StoredSegmentStats(bets: nb, wins: nw, losses: nl, pushes: np,
+                              profit: npr, staked: ns, avgOdds: navg)
   }
 
   static func buildPosteriorBuckets(from bets: [BetRecord]) -> [PosteriorBucket] {
@@ -1586,7 +1516,7 @@ final class BacktestService {
       let n = inBucket.count
       let hitRate = n > 0 ? inBucket.reduce(0.0) { $0 + $1.actual } / Double(n) : 0
       buckets.append(PosteriorBucket(probabilityLow: lo, probabilityHigh: hi,
-        n: n, factHitRate: hitRate))
+                                     n: n, factHitRate: hitRate))
     }
     return buckets
   }
@@ -1596,16 +1526,17 @@ final class BacktestService {
     var out: [PosteriorBucket] = []
     for i in 0..<max(old.count, delta.count) {
       let o = i < old.count ? old[i] : PosteriorBucket(
-        probabilityLow: Double(i) / 10.0,
-        probabilityHigh: Double(i + 1) / 10.0, n: 0, factHitRate: 0)
+        probabilityLow: Double(i) / 10.0, probabilityHigh: Double(i + 1) / 10.0,
+        n: 0, factHitRate: 0)
       let d = i < delta.count ? delta[i] : PosteriorBucket(
-        probabilityLow: Double(i) / 10.0,
-        probabilityHigh: Double(i + 1) / 10.0, n: 0, factHitRate: 0)
-      let newN = o.n + d.n
-      let weightedSum = o.factHitRate * Double(o.n) + d.factHitRate * Double(d.n)
-      let newHit = newN > 0 ? weightedSum / Double(newN) : 0
+        probabilityLow: Double(i) / 10.0, probabilityHigh: Double(i + 1) / 10.0,
+        n: 0, factHitRate: 0)
+      let nN = o.n + d.n
+      let ws = o.factHitRate * Double(o.n) + d.factHitRate * Double(d.n)
+      let nh = nN > 0 ? ws / Double(nN) : 0
       out.append(PosteriorBucket(probabilityLow: o.probabilityLow,
-        probabilityHigh: o.probabilityHigh, n: newN, factHitRate: newHit))
+                                 probabilityHigh: o.probabilityHigh,
+                                 n: nN, factHitRate: nh))
     }
     return out
   }
@@ -1617,7 +1548,9 @@ final class BacktestService {
   }
 
   private static func isInPool(_ league: String) -> Bool {
-    LeaguePool.pool.contains { lg in league.localizedCaseInsensitiveContains(lg.name) }
+    LeaguePool.pool.contains { lg in
+      league.localizedCaseInsensitiveContains(lg.name)
+    }
   }
 }
 
@@ -1650,7 +1583,6 @@ final class ScanCoordinator {
     defer { isScanning = false }
 
     var summary = ScanSummary()
-
     let resolvedSettings: AppSettings = settings ?? AppSettings()
     let key = resolvedSettings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !key.isEmpty else {
@@ -1698,14 +1630,21 @@ final class ScanCoordinator {
       let client = SStatsClient(settings: resolvedSettings)
       let engine = QuantEngine()
 
+      // Сканируем сегодняшние матчи. Оставляем upcoming (status=2) и live (3-5).
       var all = engine.matches(from: try await client.listToday())
         .filter { !Self.isExcluded($0) }
+        .filter { m in
+          guard let st = m.status else { return true }
+          return st == 2 || st == 3 || st == 4 || st == 5
+        }
       summary.skippedExcluded = all.count
+      summary.notes.append("Всего матчей сегодня: \(all.count)")
 
       if selectedLeague != "Все" {
         all = all.filter { $0.league.localizedCaseInsensitiveContains(selectedLeague) }
       }
       let matches = all.prefix(resolvedSettings.scanMatches)
+      summary.notes.append("К обработке: \(matches.count)")
 
       let posteriorBuckets: [PosteriorBucket] = tuning.posteriorEnabled
         ? Self.loadPosteriorBuckets() : []
@@ -1713,10 +1652,9 @@ final class ScanCoordinator {
       if usableBuckets > 0 { summary.notes.append("Posterior: \(usableBuckets) надёжных бакетов") }
 
       let excludedRules: [AutoExcludeRule] = tuning.autoExcludeEnabled
-        ? Self.loadExcludedRules(minROI: tuning.autoExcludeMinROI, minBets: tuning.autoExcludeMinBets)
-        : []
+        ? Self.loadExcludedRules(minROI: tuning.autoExcludeMinROI,
+                                 minBets: tuning.autoExcludeMinBets) : []
       let excludedCount = excludedRules.filter { $0.excluded }.count
-
       let stopState: VolatilityState = tuning.stopLossEnabled ? streak.state : .normal
 
       var signalsOut: [BetSignal] = []
@@ -1725,15 +1663,26 @@ final class ScanCoordinator {
       for match in matches {
         guard let h = match.homeID, let a = match.awayID else { continue }
         count += 1
-        let hs = await client.fetchTeamHistory(teamID: h, count: resolvedSettings.historyMatches)
-        let awayRecords = await client.fetchTeamHistory(teamID: a, count: resolvedSettings.historyMatches)
+        let hs = await client.fetchTeamHistory(
+          teamID: h, count: resolvedSettings.historyMatches)
+        let awayRecords = await client.fetchTeamHistory(
+          teamID: a, count: resolvedSettings.historyMatches)
         guard let info = try? await client.gameInfo(match.id) else { continue }
-        var oddsFromInfo = info.object?["data"]?.object?["odds"] ?? match.oddsJSON ?? .array([])
+
+        // /Games/{id} → {data: {..., odds: [...]}} либо {data: {game: {...}}}
+        let data = info.object?["data"]?.object ?? info.object ?? [:]
+        let game = data["game"]?.object ?? data
+        var oddsFromInfo = game["odds"] ?? data["odds"]
+          ?? match.oddsJSON ?? .array([])
+
         if oddsFromInfo.array?.isEmpty != false, let nid = match.numericID {
           if let o = try? await client.odds(numericID: nid) {
-            oddsFromInfo = o.object?["data"] ?? oddsFromInfo
+            let d2 = o.object?["data"]?.object ?? o.object ?? [:]
+            let g2 = d2["game"]?.object ?? d2
+            oddsFromInfo = g2["odds"] ?? d2["odds"] ?? oddsFromInfo
           }
         }
+
         let glicko = try? await client.glicko(match.id)
 
         let ratings: (Double?, Double?) = {
@@ -1756,7 +1705,7 @@ final class ScanCoordinator {
           teamRatings: (home: ratings.0, away: ratings.1),
           upcomingLineups: lineups)
 
-        // Волна D (D2): sharp money из LiveMonitor.
+        // Sharp money из LiveMonitor
         s = s.map { sig in
           var x = sig
           let liveKey = "\(x.market)|\(x.selection.lowercased())|\(x.line.map { String($0) } ?? "")"
@@ -1778,20 +1727,14 @@ final class ScanCoordinator {
         signalsOut.append(contentsOf: s)
       }
       summary.lineupsFound = lineupsFound
-      if lineupsFound > 0 { summary.notes.append("Lineups: \(lineupsFound) матчей с составом") }
+      if lineupsFound > 0 { summary.notes.append("Lineups: \(lineupsFound)") }
 
       let filtered = signalsOut.filter { s in
         !AutoExclude.isExcluded(league: s.league, market: s.market, rules: excludedRules)
       }
       let removed = signalsOut.count - filtered.count
       if removed > 0 {
-        summary.notes.append("Auto-Exclude: убрано \(removed) из \(signalsOut.count) (правил: \(excludedCount))")
-      } else if excludedCount > 0 {
-        summary.notes.append("Auto-Exclude: правил \(excludedCount), попаданий 0")
-      }
-
-      if summary.correlationPairs > 0 && tuning.correlationEnabled {
-        summary.notes.append("Correlation: \(summary.correlationPairs) пар из журнала")
+        summary.notes.append("Auto-Exclude: убрано \(removed) из \(signalsOut.count)")
       }
 
       summary.scannedMatches = count
@@ -1802,6 +1745,7 @@ final class ScanCoordinator {
         bankroll: resolvedSettings.effectiveBankroll)
       summary.finishedAt = Date()
       summary.success = true
+      summary.notes.append("Сырых сигналов: \(signalsOut.count), в портфель: \(summary.signals.count)")
 
       if resolvedSettings.notifyBets && !summary.signals.isEmpty {
         await NotificationService.notify(signals: summary.signals)
@@ -1835,33 +1779,9 @@ final class ScanCoordinator {
   private static func parseUpcomingLineups(from info: JSONValue)
     -> (home: [String], away: [String])? {
     let data = info.object?["data"]?.object ?? info.object ?? [:]
-
     if let obj = data["lineups"]?.object {
-      let h = extractIDs(obj["home"]?.array ?? obj["homeTeam"]?.array ?? [])
-      let a = extractIDs(obj["away"]?.array ?? obj["awayTeam"]?.array ?? [])
-      if !h.isEmpty || !a.isEmpty { return (h, a) }
-    }
-
-    if let arr = data["lineups"]?.array, arr.count >= 2 {
-      let hTeamID = data["homeTeamId"]?.string ?? data["homeTeam"]?.object?["id"]?.string
-      var h: [String] = []
-      var a: [String] = []
-      for item in arr {
-        guard let obj = item.object else { continue }
-        let teamID = obj["teamId"]?.string ?? obj["team"]?.string
-        let players = extractIDs(obj["players"]?.array ?? obj["lineup"]?.array ?? [])
-        if let t = teamID, let hID = hTeamID, t == hID { h = players }
-        else if let t = teamID, let hID = hTeamID, t != hID { a = players }
-        else if h.isEmpty { h = players } else { a = players }
-      }
-      if !h.isEmpty || !a.isEmpty { return (h, a) }
-    }
-
-    let hArr = data["homeLineup"]?.array ?? data["homePlayers"]?.array ?? data["homeSquad"]?.array
-    let aArr = data["awayLineup"]?.array ?? data["awayPlayers"]?.array ?? data["awaySquad"]?.array
-    if hArr != nil || aArr != nil {
-      let h = extractIDs(hArr ?? [])
-      let a = extractIDs(aArr ?? [])
+      let h = extractIDs(obj["home"]?.array ?? [])
+      let a = extractIDs(obj["away"]?.array ?? [])
       if !h.isEmpty || !a.isEmpty { return (h, a) }
     }
     return nil
@@ -1892,9 +1812,7 @@ enum OddsFormat: String, CaseIterable, Identifiable {
   case eu, us, uk
   var id: String { rawValue }
   var label: String {
-    switch self {
-    case .eu: return "EU"; case .us: return "US"; case .uk: return "UK"
-    }
+    switch self { case .eu: return "EU"; case .us: return "US"; case .uk: return "UK" }
   }
   var hint: String {
     switch self {
@@ -1909,18 +1827,10 @@ enum AppColorScheme: String, CaseIterable, Identifiable {
   case system, light, dark
   var id: String { rawValue }
   var label: String {
-    switch self {
-    case .system: return "Система"
-    case .light: return "Светлая"
-    case .dark: return "Тёмная"
-    }
+    switch self { case .system: return "Система"; case .light: return "Светлая"; case .dark: return "Тёмная" }
   }
   var toColorScheme: SwiftUI.ColorScheme? {
-    switch self {
-    case .system: return nil
-    case .light: return .light
-    case .dark: return .dark
-    }
+    switch self { case .system: return nil; case .light: return .light; case .dark: return .dark }
   }
 }
 
@@ -1937,7 +1847,6 @@ enum OddsFormatter {
       return "\(frac.0)/\(frac.1)"
     }
   }
-
   private static func fractional(_ value: Double) -> (Int, Int) {
     let net = value - 1.0
     guard net > 0 else { return (0, 1) }
@@ -1960,87 +1869,65 @@ extension Notification.Name {
   static let openSignal = Notification.Name("com.syndicatequant.openSignal")
 }
 
-struct SignalIDWrapper: Identifiable {
-  let id: String
-}
+struct SignalIDWrapper: Identifiable { let id: String }
 
-// MARK: - Live odds monitor
+// MARK: - Live monitor (сохранён для совместимости с D1/D2)
 
 struct OddsSnapshot: Hashable {
-  let gameID: String
-  let numericID: Int?
-  let takenAt: Date
+  let gameID: String; let numericID: Int?; let takenAt: Date
   let byKey: [String: [String: Double]]
-
   func avg(forKey k: String) -> Double? {
     guard let map = byKey[k], !map.isEmpty else { return nil }
     let values = Array(map.values)
     return values.reduce(0, +) / Double(values.count)
   }
-
   func median(forKey k: String) -> Double? {
     guard let map = byKey[k], !map.isEmpty else { return nil }
     return QuantMath.median(Array(map.values))
   }
-
   func booksMoving(forKey k: String, vs previous: OddsSnapshot, threshold: Double)
     -> (count: Int, direction: Int, avgDelta: Double) {
     guard let cur = byKey[k], let prev = previous.byKey[k] else { return (0, 0, 0) }
-    var upCount = 0; var downCount = 0
-    var deltaSum = 0.0; var n = 0
+    var up = 0; var down = 0; var deltaSum = 0.0; var n = 0
     for (book, c) in cur {
       guard let p = prev[book], p > 1, c > 1 else { continue }
       let d = (c - p) / p
-      if d > threshold { upCount += 1 } else if d < -threshold { downCount += 1 }
+      if d > threshold { up += 1 } else if d < -threshold { down += 1 }
       deltaSum += d; n += 1
     }
-    if upCount > downCount { return (upCount, +1, n > 0 ? deltaSum / Double(n) : 0) }
-    else if downCount > upCount { return (downCount, -1, n > 0 ? deltaSum / Double(n) : 0) }
+    if up > down { return (up, +1, n > 0 ? deltaSum / Double(n) : 0) }
+    else if down > up { return (down, -1, n > 0 ? deltaSum / Double(n) : 0) }
     return (0, 0, 0)
   }
 }
 
 struct LineMovement: Identifiable, Hashable {
   var id: String { key }
-  let key: String
-  let market: String
-  let selection: String
-  let line: Double?
-  let previousAvg: Double
-  let currentAvg: Double
-  let delta: Double
-  let booksAgreeing: Int
-  let isSharp: Bool
-
+  let key: String; let market: String; let selection: String; let line: Double?
+  let previousAvg: Double; let currentAvg: Double; let delta: Double
+  let booksAgreeing: Int; let isSharp: Bool
   var direction: String { delta > 0 ? "▲" : (delta < 0 ? "▼" : "·") }
 }
 
 @MainActor
 final class LiveMonitor: ObservableObject {
   static let shared = LiveMonitor()
-
   @Published private(set) var snapshots: [String: OddsSnapshot] = [:]
   private var previous: [String: OddsSnapshot] = [:]
   @Published private(set) var movements: [LineMovement] = []
   @Published private(set) var isRunning: Bool = false
   @Published private(set) var lastTick: Date?
   @Published private(set) var lastError: String?
-
   private var observed: [String: Int?] = [:]
   private var task: Task<Void, Never>?
-
   private init() {}
 
   func observe(gameID: String, numericID: Int?) { observed[gameID] = numericID }
-
   func clearObserved() {
     observed.removeAll(); snapshots.removeAll()
     previous.removeAll(); movements.removeAll()
   }
-
-  func previousSnapshotForDebug(matchID: String) -> OddsSnapshot? {
-    return previous[matchID]
-  }
+  func previousSnapshotForDebug(matchID: String) -> OddsSnapshot? { return previous[matchID] }
 
   func start(settings: AppSettings) {
     guard settings.liveMonitorEnabled else { return }
@@ -2048,7 +1935,6 @@ final class LiveMonitor: ObservableObject {
     isRunning = true
     lastError = nil
     let interval = max(30, min(300, settings.liveMonitorIntervalSec))
-
     task = Task { [weak self] in
       await self?.tick(settings: settings)
       while !Task.isCancelled {
@@ -2072,11 +1958,7 @@ final class LiveMonitor: ObservableObject {
 
     for (gameID, numericID) in observed {
       guard let nid = numericID else { continue }
-      var json: JSONValue?
-      if let live = try? await client.oddsLive(numericID: nid) { json = live }
-      if json == nil { json = try? await client.odds(numericID: nid) }
-      guard let raw = json else { continue }
-
+      guard let raw = try? await client.odds(numericID: nid) else { continue }
       let parsed = Self.parseOddsByBook(raw)
       guard !parsed.isEmpty else { continue }
 
@@ -2089,22 +1971,18 @@ final class LiveMonitor: ObservableObject {
           let market = parts.first ?? ""
           let selection = parts.count > 1 ? parts[1] : ""
           let line: Double? = parts.count > 2 ? Double(parts[2]) : nil
-
           guard let prevAvg = prev.avg(forKey: k),
                 let curAvg = snap.avg(forKey: k),
                 prevAvg > 1, curAvg > 1 else { continue }
-
           let delta = (curAvg - prevAvg) / prevAvg
           let moving = snap.booksMoving(forKey: k, vs: prev, threshold: 0.01)
           let isSharp = moving.count >= 3 && abs(delta) > 0.02
-
           newMovements.append(LineMovement(
             key: k, market: market, selection: selection, line: line,
             previousAvg: prevAvg, currentAvg: curAvg,
             delta: delta, booksAgreeing: moving.count, isSharp: isSharp))
         }
       }
-
       previous[gameID] = snap
       newSnapshots[gameID] = snap
     }
@@ -2112,54 +1990,59 @@ final class LiveMonitor: ObservableObject {
     self.snapshots = newSnapshots
     self.movements = newMovements.sorted { abs($0.delta) > abs($1.delta) }
     self.lastTick = Date()
-    if newSnapshots.isEmpty {
-      self.lastError = observed.isEmpty ? "Нет активных матчей" : "Не удалось получить котировки"
-    } else { self.lastError = nil }
+    self.lastError = newSnapshots.isEmpty
+      ? (observed.isEmpty ? "Нет активных матчей" : "Не удалось получить котировки") : nil
   }
 
   static func parseOddsByBook(_ json: JSONValue) -> [String: [String: Double]] {
     var out: [String: [String: Double]] = [:]
+    let data = json.object?["data"]?.object ?? json.object ?? [:]
+    let game = data["game"]?.object ?? data
     let items: [JSONValue] = {
+      if let arr = game["odds"]?.array { return arr }
+      if let arr = data["odds"]?.array { return arr }
       if let arr = json.array { return arr }
-      if let dataArr = json.object?["data"]?.array { return dataArr }
-      return json.allObjects().map { .object($0) }
+      return []
     }()
 
     for mv in items {
       guard let m = mv.object else { continue }
-      let marketName = (m["marketName"]?.string ?? m["market"]?.string ?? m["market_name"]?.string ?? "").lowercased()
+      let marketId = m["marketId"]?.number.map { Int($0) }
+      let marketName = (m["marketName"]?.string ?? "").lowercased()
       guard let prices = m["odds"]?.array else { continue }
       for pv in prices {
         guard let p = pv.object else { continue }
         guard let value = numberFrom(p, ["value", "odds", "price"]),
               value > 1, value < 1000 else { continue }
-        let selName = (p["name"]?.string ?? p["selection"]?.string ?? p["outcome"]?.string ?? "")
-        let market = normalizeLiveMarket(marketName + " " + selName)
+        let selName = (p["name"]?.string ?? "")
+        let market = normalizeLiveMarket(marketId, marketName, selName)
         guard !market.isEmpty else { continue }
         let line = extractLineFrom(selName) ?? extractLineFrom(marketName)
-        let book = (p["bookmaker"]?.string ?? p["bookmakerName"]?.string
-          ?? p["bookie"]?.string ?? p["bk"]?.string
-          ?? m["bookmaker"]?.string ?? m["bookmakerName"]?.string ?? "sstats").lowercased()
-
+        let book = "sstats"
         let key = "\(market)|\(selName.lowercased())|\(line.map { String($0) } ?? "")"
         var byBook = out[key] ?? [:]
-        if let existing = byBook[book] { byBook[book] = max(existing, value) }
-        else { byBook[book] = value }
+        byBook[book] = max(byBook[book] ?? 0, value)
         out[key] = byBook
       }
     }
     return out
   }
 
-  private static func normalizeLiveMarket(_ x: String) -> String {
-    let s = x.lowercased()
+  private static func normalizeLiveMarket(_ id: Int?, _ name: String, _ sel: String) -> String {
+    if let id {
+      switch id {
+      case 1: return "1X2"
+      case 5, 16, 17: return "GOALS"
+      default: break
+      }
+    }
+    let s = (name + " " + sel).lowercased()
     if s.contains("corner") { return "CORNERS" }
     if s.contains("card") || s.contains("yellow") { return "CARDS" }
     if s.contains("goal") || s.contains("total")
         || s.contains("over") || s.contains("under") { return "GOALS" }
-    let trimmed = s.trimmingCharacters(in: .whitespaces)
-    if s.contains("1x2") || s.contains("winner") || s.contains("home")
-        || trimmed == "1" || trimmed == "x" || trimmed == "2" { return "1X2" }
+    if s.contains("1x2") || s.contains("winner")
+        || s.contains("home") || s.contains("draw") || s.contains("away") { return "1X2" }
     return ""
   }
 
