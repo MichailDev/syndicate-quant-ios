@@ -1290,6 +1290,10 @@ struct SignalCard: View {
           Text("PLR").foregroundStyle(.orange)
         }
         if signal.sharpMoney == true { Text("SHARP").foregroundStyle(.purple) }
+        if let v = signal.modelVote {
+          Text("VOTE \(v)/4")
+            .foregroundStyle(v >= 3 ? .green : (v == 2 ? .orange : .red))
+        }
       }
       .font(.caption2).foregroundStyle(.secondary)
     }
@@ -1416,25 +1420,22 @@ struct SignalDetailView: View {
         }
       }
 
-      if let lm = signal.liveMovement {
-        Section("Live movement (D1)") {
-          LabeledContent("Средняя цена",
-                         value: String(format: "%+.2f%%", lm * 100))
-            .foregroundStyle(lm < 0 ? .green : .red)
-          if signal.sharpMoney == true, let sm = signal.sharpMovement {
-            HStack {
-              Text("Sharp money")
-              Spacer()
-              Text(String(format: "да · %+.2f%%", sm * 100))
-                .foregroundStyle(.purple)
-                .font(.subheadline.bold())
-            }
-            Text("≥3 книги одновременно двигают линию в одну сторону.")
-              .font(.caption2).foregroundStyle(.secondary)
-          } else {
-            Text("Движение односторонним не признано")
-              .font(.caption2).foregroundStyle(.secondary)
+      if let vote = signal.modelVote {
+        Section("Voting (D3)") {
+          HStack {
+            Text("Согласие моделей")
+            Spacer()
+            Text("\(vote)/4")
+              .font(.subheadline.bold())
+              .foregroundStyle(vote >= 3 ? .green : (vote == 2 ? .orange : .red))
           }
+          if let detail = signal.modelVoteDetail, !detail.isEmpty {
+            Text(detail)
+              .font(.caption2.monospaced())
+              .foregroundStyle(.secondary)
+          }
+          Text("S BET требует 4/4, A BET — 3/4. Голос = p(model) > p(market) + 1%.")
+            .font(.caption2).foregroundStyle(.tertiary)
         }
       }
 
