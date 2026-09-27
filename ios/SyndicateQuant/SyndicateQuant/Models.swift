@@ -716,102 +716,54 @@ enum TuningService {
 
     let cfg = fetchOrCreate(in: context)
     switch last.target {
-    case "posteriorWeight":
-      cfg.posteriorWeight = Double(last.beforeValue) ?? cfg.posteriorWeight
-    case "autoExcludeMinROI":
-      cfg.autoExcludeMinROI = Double(last.beforeValue) ?? cfg.autoExcludeMinROI
-    case "autoExcludeMinBets":
-      cfg.autoExcludeMinBets = Int(last.beforeValue) ?? cfg.autoExcludeMinBets
-    case "stopLossCapStreak":
-      cfg.stopLossCapStreak = Int(last.beforeValue) ?? cfg.stopLossCapStreak
-    case "stopLossPauseStreak":
-      cfg.stopLossPauseStreak = Int(last.beforeValue) ?? cfg.stopLossPauseStreak
-    case "autoExcludeEnabled":
-      cfg.autoExcludeEnabled = Bool(last.beforeValue) ?? cfg.autoExcludeEnabled
-    case "posteriorEnabled":
-      cfg.posteriorEnabled = Bool(last.beforeValue) ?? cfg.posteriorEnabled
-    case "stopLossEnabled":
-      cfg.stopLossEnabled = Bool(last.beforeValue) ?? cfg.stopLossEnabled
-    case "correlationEnabled":
-      cfg.correlationEnabled = Bool(last.beforeValue) ?? cfg.correlationEnabled
-    case "playerImpactEnabled":
-      cfg.playerImpactEnabled = Bool(last.beforeValue) ?? cfg.playerImpactEnabled
-    case "teamRatingEnabled":
-      cfg.teamRatingEnabled = Bool(last.beforeValue) ?? cfg.teamRatingEnabled
-    case "cornersEnabled":
-      cfg.cornersEnabled = Bool(last.beforeValue) ?? cfg.cornersEnabled
-    case "cardsEnabled":
-      cfg.cardsEnabled = Bool(last.beforeValue) ?? cfg.cardsEnabled
-    case "cornersMinEV":
-      cfg.cornersMinEV = Double(last.beforeValue) ?? cfg.cornersMinEV
-    case "cardsMinEV":
-      cfg.cardsMinEV = Double(last.beforeValue) ?? cfg.cardsMinEV
-    case "cornersMinQCS":
-      cfg.cornersMinQCS = Double(last.beforeValue) ?? cfg.cornersMinQCS
-    case "cardsMinQCS":
-      cfg.cardsMinQCS = Double(last.beforeValue) ?? cfg.cardsMinQCS
-    case "cornersMaxStake":
-      cfg.cornersMaxStake = Double(last.beforeValue) ?? cfg.cornersMaxStake
-    case "cardsMaxStake":
-      cfg.cardsMaxStake = Double(last.beforeValue) ?? cfg.cardsMaxStake
-    case "cornersMinSample":
-      cfg.cornersMinSample = Int(last.beforeValue) ?? cfg.cornersMinSample
-    case "cardsMinSample":
-      cfg.cardsMinSample = Int(last.beforeValue) ?? cfg.cardsMinSample
-    case "goalsMinRobustEV":
-      cfg.goalsMinRobustEV = Double(last.beforeValue) ?? cfg.goalsMinRobustEV
-    case "goalsMinSample":
-      cfg.goalsMinSample = Int(last.beforeValue) ?? cfg.goalsMinSample
-    case "goalsMaxUncertainty":
-      cfg.goalsMaxUncertainty = Double(last.beforeValue) ?? cfg.goalsMaxUncertainty
-    case "cornersMinRobustEV":
-      cfg.cornersMinRobustEV = Double(last.beforeValue) ?? cfg.cornersMinRobustEV
-    case "cornersMinMSS":
-      cfg.cornersMinMSS = Double(last.beforeValue) ?? cfg.cornersMinMSS
-    case "cornersMaxUncertainty":
-      cfg.cornersMaxUncertainty = Double(last.beforeValue) ?? cfg.cornersMaxUncertainty
-    case "cardsMinRobustEV":
-      cfg.cardsMinRobustEV = Double(last.beforeValue) ?? cfg.cardsMinRobustEV
-    case "cardsMinMSS":
-      cfg.cardsMinMSS = Double(last.beforeValue) ?? cfg.cardsMinMSS
-    case "cardsMaxUncertainty":
-      cfg.cardsMaxUncertainty = Double(last.beforeValue) ?? cfg.cardsMaxUncertainty
-    case "oosGateEnabled":
-      cfg.oosGateEnabled = Bool(last.beforeValue) ?? cfg.oosGateEnabled
-    case "oosMinBets":
-      cfg.oosMinBets = Int(last.beforeValue) ?? cfg.oosMinBets
-    case "oosWindowDays":
-      cfg.oosWindowDays = Int(last.beforeValue) ?? cfg.oosWindowDays
-    case "goalsOOSMinROI":
-      cfg.goalsOOSMinROI = Double(last.beforeValue) ?? cfg.goalsOOSMinROI
-    case "cornersOOSMinROI":
-      cfg.cornersOOSMinROI = Double(last.beforeValue) ?? cfg.cornersOOSMinROI
-    case "cardsOOSMinROI":
-      cfg.cardsOOSMinROI = Double(last.beforeValue) ?? cfg.cardsOOSMinROI
-    case "cornersWeightRecentOwn":
-      cfg.cornersWeightRecentOwn = Double(last.beforeValue) ?? cfg.cornersWeightRecentOwn
-    case "cornersWeightRecentOpp":
-      cfg.cornersWeightRecentOpp = Double(last.beforeValue) ?? cfg.cornersWeightRecentOpp
-    case "cornersWeightLeague":
-      cfg.cornersWeightLeague = Double(last.beforeValue) ?? cfg.cornersWeightLeague
-    case "cornersWeightXG":
-      cfg.cornersWeightXG = Double(last.beforeValue) ?? cfg.cornersWeightXG
-    case "cornersWeightPossession":
-      cfg.cornersWeightPossession = Double(last.beforeValue) ?? cfg.cornersWeightPossession
-    case "cornersWeightH2H":
-      cfg.cornersWeightH2H = Double(last.beforeValue) ?? cfg.cornersWeightH2H
-    case "cardsWeightRecentOwn":
-      cfg.cardsWeightRecentOwn = Double(last.beforeValue) ?? cfg.cardsWeightRecentOwn
-    case "cardsWeightRecentOpp":
-      cfg.cardsWeightRecentOpp = Double(last.beforeValue) ?? cfg.cardsWeightRecentOpp
-    case "cardsWeightLeague":
-      cfg.cardsWeightLeague = Double(last.beforeValue) ?? cfg.cardsWeightLeague
-    case "cardsWeightFouls":
-      cfg.cardsWeightFouls = Double(last.beforeValue) ?? cfg.cardsWeightFouls
-    case "cardsWeightReferee":
-      cfg.cardsWeightReferee = Double(last.beforeValue) ?? cfg.cardsWeightReferee
-    case "cardsWeightH2H":
-      cfg.cardsWeightH2H = Double(last.beforeValue) ?? cfg.cardsWeightH2H
+    case "posteriorWeight": cfg.posteriorWeight = Double(last.beforeValue) ?? cfg.posteriorWeight
+    case "autoExcludeMinROI": cfg.autoExcludeMinROI = Double(last.beforeValue) ?? cfg.autoExcludeMinROI
+    case "autoExcludeMinBets": cfg.autoExcludeMinBets = Int(last.beforeValue) ?? cfg.autoExcludeMinBets
+    case "stopLossCapStreak": cfg.stopLossCapStreak = Int(last.beforeValue) ?? cfg.stopLossCapStreak
+    case "stopLossPauseStreak": cfg.stopLossPauseStreak = Int(last.beforeValue) ?? cfg.stopLossPauseStreak
+    case "autoExcludeEnabled": cfg.autoExcludeEnabled = Bool(last.beforeValue) ?? cfg.autoExcludeEnabled
+    case "posteriorEnabled": cfg.posteriorEnabled = Bool(last.beforeValue) ?? cfg.posteriorEnabled
+    case "stopLossEnabled": cfg.stopLossEnabled = Bool(last.beforeValue) ?? cfg.stopLossEnabled
+    case "correlationEnabled": cfg.correlationEnabled = Bool(last.beforeValue) ?? cfg.correlationEnabled
+    case "playerImpactEnabled": cfg.playerImpactEnabled = Bool(last.beforeValue) ?? cfg.playerImpactEnabled
+    case "teamRatingEnabled": cfg.teamRatingEnabled = Bool(last.beforeValue) ?? cfg.teamRatingEnabled
+    case "cornersEnabled": cfg.cornersEnabled = Bool(last.beforeValue) ?? cfg.cornersEnabled
+    case "cardsEnabled": cfg.cardsEnabled = Bool(last.beforeValue) ?? cfg.cardsEnabled
+    case "cornersMinEV": cfg.cornersMinEV = Double(last.beforeValue) ?? cfg.cornersMinEV
+    case "cardsMinEV": cfg.cardsMinEV = Double(last.beforeValue) ?? cfg.cardsMinEV
+    case "cornersMinQCS": cfg.cornersMinQCS = Double(last.beforeValue) ?? cfg.cornersMinQCS
+    case "cardsMinQCS": cfg.cardsMinQCS = Double(last.beforeValue) ?? cfg.cardsMinQCS
+    case "cornersMaxStake": cfg.cornersMaxStake = Double(last.beforeValue) ?? cfg.cornersMaxStake
+    case "cardsMaxStake": cfg.cardsMaxStake = Double(last.beforeValue) ?? cfg.cardsMaxStake
+    case "cornersMinSample": cfg.cornersMinSample = Int(last.beforeValue) ?? cfg.cornersMinSample
+    case "cardsMinSample": cfg.cardsMinSample = Int(last.beforeValue) ?? cfg.cardsMinSample
+    case "goalsMinRobustEV": cfg.goalsMinRobustEV = Double(last.beforeValue) ?? cfg.goalsMinRobustEV
+    case "goalsMinSample": cfg.goalsMinSample = Int(last.beforeValue) ?? cfg.goalsMinSample
+    case "goalsMaxUncertainty": cfg.goalsMaxUncertainty = Double(last.beforeValue) ?? cfg.goalsMaxUncertainty
+    case "cornersMinRobustEV": cfg.cornersMinRobustEV = Double(last.beforeValue) ?? cfg.cornersMinRobustEV
+    case "cornersMinMSS": cfg.cornersMinMSS = Double(last.beforeValue) ?? cfg.cornersMinMSS
+    case "cornersMaxUncertainty": cfg.cornersMaxUncertainty = Double(last.beforeValue) ?? cfg.cornersMaxUncertainty
+    case "cardsMinRobustEV": cfg.cardsMinRobustEV = Double(last.beforeValue) ?? cfg.cardsMinRobustEV
+    case "cardsMinMSS": cfg.cardsMinMSS = Double(last.beforeValue) ?? cfg.cardsMinMSS
+    case "cardsMaxUncertainty": cfg.cardsMaxUncertainty = Double(last.beforeValue) ?? cfg.cardsMaxUncertainty
+    case "oosGateEnabled": cfg.oosGateEnabled = Bool(last.beforeValue) ?? cfg.oosGateEnabled
+    case "oosMinBets": cfg.oosMinBets = Int(last.beforeValue) ?? cfg.oosMinBets
+    case "oosWindowDays": cfg.oosWindowDays = Int(last.beforeValue) ?? cfg.oosWindowDays
+    case "goalsOOSMinROI": cfg.goalsOOSMinROI = Double(last.beforeValue) ?? cfg.goalsOOSMinROI
+    case "cornersOOSMinROI": cfg.cornersOOSMinROI = Double(last.beforeValue) ?? cfg.cornersOOSMinROI
+    case "cardsOOSMinROI": cfg.cardsOOSMinROI = Double(last.beforeValue) ?? cfg.cardsOOSMinROI
+    case "cornersWeightRecentOwn": cfg.cornersWeightRecentOwn = Double(last.beforeValue) ?? cfg.cornersWeightRecentOwn
+    case "cornersWeightRecentOpp": cfg.cornersWeightRecentOpp = Double(last.beforeValue) ?? cfg.cornersWeightRecentOpp
+    case "cornersWeightLeague": cfg.cornersWeightLeague = Double(last.beforeValue) ?? cfg.cornersWeightLeague
+    case "cornersWeightXG": cfg.cornersWeightXG = Double(last.beforeValue) ?? cfg.cornersWeightXG
+    case "cornersWeightPossession": cfg.cornersWeightPossession = Double(last.beforeValue) ?? cfg.cornersWeightPossession
+    case "cornersWeightH2H": cfg.cornersWeightH2H = Double(last.beforeValue) ?? cfg.cornersWeightH2H
+    case "cardsWeightRecentOwn": cfg.cardsWeightRecentOwn = Double(last.beforeValue) ?? cfg.cardsWeightRecentOwn
+    case "cardsWeightRecentOpp": cfg.cardsWeightRecentOpp = Double(last.beforeValue) ?? cfg.cardsWeightRecentOpp
+    case "cardsWeightLeague": cfg.cardsWeightLeague = Double(last.beforeValue) ?? cfg.cardsWeightLeague
+    case "cardsWeightFouls": cfg.cardsWeightFouls = Double(last.beforeValue) ?? cfg.cardsWeightFouls
+    case "cardsWeightReferee": cfg.cardsWeightReferee = Double(last.beforeValue) ?? cfg.cardsWeightReferee
+    case "cardsWeightH2H": cfg.cardsWeightH2H = Double(last.beforeValue) ?? cfg.cardsWeightH2H
     default: break
     }
     cfg.updatedAt = Date()
@@ -1335,8 +1287,6 @@ struct ModelComparison: Codable, Hashable, Identifiable {
   var avgAwayP: Double
 }
 
-// MARK: - Walk-forward delta
-
 struct WalkForwardDelta: Codable, Hashable {
   var matches: Int
   var bets: Int
@@ -1614,7 +1564,6 @@ struct BollingerRisk {
                     window: window,
                     note: "Недостаточно данных (\(bands.count)/\(window + 2))")
     }
-
     var widths: [Double] = []
     widths.reserveCapacity(bands.count)
     for p in bands {
@@ -1625,7 +1574,6 @@ struct BollingerRisk {
                     widthRatio: 1, recentBreakouts: 0, breakoutRate: 0,
                     window: window, note: "Нет полос")
     }
-
     let recent = Array(widths.suffix(window))
     let currentWidth = recent.last ?? 0
     let avgWidth = recent.reduce(0, +) / Double(recent.count)
@@ -1835,7 +1783,6 @@ enum Metrics {
       positiveRate: rate, verdict: verdict, note: note)
   }
 
-  // [W3c] OOS wrapper для UI.
   static func oosFromJournal(_ entries: [JournalEntry],
                              windowDays: Int = 90) -> OOSValidationReport {
     OOSBuilder.build(from: entries, windowDays: windowDays)
@@ -2088,7 +2035,7 @@ final class BacktestService {
   static let gamesPerRequest = 1000
   static let maxPagesPerMonth = 20
   static let oddsFetchCap = 1500
-  static let cornersCardsFetchCap = 300
+  static let cornersCardsFetchCap = 1500
 
   private var isBuilding = false
 
@@ -2186,7 +2133,6 @@ final class BacktestService {
     var resumed = false
     var jobID: String = snapshot.buildJobID ?? UUID().uuidString
 
-    // ── Resume
     if snapshot.buildStatus == "building",
        let cp = Self.loadCheckpoint(),
        let cpJobID = cp.jobID,
@@ -2287,7 +2233,6 @@ final class BacktestService {
       allHistories[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
     }
 
-    // ── Сидируем кэш
     for m in allMatches {
       _ = HistoricalMarketCacheService.upsert(from: m, in: context)
     }
@@ -2324,21 +2269,19 @@ final class BacktestService {
       if i % 20 == 0 {
         let p = 0.55 + (Double(i) / Double(max(cap, 1))) * 0.10
         progress(p, "Odds+stats \(i + 1)/\(cap)")
-        // Чекпоинт каждые 20 матчей
         Self.saveCheckpoint(jobID: jobID,
                             cursor: cursor, fromDate: fromDate, toDate: toDate,
                             matches: allMatchesMut, histories: allHistories)
       }
       try? await Task.sleep(for: .milliseconds(400))
     }
-    // Финальный чекпоинт фазы 2
     Self.saveCheckpoint(jobID: jobID,
                         cursor: cursor, fromDate: fromDate, toDate: toDate,
                         matches: allMatchesMut, histories: allHistories)
 
-    // ── Фаза 3: Corners/Cards (resume-safe через HistoricalMarketCache)
+    // ── Фаза 3: Corners/Cards (resume-safe)
     let needCC: [Int] = allMatchesMut.enumerated().compactMap { (idx, m) -> Int? in
-      guard let nid = m.numericID else { return nil }
+      guard m.numericID != nil else { return nil }
       let gid = m.id
       let d = FetchDescriptor<HistoricalMarketCache>(
         predicate: #Predicate { $0.gameID == gid })
@@ -2357,8 +2300,9 @@ final class BacktestService {
 
     for (i, idx) in needCC.prefix(ccCount).enumerated() {
       var mm = allMatchesMut[idx]
-      guard let nid = mm.numericID else { continue }
-      if let books = try? await client.fullOdds(gameId: nid), !books.isEmpty {
+      if let nid = mm.numericID,
+         let books = try? await client.fullOdds(gameId: nid),
+         !books.isEmpty {
         let extra = Self.oddsJSONFromBookmakers(books)
         if !extra.isEmpty {
           var merged: [JSONValue] = mm.oddsJSON?.array ?? []
@@ -2383,7 +2327,6 @@ final class BacktestService {
       if i % 25 == 0 {
         let p = 0.65 + (Double(i) / Double(max(ccCount, 1))) * 0.15
         progress(p, "Corners/Cards \(i + 1)/\(ccCount)")
-        // Чекпоинт каждые 25 матчей
         try? context.save()
         Self.saveCheckpoint(jobID: jobID,
                             cursor: cursor, fromDate: fromDate, toDate: toDate,
@@ -2403,7 +2346,6 @@ final class BacktestService {
     snapshot.enrichmentProgress = cacheAfter.enriched
     try? context.save()
 
-    // Собираем prepared для walk-forward
     var prepared: [Match] = allMatchesMut.filter { ($0.oddsJSON?.array?.isEmpty == false) }
     prepared.sort { ($0.start ?? .distantPast) < ($1.start ?? .distantPast) }
 
@@ -2415,7 +2357,6 @@ final class BacktestService {
       return false
     }
 
-    // ── Walk-forward
     let totalPrepared = prepared.count
     let trainEnd = max(1, Int(Double(totalPrepared) * 0.60))
     let valEnd = max(trainEnd + 1, Int(Double(totalPrepared) * 0.80))
@@ -2482,97 +2423,6 @@ final class BacktestService {
       }))
     snapshot.modelComparisonJSON = try? encoder.encode(comparisons)
 
-    let journalDescriptor = FetchDescriptor<JournalEntry>()
-    let journal = (try? context.fetch(journalDescriptor)) ?? []
-    let cfg = TuningService.fetchOrCreate(in: context)
-    let oosReport = OOSBuilder.build(from: journal, windowDays: cfg.oosWindowDays)
-    snapshot.oosValidationJSON = try? encoder.encode(oosReport)
-
-    snapshot.buildStatus = "ready"
-    snapshot.buildProgress = 1.0
-    snapshot.lastError = nil
-    snapshot.buildCursorTimestamp = 0
-    snapshot.buildMatchesCount = 0
-    snapshot.buildJobID = nil
-    try? context.save()
-
-    Self.clearCheckpoint()
-
-    progress(1.0, "Готово: \(report.matches) матчей, \(report.bets) ставок")
-    return true
-  }
-
-    // [W3b] Train 60% / Validation 20% / Holdout 20%.
-    let totalPrepared = prepared.count
-    let trainEnd = max(1, Int(Double(totalPrepared) * 0.60))
-    let valEnd = max(trainEnd + 1, Int(Double(totalPrepared) * 0.80))
-
-    let trainMatches = Array(prepared[0..<trainEnd])
-    let valMatches = Array(prepared[trainEnd..<min(valEnd, totalPrepared)])
-    let holdoutMatches = Array(prepared[min(valEnd, totalPrepared)..<totalPrepared])
-
-    progress(0.83, "Walk-forward train \(trainMatches.count) / val \(valMatches.count) / holdout \(holdoutMatches.count)…")
-    let trainReport = backtester.run(matches: trainMatches, histories: allHistories)
-    let valReport = backtester.run(matches: valMatches, histories: allHistories)
-    let holdoutReport = backtester.run(matches: holdoutMatches, histories: allHistories)
-
-    // Для summary и posterior — только train + val.
-    let report = backtester.run(matches: trainMatches + valMatches, histories: allHistories)
-
-    progress(0.90, "Сравнение моделей (E5)…")
-    let comparisons = MultiModelBacktester().run(
-      matches: trainMatches + valMatches, histories: allHistories)
-
-    progress(0.95, "Сохраняю снапшот…")
-
-    snapshot.builtAt = Date()
-    snapshot.fromDate = fromDate
-    snapshot.toDate = toDate
-    snapshot.totalMatches = report.matches
-    snapshot.totalBets = report.bets
-    snapshot.avgROI = report.roi
-    snapshot.avgCLV = report.avgCLV
-    snapshot.brier = report.brier
-    snapshot.logLoss = report.logLoss
-    snapshot.sharpe = report.sharpe
-    snapshot.sortino = report.sortino
-    snapshot.profitFactor = report.profitFactor
-
-    snapshot.enrichmentTotal = prepared.count
-    snapshot.enrichmentProgress = min(prepared.count, ccCount)
-
-    let encoder = JSONEncoder()
-
-    snapshot.trainReportJSON = try? encoder.encode(Self.walkForwardDelta(trainReport))
-    snapshot.validationReportJSON = try? encoder.encode(Self.walkForwardDelta(valReport))
-    snapshot.holdoutReportJSON = try? encoder.encode(Self.walkForwardDelta(holdoutReport))
-    snapshot.walkForwardMode = "602020"
-
-    snapshot.perLeagueJSON = try? encoder.encode(
-      report.perLeague.mapValues { Self.toStored($0) })
-    snapshot.perMarketJSON = try? encoder.encode(
-      report.perMarket.mapValues { Self.toStored($0) })
-    snapshot.perLeagueMarketJSON = try? encoder.encode(
-      Self.leagueMarketSegment(report: report, matches: prepared))
-    snapshot.evBucketsJSON = try? encoder.encode(
-      report.byEVBucket.mapValues { Self.toStored($0) })
-    snapshot.oddsBucketsJSON = try? encoder.encode(
-      report.byOddsBand.mapValues { Self.toStored($0) })
-    snapshot.classificationJSON = try? encoder.encode(
-      report.byClassification.mapValues { Self.toStored($0) })
-    snapshot.posteriorJSON = try? encoder.encode(
-      Self.buildPosteriorBuckets(from: report.betRecords))
-    snapshot.posteriorCornersJSON = try? encoder.encode(
-      Self.buildPosteriorBuckets(from: report.betRecords.filter {
-        $0.market == "CORNERS"
-      }))
-    snapshot.posteriorCardsJSON = try? encoder.encode(
-      Self.buildPosteriorBuckets(from: report.betRecords.filter {
-        $0.market == "CARDS"
-      }))
-    snapshot.modelComparisonJSON = try? encoder.encode(comparisons)
-
-    // OOS-отчёт по журналу.
     let journalDescriptor = FetchDescriptor<JournalEntry>()
     let journal = (try? context.fetch(journalDescriptor)) ?? []
     let cfg = TuningService.fetchOrCreate(in: context)
@@ -3713,6 +3563,7 @@ final class LiveMonitor: ObservableObject {
     return nil
   }
 
+  // [W2b] Market regime. Принимает словарь [gameID: OddsSnapshot].
   static func classifyRegime(snapshots: [String: OddsSnapshot],
                              movements: [LineMovement]) -> MarketRegimeReport {
     guard !snapshots.isEmpty else {

@@ -18,8 +18,6 @@ struct SegmentStats {
   var expectancy: Double { bets > 0 ? profit / Double(bets) : 0 }
 }
 
-// MARK: - BetRecord
-
 struct BetRecord: Codable, Hashable {
   var probability: Double
   var probabilityLow: Double
@@ -28,8 +26,6 @@ struct BetRecord: Codable, Hashable {
   var actual: Double
   var market: String? = nil
 }
-
-// MARK: - Full report
 
 struct WalkForwardReport {
   var matches = 0
@@ -59,9 +55,6 @@ struct WalkForwardReport {
 
   var perLeague: [String: SegmentStats] = [:]
   var perMarket: [String: SegmentStats] = [:]
-  // [W2-#9] Настоящие league × market ячейки. Раньше heatmap собирался
-  // cartesian-произведением perLeague × perMarket, из-за чего все ячейки
-  // получали одно и то же значение.
   var perLeagueMarket: [String: SegmentStats] = [:]
   var byEVBucket: [String: SegmentStats] = [:]
   var byClassification: [String: SegmentStats] = [:]
@@ -132,10 +125,19 @@ struct WalkForwardBacktester {
         "awayFTResult": .number(aFT),
       ])
 
+      // Полный сигнал-пайплайн — с enabled CORNERS/CARDS и дефолтными порогами.
+      var thresholds = SignalThresholds.default
+      thresholds.cornersEnabled = true
+      thresholds.cardsEnabled = true
+      thresholds.cornersMinSample = 2
+      thresholds.cardsMinSample = 2
+
       let signals = engine.portfolio(
         engine.signals(
           match: match, info: infoJSON, oddsJSON: oddsJSON,
-          homeHistory: hs, awayHistory: awayRecords))
+          homeHistory: hs, awayHistory: awayRecords,
+          thresholds: thresholds),
+        thresholds: thresholds)
 
       let weekKey: String = {
         guard let d = match.start else { return "unknown" }
@@ -170,25 +172,16 @@ struct WalkForwardBacktester {
 
         switch outcome {
         case .win:
-          r.wins += 1
-          r.grossWin += pnl
-          lossStreak = 0
+          r.wins += 1; r.grossWin += pnl; lossStreak = 0
         case .halfWin:
-          r.wins += 1
-          r.grossWin += pnl
-          lossStreak = 0
+          r.wins += 1; r.grossWin += pnl; lossStreak = 0
         case .push:
-          r.pushes += 1
-          lossStreak = 0
+          r.pushes += 1; lossStreak = 0
         case .halfLoss:
-          r.losses += 1
-          r.grossLoss += abs(pnl)
-          lossStreak += 1
+          r.losses += 1; r.grossLoss += abs(pnl); lossStreak += 1
           r.maxLosingStreak = max(r.maxLosingStreak, lossStreak)
         case .loss:
-          r.losses += 1
-          r.grossLoss += abs(pnl)
-          lossStreak += 1
+          r.losses += 1; r.grossLoss += abs(pnl); lossStreak += 1
           r.maxLosingStreak = max(r.maxLosingStreak, lossStreak)
         case .void:
           break
@@ -212,7 +205,7 @@ struct WalkForwardBacktester {
                    outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.perMarket, key: s.market,
                    outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
-        // [W2-#9] Реальная league × market ячейка.
+        // [W2-#9] Настоящая league × market ячейка.
         accumulate(&r.perLeagueMarket, key: "\(match.league)|\(s.market)",
                    outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.byEVBucket, key: evBucket(s.ev),
