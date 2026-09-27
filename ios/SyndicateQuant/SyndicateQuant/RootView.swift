@@ -73,10 +73,15 @@ struct RootView: View {
     }
     .tint(.blue)
     .preferredColorScheme(settings.colorScheme.toColorScheme)
-    .task {
+     .task {
       _ = BacktestService.fetchOrCreate(in: context)
       _ = TuningService.fetchOrCreate(in: context)
       await refresh()
+      // Авто-возобновление сборки, если она была прервана выходом из фона
+      if currentSnapshot?.buildStatus == "building",
+         BacktestService.hasCheckpoint() {
+        await runFullBuild()
+      }
     }
     .onChange(of: settings.liveMonitorEnabled) { _, enabled in
       if enabled { liveMonitor.start(settings: settings) }
@@ -464,10 +469,18 @@ struct RootView: View {
       }
 
       Section("Действия") {
+        let snap = currentSnapshot
+        let isResumable = (snap?.buildStatus == "building"
+                           && (snap?.buildMatchesCount ?? 0) > 0)
         Button { Task { await runFullBuild() } } label: {
-          Label("Собрать базу (2 года × 8 лиг)", systemImage: "arrow.down.circle")
+          if isResumable {
+            Label("Продолжить сбор · \(snap?.buildMatchesCount ?? 0) матчей",
+                  systemImage: "arrow.clockwise.circle")
+          } else {
+            Label("Собрать базу (2 года × 11 лиг)", systemImage: "arrow.down.circle")
+          }
         }
-        .disabled(busy || currentSnapshot?.buildStatus == "building")
+        .disabled(busy)
 
         Button { Task { await runIncremental() } } label: {
           Label("Докачать за неделю", systemImage: "arrow.triangle.2.circlepath")
@@ -476,6 +489,10 @@ struct RootView: View {
 
         if !btProgressText.isEmpty {
           Text(btProgressText).font(.caption.monospaced()).foregroundStyle(.secondary)
+        }
+        if isResumable {
+          Text("Прогресс сохраняется после каждого месяца — можно смело сворачивать и возвращаться.")
+            .font(.caption2).foregroundStyle(.secondary)
         }
       }
 
