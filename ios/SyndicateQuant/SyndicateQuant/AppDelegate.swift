@@ -7,6 +7,8 @@ import SwiftData
 final class AppDelegate: NSObject, UIApplicationDelegate {
   nonisolated static let refreshID = "com.syndicatequant.app.refresh"
   nonisolated static let processingID = "com.syndicatequant.app.processing"
+  // [BGTask] Ночное обогащение
+  nonisolated static let enrichID = "com.syndicatequant.app.enrich"
 
   func application(
     _ application: UIApplication,
@@ -34,16 +36,30 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
       AppDelegate.handleProcessing(processing)
     }
 
+    // [BGTask] Регистрация enrich
+    BGTaskScheduler.shared.register(
+      forTaskWithIdentifier: Self.enrichID,
+      using: nil
+    ) { task in
+      guard let enrichTask = task as? BGProcessingTask else {
+        task.setTaskCompleted(success: false)
+        return
+      }
+      AppDelegate.handleEnrich(enrichTask)
+    }
+
     UNUserNotificationCenter.current().delegate = self
 
     NotificationService.request()
     Self.scheduleNextRefresh()
     Self.scheduleWeeklyProcessing()
+    Self.scheduleNextEnrich()
     return true
   }
 
   func applicationDidEnterBackground(_ application: UIApplication) {
     Self.scheduleNextRefresh()
+    Self.scheduleNextEnrich()
   }
 
   // MARK: - BGAppRefreshTask (Волна A)
@@ -92,13 +108,15 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
   }
 
-  // MARK: - BGProcessingTask (Волна G)
+  // MARK: - BGProcessingTask (Волна G, недельный)
 
   nonisolated private static func handleProcessing(_ task: BGProcessingTask) {
     scheduleWeeklyProcessing()
 
     let work = Task { @MainActor in
       let ok = await BacktestService.shared.updateIncremental()
+      // [BGTask] После докачки — одна порция обогащения
+      await BacktestService.shared.continueEnrichmentInBackground(chunkSize: 60)
       task.setTaskCompleted(success: ok)
     }
 
@@ -135,6 +153,50 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
     return Date().addingTimeInterval(7 * 24 * 3600)
   }
+
+  // MARK: - [BGTask] Ночное обогащение (BGProcessingTask, ежедневно ~03:00)
+
+  nonisolated private static func handleEnrich(_ task: BGProcessingTask) {
+    // Сразу перепланируем на следующую ночь
+    scheduleNextEnrich()
+
+    let work = Task { @MainActor in
+      await BacktestService.shared.continueEnrichmentInBackground(chunkSize: 60)
+      task.setTaskCompleted(success: true)
+    }
+
+    task.expirationHandler = {
+      work.cancel()
+    }
+  }
+
+  nonisolated private static func scheduleNextEnrich() {
+    let req = BGProcessingTaskRequest(identifier: enrichID)
+    req.requiresNetworkConnectivity = true
+    req.requiresExternalPower = false
+    req.earliestBeginDate = nextNight3AM()
+    do {
+      try BGTaskScheduler.shared.submit(req)
+      print("[BG] enrich scheduled for \(nextNight3AM())")
+    } catch {
+      print("[BG] enrich submit failed: \(error.localizedDescription)")
+    }
+  }
+
+  nonisolated private static func nextNight3AM() -> Date {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone.current
+    var comps = DateComponents()
+    comps.hour = 3
+    comps.minute = 0
+    if let next = cal.nextDate(
+      after: Date(), matching: comps,
+      matchingPolicy: .nextTime
+    ) {
+      return next
+    }
+    return Date().addingTimeInterval(24 * 3600)
+  }
 }
 
 // MARK: - UNUserNotificationCenterDelegate (C1: deep-link)
@@ -147,7 +209,6 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
     let userInfo = response.notification.request.content.userInfo
-    // NotificationService пишет ключ "signal_id" в content.userInfo.
     if let signalID = userInfo["signal_id"] as? String {
       DispatchQueue.main.async {
         NotificationCenter.default.post(

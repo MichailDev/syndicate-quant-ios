@@ -2,7 +2,6 @@ import Charts
 import SwiftData
 import SwiftUI
 
-// [8.4] Общий форматтер даты/времени начала матча
 private let matchStartFormatter: DateFormatter = {
   let f = DateFormatter()
   f.dateFormat = "dd.MM · HH:mm"
@@ -200,12 +199,33 @@ struct RootView: View {
   @ViewBuilder
   private var equitySection: some View {
     let curve = Metrics.equityCurve(journal, bankroll: settings.effectiveBankroll)
+    let bands = Metrics.bollingerBands(curve, window: 20, sigmaMultiplier: 2.0)
+    let breakouts = bands.filter { $0.isBreakout }
+    let lastBand = bands.last
+
     Section("Equity curve") {
       if curve.count < 2 {
         Text("Нужно минимум 2 закрытые записи")
           .font(.caption).foregroundStyle(.secondary)
       } else {
         Chart {
+          ForEach(bands) { p in
+            if let u = p.upper {
+              LineMark(x: .value("Дата", p.date), y: .value("Upper", u))
+                .foregroundStyle(.gray.opacity(0.45))
+                .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            }
+            if let l = p.lower {
+              LineMark(x: .value("Дата", p.date), y: .value("Lower", l))
+                .foregroundStyle(.gray.opacity(0.45))
+                .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            }
+            if let m = p.ma {
+              LineMark(x: .value("Дата", p.date), y: .value("MA", m))
+                .foregroundStyle(.purple.opacity(0.65))
+                .lineStyle(StrokeStyle(lineWidth: 1))
+            }
+          }
           ForEach(curve) { p in
             AreaMark(x: .value("Дата", p.date),
                      y: .value("P/L", p.cumulativeProfit))
@@ -214,8 +234,15 @@ struct RootView: View {
                      y: .value("P/L", p.cumulativeProfit))
               .foregroundStyle(.blue)
           }
+          ForEach(breakouts) { p in
+            PointMark(x: .value("Дата", p.date),
+                      y: .value("P/L", p.value))
+              .foregroundStyle(p.value > (p.upper ?? .infinity) ? .green : .red)
+              .symbolSize(55)
+          }
         }
-        .frame(height: 180)
+        .frame(height: 200)
+
         HStack {
           Text("Точек: \(curve.count)")
           Spacer()
@@ -230,6 +257,21 @@ struct RootView: View {
           }
         }
         .font(.caption)
+
+        if let lb = lastBand, let ma = lb.ma, let u = lb.upper, let l = lb.lower {
+          HStack(spacing: 14) {
+            miniBlock("MA(20)", String(format: "%+.3f", ma))
+            miniBlock("Upper", String(format: "%+.3f", u))
+            miniBlock("Lower", String(format: "%+.3f", l))
+            miniBlock("Breakouts", "\(breakouts.count)")
+          }
+          .padding(.vertical, 2)
+          Text("MA(20) ± 2σ по последним 20 ставкам. Точки — выход за полосу.")
+            .font(.caption2).foregroundStyle(.secondary)
+        } else {
+          Text("Полосы Боллинджера появятся после 20 закрытых записей.")
+            .font(.caption2).foregroundStyle(.secondary)
+        }
       }
     }
   }
@@ -290,7 +332,6 @@ struct RootView: View {
           .padding(.horizontal, 8).padding(.vertical, 3)
           .background(.thinMaterial).clipShape(Capsule())
       }
-      // [8.4] Дата начала матча
       if let s = formatMatchStart(e.matchStart) {
         HStack(spacing: 4) {
           Image(systemName: "clock")
@@ -378,11 +419,12 @@ struct RootView: View {
     List {
       Section {
         Text("Backtest Service").font(.headline)
-        Text("Auto-Exclude, posterior (B2), TeamRating (B3), корреляция (B4), stop-loss (B5), player impact (B6), voting (D3), сравнение моделей (E5).")
+        Text("Auto-Exclude, posterior (B2), TeamRating (B3), корреляция (B4), stop-loss (B5), player impact (B6), voting (D3), сравнение моделей (E5), пороги и веса CORNERS/CARDS.")
           .font(.caption).foregroundStyle(.secondary)
       }
 
       selfTuningLinkSection
+      enrichmentSection
       liveMonitorSection
       leagueMarketHeatmapSection
       modelComparisonSection
@@ -460,12 +502,48 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
+  // [Блок 5] Enrichment progress + кнопка «Продолжить»
+  @ViewBuilder
+  private var enrichmentSection: some View {
+    if let snap = currentSnapshot, snap.enrichmentTotal > 0 {
+      Section {
+        let done = snap.enrichmentProgress
+        let total = max(snap.enrichmentTotal, 1)
+        let progress = Double(done) / Double(total)
+        ProgressView(value: progress)
+        HStack {
+          Text("Обогащено")
+          Spacer()
+          Text("\(done) / \(total)")
+            .font(.subheadline.monospacedDigit().bold())
+            .foregroundStyle(done >= total ? .green : .primary)
+        }
+        if done >= total {
+          Text("Все матчи обогащены углами и ЖК.")
+            .font(.caption2).foregroundStyle(.secondary)
+        } else {
+          Button {
+            Task { await runEnrichment() }
+          } label: {
+            Label("Продолжить обогащение (30 матчей)",
+                  systemImage: "arrow.triangle.branch")
+          }
+          .disabled(busy)
+          Text("Обогащение работает, пока приложение открыто. Обычно нужно 1–3 подхода.")
+            .font(.caption2).foregroundStyle(.secondary)
+        }
+      } header: {
+        Text("Обогащение котировок")
+      }
+    }
+  }
+
   @ViewBuilder
   private var modelComparisonSection: some View {
     let list = currentSnapshot?.decodedModelComparison() ?? []
     if !list.isEmpty {
       Section("Model comparison (E5)") {
-        Text("Brier и LogLoss ниже — модель лучше. Сравнение на равномерной выборке завершённых матчей.")
+        Text("Brier и LogLoss ниже — модель лучше.")
           .font(.caption2).foregroundStyle(.secondary)
         ForEach(list) { c in
           VStack(alignment: .leading, spacing: 4) {
@@ -521,7 +599,7 @@ struct RootView: View {
     } header: {
       Text("Live (D1)")
     } footer: {
-      Text("Следит за активными матчами раз в \(settings.liveMonitorIntervalSec) сек.")
+      Text("Каждый 5-й цикл — полные котировки (углы+ЖК). Остальные — только голы.")
     }
 
     if !liveMonitor.movements.isEmpty {
@@ -563,7 +641,7 @@ struct RootView: View {
           VStack(alignment: .leading, spacing: 2) {
             Text("Self-Tuning панель").font(.headline)
             if let cfg = tuningConfig {
-              Text("Активных: \(activeCount(cfg)) из 6 · порогов: 5")
+              Text("Активных: \(activeCount(cfg)) из 8 · порогов: 15 · весов: 12")
                 .font(.caption).foregroundStyle(.secondary)
             } else {
               Text("Открыть настройки автотюнинга")
@@ -584,6 +662,8 @@ struct RootView: View {
     if cfg.correlationEnabled { n += 1 }
     if cfg.playerImpactEnabled { n += 1 }
     if cfg.teamRatingEnabled { n += 1 }
+    if cfg.cornersEnabled { n += 1 }
+    if cfg.cardsEnabled { n += 1 }
     return n
   }
 
@@ -924,6 +1004,19 @@ struct RootView: View {
     try? context.save()
   }
 
+  // [Блок 5] Продолжить обогащение
+  private func runEnrichment() async {
+    guard !busy else { return }
+    busy = true
+    defer { busy = false }
+    btProgressText = "Обогащение…"
+    await BacktestService.shared.continueEnrichmentInBackground(chunkSize: 30) { done, total, msg in
+      btProgressText = String(format: "%d/%d · %@", done, total, msg)
+    }
+    btProgressText = "Обогащение завершено (порция)"
+    try? context.save()
+  }
+
   // MARK: - Контроль
 
   private var diagnosticsView: some View {
@@ -986,7 +1079,7 @@ struct RootView: View {
       }
       Section("Self-Tuning") {
         if let cfg = tuningConfig {
-          LabeledContent("Активных механизмов", value: "\(activeCount(cfg)) из 6")
+          LabeledContent("Активных механизмов", value: "\(activeCount(cfg)) из 8")
           LabeledContent("posteriorWeight",
                          value: String(format: "%.2f", cfg.posteriorWeight))
           LabeledContent("autoExcludeMinROI",
@@ -994,6 +1087,14 @@ struct RootView: View {
           LabeledContent("autoExcludeMinBets", value: "\(cfg.autoExcludeMinBets)")
           LabeledContent("stopLossCap/Pause",
                          value: "\(cfg.stopLossCapStreak)/\(cfg.stopLossPauseStreak)")
+          LabeledContent("CORNERS",
+                         value: String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, stake ≤ %.1f%%",
+                                       cfg.cornersMinEV * 100, cfg.cornersMinQCS,
+                                       cfg.cornersMaxStake * 100))
+          LabeledContent("CARDS",
+                         value: String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, stake ≤ %.1f%%",
+                                       cfg.cardsMinEV * 100, cfg.cardsMinQCS,
+                                       cfg.cardsMaxStake * 100))
           LabeledContent("Событий в логе", value: "\(tuningEvents.count)")
         } else {
           Text("Конфиг не создан").font(.caption).foregroundStyle(.secondary)
@@ -1038,6 +1139,10 @@ struct RootView: View {
                          value: String(format: "%.1f%%", snap.buildProgress * 100))
           LabeledContent("Matches", value: "\(snap.totalMatches)")
           LabeledContent("Bets", value: "\(snap.totalBets)")
+          if snap.enrichmentTotal > 0 {
+            LabeledContent("Enrichment",
+                           value: "\(snap.enrichmentProgress)/\(snap.enrichmentTotal)")
+          }
           if snap.totalBets > 0 {
             LabeledContent("avgROI",
                            value: String(format: "%+.2f%%", snap.avgROI * 100))
@@ -1163,7 +1268,7 @@ struct RootView: View {
           Stepper("Интервал: \(settings.liveMonitorIntervalSec) сек",
                   value: $settings.liveMonitorIntervalSec, in: 30...300, step: 30)
         }
-        Text("Опрашивает /Odds/{id}. Для углов и карточек — те же котировки.")
+        Text("Каждый 5-й цикл — полные котировки (углы+ЖК). Остальные — только голы.")
           .font(.caption2).foregroundStyle(.secondary)
       }
       Section("Автообновление") {
@@ -1224,6 +1329,7 @@ struct RootView: View {
     diagnostics.append("scanned=\(summary.scannedMatches)")
     diagnostics.append("corrPairs=\(summary.correlationPairs)")
     diagnostics.append("lineups=\(summary.lineupsFound)")
+    diagnostics.append("h2h=\(summary.h2hFetched)")
   }
 
   private func settleJournal() async {
@@ -1258,7 +1364,6 @@ struct SignalCard: View {
           .background(classificationColor(signal.classification).opacity(0.25))
           .clipShape(Capsule())
       }
-      // [8.4] Дата/время начала матча
       if let s = formatMatchStart(signal.startTime) {
         HStack(spacing: 4) {
           Image(systemName: "clock")
@@ -1283,6 +1388,10 @@ struct SignalCard: View {
         Text("\(signal.bookmakers)b")
         if let src = signal.oddsSource {
           Text(src).foregroundStyle(.blue)
+        }
+        if let mss = signal.mss, signal.market == "CORNERS" || signal.market == "CARDS" {
+          Text("MSS \(String(format: "%.0f", mss))")
+            .foregroundStyle(mss >= 70 ? .green : (mss >= 40 ? .primary : .orange))
         }
         if signal.posteriorWeight != nil { Text("PST").foregroundStyle(.purple) }
         if signal.stopApplied != nil { Text("STOP").foregroundStyle(.red) }
@@ -1355,7 +1464,6 @@ struct SignalDetailView: View {
         LabeledContent("Хозяева", value: signal.home)
         LabeledContent("Гости", value: signal.away)
         LabeledContent("Лига", value: signal.league)
-        // [8.4] Начало матча
         if let s = formatMatchStartLong(signal.startTime) {
           LabeledContent("Начало", value: s)
         }
@@ -1372,9 +1480,25 @@ struct SignalDetailView: View {
             Text("Edge считается против sharp-линии Pinnacle (bookmakerId=4).")
               .font(.caption2).foregroundStyle(.secondary)
           } else if signal.market == "CARDS" {
-            Text("Edge считается против лучшей доступной котировки среди букмекеров. В реальных ответах SStats карточки часто только у Betano.")
+            Text("Edge считается против лучшей доступной котировки среди букмекеров.")
               .font(.caption2).foregroundStyle(.secondary)
           }
+        }
+      }
+
+      // [Блок 6.4] MSS
+      if let mss = signal.mss,
+         signal.market == "CORNERS" || signal.market == "CARDS" {
+        Section("Market support (MSS)") {
+          HStack {
+            Text("MSS").font(.subheadline.bold())
+            Spacer()
+            Text(String(format: "%.0f", mss))
+              .font(.subheadline.monospacedDigit().bold())
+              .foregroundStyle(mss >= 70 ? .green : (mss >= 40 ? .primary : .orange))
+          }
+          Text("Оценка согласованности котировок: чем выше — тем сильнее рынок подтверждает сигнал. Учитывает ширину спреда между книгами и согласие sharp-книг.")
+            .font(.caption2).foregroundStyle(.secondary)
         }
       }
 
@@ -1423,11 +1547,6 @@ struct SignalDetailView: View {
           LabeledContent("Худшая",
                          value: "\(OddsFormatter.format(worst, as: settings.oddsFormat)) · \(worstBook)")
           LabeledContent("Книг", value: "\(signal.bookmakers)")
-          if signal.bookmakers >= 3, avg > 0 {
-            let spread = (best - worst) / avg * 100
-            Text(String(format: "Разброс: %.1f%%", spread))
-              .font(.caption2).foregroundStyle(.secondary)
-          }
         }
       }
 
@@ -1443,11 +1562,6 @@ struct SignalDetailView: View {
               Text(String(format: "да · %+.2f%%", sm * 100))
                 .foregroundStyle(.purple).font(.subheadline.bold())
             }
-            Text("≥3 книги одновременно двигают линию в одну сторону.")
-              .font(.caption2).foregroundStyle(.secondary)
-          } else {
-            Text("Движение односторонним не признано")
-              .font(.caption2).foregroundStyle(.secondary)
           }
         }
       }
@@ -1460,28 +1574,14 @@ struct SignalDetailView: View {
             Text("\(vote)/4").font(.subheadline.bold())
               .foregroundStyle(vote >= 3 ? .green : (vote == 2 ? .orange : .red))
           }
-          if let detail = signal.modelVoteDetail, !detail.isEmpty {
-            Text(detail).font(.caption2.monospaced()).foregroundStyle(.secondary)
-          }
-          Text("S BET требует 4/4, A BET — 3/4. Голос = p(model) > p(market) + 1%.")
-            .font(.caption2).foregroundStyle(.tertiary)
         }
       }
 
       if let w = signal.posteriorWeight {
         Section("Posterior correction (B2)") {
-          Text("p_adj = (1 − w)·p_model + w·p_posterior")
-            .font(.caption2).foregroundStyle(.secondary)
           LabeledContent("Вес w", value: String(format: "%.2f", w))
           if let src = signal.posteriorSource {
             LabeledContent("Бакет", value: src)
-          }
-          if let raw = signal.probabilityRaw {
-            LabeledContent("p_model", value: String(format: "%.2f%%", raw * 100))
-            LabeledContent("p_adj",
-                           value: String(format: "%.2f%%", signal.probability * 100))
-            let delta = (signal.probability - raw) * 100
-            LabeledContent("Δ", value: String(format: "%+.2f п.п.", delta))
           }
         }
       }
@@ -1607,12 +1707,14 @@ struct SignalDetailView: View {
     }
   }
 
-  // [8.4] Подсказка, что показываем
   private var marketHintLine: String {
     switch signal.market {
-    case "CORNERS": return "Показан тотал углов обеих команд в каждом матче (свои + соперника)."
-    case "CARDS":   return "Показан тотал ЖК обеих команд в каждом матче (свои + соперника)."
-    default:        return "Показан счёт каждого матча и результат (В/Н/П)."
+    case "CORNERS":
+      return "В бейдже — свои углы · углы соперника в каждом матче. avg справа — средний тотал за 5 матчей."
+    case "CARDS":
+      return "В бейдже — свои ЖК · ЖК соперника в каждом матче. avg справа — средний тотал за 5 матчей."
+    default:
+      return "Показан счёт каждого матча и результат (В/Н/П)."
     }
   }
 
@@ -1644,7 +1746,6 @@ struct SignalDetailView: View {
     .padding(.vertical, 2)
   }
 
-  // [8.4] Сводка: для CORNERS / CARDS — средний тотал, для GOALS — W/D/L
   private func summaryFor(market: String, records: [TeamRecord]) -> String {
     switch market {
     case "CORNERS":
@@ -1673,37 +1774,30 @@ struct SignalDetailView: View {
     }
   }
 
-  // [8.4] Бейдж: для CORNERS / CARDS — тотал за матч, для GOALS — счёт + результат
   @ViewBuilder
   private func formBadge(_ r: TeamRecord, market: String) -> some View {
     switch market {
     case "CORNERS":
-      let total: Double? = {
-        guard let c = r.corners, let oc = r.oppCorners else { return nil }
-        return c + oc
-      }()
-      let value = total.map { String(format: "%.0f", $0) } ?? "—"
+      let own = r.corners.map { String(format: "%.0f", $0) } ?? "—"
+      let opp = r.oppCorners.map { String(format: "%.0f", $0) } ?? "—"
       VStack(spacing: 1) {
-        Text(value).font(.caption2.bold())
+        Text("\(own)·\(opp)").font(.caption2.bold())
         Text("угл").font(.caption2).opacity(0.6)
         Text(r.isHome ? "Д" : "Г").font(.caption2).opacity(0.6)
       }
-      .frame(width: 38, height: 46)
+      .frame(width: 46, height: 46)
       .background(Color.blue.opacity(0.20))
       .clipShape(RoundedRectangle(cornerRadius: 6))
 
     case "CARDS":
-      let total: Double? = {
-        guard let c = r.cards, let oc = r.oppCards else { return nil }
-        return c + oc
-      }()
-      let value = total.map { String(format: "%.0f", $0) } ?? "—"
+      let own = r.cards.map { String(format: "%.0f", $0) } ?? "—"
+      let opp = r.oppCards.map { String(format: "%.0f", $0) } ?? "—"
       VStack(spacing: 1) {
-        Text(value).font(.caption2.bold())
+        Text("\(own)·\(opp)").font(.caption2.bold())
         Text("ЖК").font(.caption2).opacity(0.6)
         Text(r.isHome ? "Д" : "Г").font(.caption2).opacity(0.6)
       }
-      .frame(width: 38, height: 46)
+      .frame(width: 46, height: 46)
       .background(Color.orange.opacity(0.20))
       .clipShape(RoundedRectangle(cornerRadius: 6))
 
@@ -1726,7 +1820,6 @@ struct SignalDetailView: View {
     }
   }
 
-  // [8.4] Используем обогащённую историю (с corners/cards из /Games/{id})
   private func loadPreview() async {
     if previewLoading { return }
     previewLoading = true
@@ -1813,7 +1906,6 @@ struct JournalEntryDetailView: View {
         LabeledContent("Хозяева", value: entry.home)
         LabeledContent("Гости", value: entry.away)
         LabeledContent("Лига", value: entry.league)
-        // [8.4] Начало матча
         if let s = formatMatchStartLong(entry.matchStart) {
           LabeledContent("Начало", value: s)
         }
@@ -1882,7 +1974,7 @@ struct JournalEntryDetailView: View {
   }
 }
 
-// MARK: - SelfTuningView (без изменений)
+// MARK: - SelfTuningView
 
 struct SelfTuningView: View {
   @Environment(\.modelContext) private var context
@@ -1904,7 +1996,11 @@ struct SelfTuningView: View {
     List {
       if let cfg = config {
         decisionsSection(cfg)
+        marketsSection(cfg)
         thresholdsSection(cfg)
+        marketThresholdsSection(cfg)
+        cornersWeightsSection(cfg)
+        cardsWeightsSection(cfg)
         eventsSection
         resetSection
       } else {
@@ -1948,6 +2044,33 @@ struct SelfTuningView: View {
     footer: { Text("Отключённый механизм не применяется при следующем скане.") }
   }
 
+  @ViewBuilder
+  private func marketsSection(_ cfg: TuningConfig) -> some View {
+    Section {
+      Toggle(isOn: Binding(
+        get: { cfg.cornersEnabled },
+        set: { v in setFlag("cornersEnabled", value: v, in: cfg) }
+      )) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Рынок CORNERS").font(.subheadline)
+          Text("Углы. Edge vs Pinnacle (sharp).")
+            .font(.caption2).foregroundStyle(.secondary)
+        }
+      }
+      Toggle(isOn: Binding(
+        get: { cfg.cardsEnabled },
+        set: { v in setFlag("cardsEnabled", value: v, in: cfg) }
+      )) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Рынок CARDS").font(.subheadline)
+          Text("ЖК + красные. Edge vs best available.")
+            .font(.caption2).foregroundStyle(.secondary)
+        }
+      }
+    } header: { Text("Рынки") }
+    footer: { Text("Выключенный рынок не генерирует сигналы — ни в скане, ни в portfolio.") }
+  }
+
   private func setFlag(_ key: String, value: Bool, in cfg: TuningConfig) {
     let before = currentFlagValue(key, cfg)
     switch key {
@@ -1957,6 +2080,8 @@ struct SelfTuningView: View {
     case "correlationEnabled": cfg.correlationEnabled = value
     case "playerImpactEnabled": cfg.playerImpactEnabled = value
     case "teamRatingEnabled": cfg.teamRatingEnabled = value
+    case "cornersEnabled": cfg.cornersEnabled = value
+    case "cardsEnabled": cfg.cardsEnabled = value
     default: return
     }
     cfg.updatedAt = Date()
@@ -1974,6 +2099,8 @@ struct SelfTuningView: View {
     case "correlationEnabled": return cfg.correlationEnabled
     case "playerImpactEnabled": return cfg.playerImpactEnabled
     case "teamRatingEnabled": return cfg.teamRatingEnabled
+    case "cornersEnabled": return cfg.cornersEnabled
+    case "cardsEnabled": return cfg.cardsEnabled
     default: return false
     }
   }
@@ -2020,8 +2147,154 @@ struct SelfTuningView: View {
         },
         currentString: { "\(cfg.stopLossPauseStreak)" },
         step: 1, rangeLabel: "> cap · … · 15")
-    } header: { Text("Пороги") }
-    footer: { Text("Изменения применяются со следующего скана. Каждое изменение пишется в журнал ниже.") }
+    } header: { Text("Пороги (глобальные)") }
+  }
+
+  @ViewBuilder
+  private func marketThresholdsSection(_ cfg: TuningConfig) -> some View {
+    Section {
+      thresholdRow("cornersMinEV", label: "CORNERS min EV",
+        formattedValue: String(format: "%.1f%%", cfg.cornersMinEV * 100),
+        onDelta: { d in cfg.cornersMinEV = max(0.0, min(0.30, cfg.cornersMinEV + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersMinEV) },
+        step: 0.005, rangeLabel: "0% … 30%")
+
+      thresholdRow("cornersMinQCS", label: "CORNERS min QCS",
+        formattedValue: String(format: "%.0f", cfg.cornersMinQCS),
+        onDelta: { d in cfg.cornersMinQCS = max(40, min(100, cfg.cornersMinQCS + d)) },
+        currentString: { String(format: "%.0f", cfg.cornersMinQCS) },
+        step: 2, rangeLabel: "40 – 100")
+
+      thresholdRow("cornersMaxStake", label: "CORNERS max stake",
+        formattedValue: String(format: "%.1f%%", cfg.cornersMaxStake * 100),
+        onDelta: { d in cfg.cornersMaxStake = max(0.002, min(0.10, cfg.cornersMaxStake + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersMaxStake) },
+        step: 0.002, rangeLabel: "0.2% … 10%")
+
+      thresholdRow("cornersMinSample", label: "CORNERS min sample",
+        formattedValue: "\(cfg.cornersMinSample)",
+        onDelta: { d in
+          let v = cfg.cornersMinSample + Int(d.rounded())
+          cfg.cornersMinSample = max(2, min(20, v))
+        },
+        currentString: { "\(cfg.cornersMinSample)" },
+        step: 1, rangeLabel: "2 – 20")
+    } header: { Text("Пороги CORNERS (углы)") }
+
+    Section {
+      thresholdRow("cardsMinEV", label: "CARDS min EV",
+        formattedValue: String(format: "%.1f%%", cfg.cardsMinEV * 100),
+        onDelta: { d in cfg.cardsMinEV = max(0.0, min(0.30, cfg.cardsMinEV + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsMinEV) },
+        step: 0.005, rangeLabel: "0% … 30%")
+
+      thresholdRow("cardsMinQCS", label: "CARDS min QCS",
+        formattedValue: String(format: "%.0f", cfg.cardsMinQCS),
+        onDelta: { d in cfg.cardsMinQCS = max(40, min(100, cfg.cardsMinQCS + d)) },
+        currentString: { String(format: "%.0f", cfg.cardsMinQCS) },
+        step: 2, rangeLabel: "40 – 100")
+
+      thresholdRow("cardsMaxStake", label: "CARDS max stake",
+        formattedValue: String(format: "%.1f%%", cfg.cardsMaxStake * 100),
+        onDelta: { d in cfg.cardsMaxStake = max(0.002, min(0.10, cfg.cardsMaxStake + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsMaxStake) },
+        step: 0.002, rangeLabel: "0.2% … 10%")
+
+      thresholdRow("cardsMinSample", label: "CARDS min sample",
+        formattedValue: "\(cfg.cardsMinSample)",
+        onDelta: { d in
+          let v = cfg.cardsMinSample + Int(d.rounded())
+          cfg.cardsMinSample = max(2, min(20, v))
+        },
+        currentString: { "\(cfg.cardsMinSample)" },
+        step: 1, rangeLabel: "2 – 20")
+    } header: { Text("Пороги CARDS (ЖК)") }
+  }
+
+  // [Блок 6.3] Веса λ для углов
+  @ViewBuilder
+  private func cornersWeightsSection(_ cfg: TuningConfig) -> some View {
+    Section {
+      thresholdRow("cornersWeightRecentOwn", label: "Own corners",
+        formattedValue: String(format: "%.2f", cfg.cornersWeightRecentOwn),
+        onDelta: { d in cfg.cornersWeightRecentOwn = max(0, min(1, cfg.cornersWeightRecentOwn + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersWeightRecentOwn) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cornersWeightRecentOpp", label: "Opp corners",
+        formattedValue: String(format: "%.2f", cfg.cornersWeightRecentOpp),
+        onDelta: { d in cfg.cornersWeightRecentOpp = max(0, min(1, cfg.cornersWeightRecentOpp + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersWeightRecentOpp) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cornersWeightLeague", label: "League avg",
+        formattedValue: String(format: "%.2f", cfg.cornersWeightLeague),
+        onDelta: { d in cfg.cornersWeightLeague = max(0, min(1, cfg.cornersWeightLeague + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersWeightLeague) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cornersWeightXG", label: "xG factor",
+        formattedValue: String(format: "%.2f", cfg.cornersWeightXG),
+        onDelta: { d in cfg.cornersWeightXG = max(0, min(1, cfg.cornersWeightXG + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersWeightXG) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cornersWeightPossession", label: "Possession",
+        formattedValue: String(format: "%.2f", cfg.cornersWeightPossession),
+        onDelta: { d in cfg.cornersWeightPossession = max(0, min(1, cfg.cornersWeightPossession + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersWeightPossession) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cornersWeightH2H", label: "H2H",
+        formattedValue: String(format: "%.2f", cfg.cornersWeightH2H),
+        onDelta: { d in cfg.cornersWeightH2H = max(0, min(1, cfg.cornersWeightH2H + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersWeightH2H) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+    } header: { Text("Веса λ CORNERS") }
+    footer: { Text("Сумма весов не обязана быть 1 — нормализуется автоматически.") }
+  }
+
+  // [Блок 6.3] Веса λ для ЖК
+  @ViewBuilder
+  private func cardsWeightsSection(_ cfg: TuningConfig) -> some View {
+    Section {
+      thresholdRow("cardsWeightRecentOwn", label: "Own cards",
+        formattedValue: String(format: "%.2f", cfg.cardsWeightRecentOwn),
+        onDelta: { d in cfg.cardsWeightRecentOwn = max(0, min(1, cfg.cardsWeightRecentOwn + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsWeightRecentOwn) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cardsWeightRecentOpp", label: "Opp cards",
+        formattedValue: String(format: "%.2f", cfg.cardsWeightRecentOpp),
+        onDelta: { d in cfg.cardsWeightRecentOpp = max(0, min(1, cfg.cardsWeightRecentOpp + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsWeightRecentOpp) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cardsWeightLeague", label: "League avg",
+        formattedValue: String(format: "%.2f", cfg.cardsWeightLeague),
+        onDelta: { d in cfg.cardsWeightLeague = max(0, min(1, cfg.cardsWeightLeague + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsWeightLeague) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cardsWeightFouls", label: "Fouls factor",
+        formattedValue: String(format: "%.2f", cfg.cardsWeightFouls),
+        onDelta: { d in cfg.cardsWeightFouls = max(0, min(1, cfg.cardsWeightFouls + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsWeightFouls) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cardsWeightReferee", label: "Referee",
+        formattedValue: String(format: "%.2f", cfg.cardsWeightReferee),
+        onDelta: { d in cfg.cardsWeightReferee = max(0, min(1, cfg.cardsWeightReferee + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsWeightReferee) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+
+      thresholdRow("cardsWeightH2H", label: "H2H",
+        formattedValue: String(format: "%.2f", cfg.cardsWeightH2H),
+        onDelta: { d in cfg.cardsWeightH2H = max(0, min(1, cfg.cardsWeightH2H + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsWeightH2H) },
+        step: 0.05, rangeLabel: "0.00 – 1.00")
+    } header: { Text("Веса λ CARDS") }
+    footer: { Text("Сумма весов не обязана быть 1 — нормализуется автоматически.") }
   }
 
   @ViewBuilder
@@ -2150,6 +2423,29 @@ struct SelfTuningView: View {
         cfg.autoExcludeMinBets = 20
         cfg.stopLossCapStreak = 4
         cfg.stopLossPauseStreak = 7
+        cfg.cornersEnabled = true
+        cfg.cardsEnabled = true
+        cfg.cornersMinEV = 0.03
+        cfg.cardsMinEV = 0.03
+        cfg.cornersMinQCS = 70
+        cfg.cardsMinQCS = 70
+        cfg.cornersMaxStake = 0.02
+        cfg.cardsMaxStake = 0.02
+        cfg.cornersMinSample = 5
+        cfg.cardsMinSample = 5
+        // [Блок 6.3] веса
+        cfg.cornersWeightRecentOwn = 0.35
+        cfg.cornersWeightRecentOpp = 0.25
+        cfg.cornersWeightLeague = 0.15
+        cfg.cornersWeightXG = 0.10
+        cfg.cornersWeightPossession = 0.05
+        cfg.cornersWeightH2H = 0.10
+        cfg.cardsWeightRecentOwn = 0.30
+        cfg.cardsWeightRecentOpp = 0.20
+        cfg.cardsWeightLeague = 0.15
+        cfg.cardsWeightFouls = 0.10
+        cfg.cardsWeightReferee = 0.20
+        cfg.cardsWeightH2H = 0.05
         cfg.updatedAt = Date()
         TuningService.log(context: context, kind: "threshold", target: "all",
                           before: before, after: "defaults", note: "Сброс к дефолтам")

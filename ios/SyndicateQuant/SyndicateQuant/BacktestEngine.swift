@@ -18,7 +18,9 @@ struct SegmentStats {
   var expectancy: Double { bets > 0 ? profit / Double(bets) : 0 }
 }
 
-// MARK: - BetRecord (Волна G, G8)
+// MARK: - BetRecord
+// [posterior-corners] Добавлено поле `market` (опционально — для обратной совместимости
+// с уже сохранёнными в SwiftData posterior-бакетами).
 
 struct BetRecord: Codable, Hashable {
   var probability: Double
@@ -26,6 +28,7 @@ struct BetRecord: Codable, Hashable {
   var probabilityHigh: Double
   var ev: Double
   var actual: Double
+  var market: String? = nil
 }
 
 // MARK: - Full report
@@ -94,17 +97,6 @@ struct WalkForwardReport {
 }
 
 // MARK: - Backtester
-//
-// [7.25] ВАЖНО про углы и карточки:
-//   Для того, чтобы walk-forward смог settle-ить CORNERS/CARDS, каждый Match
-//   должен иметь заполненные `homeCorners / awayCorners / homeYellows / awayYellows`
-//   (и опционально `homeReds / awayReds`). Это делает BacktestService,
-//   догружая /Games/{id} для завершённых матчей. Если поля nil —
-//   сигнал будет создан, но settle вернёт nil и ставка не попадёт в отчёт.
-//
-//   Котировки углов (marketId=45) и карточек (marketId=80) приходят из
-//   /Odds/{id}. BacktestService объединяет их с /Games/{id} в Match.oddsJSON
-//   перед вызовом run(...).
 
 struct WalkForwardBacktester {
 
@@ -138,10 +130,6 @@ struct WalkForwardBacktester {
         "awayFTResult": .number(aFT),
       ])
 
-      // fullOdds передаётся пустым: предполагается, что BacktestService уже
-      // вложил углы/карточки в oddsJSON (комбинированная структура).
-      // parseQuotes умеет читать оба ключа: "data" (от /Games/{id})
-      // и "bookmakers" (от /Odds/{id}) — см. Models.swift после патча.
       let signals = engine.portfolio(
         engine.signals(
           match: match, info: infoJSON, oddsJSON: oddsJSON,
@@ -167,12 +155,14 @@ struct WalkForwardBacktester {
         r.brierSum += (predicted - actualVal) * (predicted - actualVal)
         r.logLossSum += QuantMath.logLoss(predicted: predicted, actual: actualVal)
 
+        // [posterior-corners] Записываем market
         r.betRecords.append(BetRecord(
           probability: predicted,
           probabilityLow: s.probabilityLow,
           probabilityHigh: s.probabilityHigh,
           ev: s.ev,
-          actual: actualVal))
+          actual: actualVal,
+          market: s.market))
 
         let pnlMultiplier = outcome.pnlMultiplier(odds: s.odds)
         let pnl = s.stake * pnlMultiplier
@@ -273,16 +263,8 @@ struct WalkForwardBacktester {
     return "Odds 5.0+"
   }
 
-  // [7.23] settle расширен на 4 рынка.
-  // Для углов и карточек используем total = свои + чужие (либо карточки + красные).
-  // Если у Match не заполнены corners/yellows/reds — возвращаем nil,
-  // и ставка не попадёт в отчёт (без падения).
   private func settle(match: Match, signal: BetSignal) -> AsianOutcome? {
     switch signal.market {
-
-    // [7.24] 1X2 сохранён: старые записи в снапшотах могут иметь market="1X2".
-    // Новые сигналы по 1X2 не создаются (QuantEngine), но если что-то попало —
-    // settlement работает корректно.
     case "1X2":
       guard let h = match.homeFT, let a = match.awayFT else { return nil }
       let sel = signal.selection.lowercased()
@@ -328,11 +310,10 @@ struct WalkForwardBacktester {
   }
 }
 
-// MARK: - Волна E (E5): сравнение 4 моделей
+// MARK: - Multi-model backtester
 
 struct MultiModelBacktester {
 
-  /// Максимум матчей для оценки — чтобы не гонять всё 2-летнее полотно.
   static let maxMatches = 1500
 
   func run(
@@ -417,7 +398,7 @@ struct MultiModelBacktester {
   }
 }
 
-// MARK: - CalibrationEngine (совместимость)
+// MARK: - CalibrationEngine
 
 struct CalibrationEngine {
   static func brier(_ samples: [CalibrationSample]) -> Double {

@@ -110,6 +110,100 @@ enum UncertaintyBand {
   }
 }
 
+// MARK: - Signal thresholds
+
+struct SignalThresholds: Hashable {
+  var goalsMinEV: Double
+  var goalsMinQCS: Double
+  var goalsMaxStake: Double
+
+  var cornersEnabled: Bool
+  var cornersMinEV: Double
+  var cornersMinQCS: Double
+  var cornersMaxStake: Double
+  var cornersMinSample: Int
+
+  var cardsEnabled: Bool
+  var cardsMinEV: Double
+  var cardsMinQCS: Double
+  var cardsMaxStake: Double
+  var cardsMinSample: Int
+
+  static let `default` = SignalThresholds(
+    goalsMinEV: 0.03, goalsMinQCS: 78, goalsMaxStake: 0.025,
+    cornersEnabled: true,
+    cornersMinEV: 0.03, cornersMinQCS: 70,
+    cornersMaxStake: 0.02, cornersMinSample: 5,
+    cardsEnabled: true,
+    cardsMinEV: 0.03, cardsMinQCS: 70,
+    cardsMaxStake: 0.02, cardsMinSample: 5)
+
+  static func from(_ cfg: TuningConfig) -> SignalThresholds {
+    SignalThresholds(
+      goalsMinEV: 0.03, goalsMinQCS: 78, goalsMaxStake: 0.025,
+      cornersEnabled: cfg.cornersEnabled,
+      cornersMinEV: cfg.cornersMinEV,
+      cornersMinQCS: cfg.cornersMinQCS,
+      cornersMaxStake: cfg.cornersMaxStake,
+      cornersMinSample: cfg.cornersMinSample,
+      cardsEnabled: cfg.cardsEnabled,
+      cardsMinEV: cfg.cardsMinEV,
+      cardsMinQCS: cfg.cardsMinQCS,
+      cardsMaxStake: cfg.cardsMaxStake,
+      cardsMinSample: cfg.cardsMinSample)
+  }
+}
+
+// MARK: - Corner / Card weights
+
+struct CornerWeights: Hashable {
+  var recentOwn: Double
+  var recentOpp: Double
+  var leagueAvg: Double
+  var xgFactor: Double
+  var possession: Double
+  var h2h: Double
+
+  static let `default` = CornerWeights(
+    recentOwn: 0.35, recentOpp: 0.25,
+    leagueAvg: 0.15, xgFactor: 0.10,
+    possession: 0.05, h2h: 0.10)
+
+  static func from(_ cfg: TuningConfig) -> CornerWeights {
+    CornerWeights(
+      recentOwn: cfg.cornersWeightRecentOwn,
+      recentOpp: cfg.cornersWeightRecentOpp,
+      leagueAvg: cfg.cornersWeightLeague,
+      xgFactor: cfg.cornersWeightXG,
+      possession: cfg.cornersWeightPossession,
+      h2h: cfg.cornersWeightH2H)
+  }
+}
+
+struct CardWeights: Hashable {
+  var recentOwn: Double
+  var recentOpp: Double
+  var leagueAvg: Double
+  var fouls: Double
+  var referee: Double
+  var h2h: Double
+
+  static let `default` = CardWeights(
+    recentOwn: 0.30, recentOpp: 0.20,
+    leagueAvg: 0.15, fouls: 0.10,
+    referee: 0.20, h2h: 0.05)
+
+  static func from(_ cfg: TuningConfig) -> CardWeights {
+    CardWeights(
+      recentOwn: cfg.cardsWeightRecentOwn,
+      recentOpp: cfg.cardsWeightRecentOpp,
+      leagueAvg: cfg.cardsWeightLeague,
+      fouls: cfg.cardsWeightFouls,
+      referee: cfg.cardsWeightReferee,
+      h2h: cfg.cardsWeightH2H)
+  }
+}
+
 // MARK: - Match
 
 struct Match: Identifiable, Codable, Hashable {
@@ -213,9 +307,8 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var modelVoteDetail: String? = nil
 
   var oddsSource: String? = nil
-
-  // [8.2] Дата/время начала матча (из Match.start)
   var startTime: Date? = nil
+  var mss: Double? = nil
 }
 
 // MARK: - Team rating
@@ -255,6 +348,31 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var stopLossCapStreak: Int
   var stopLossPauseStreak: Int
   var updatedAt: Date
+
+  var cornersEnabled: Bool = true
+  var cardsEnabled: Bool = true
+  var cornersMinEV: Double = 0.03
+  var cardsMinEV: Double = 0.03
+  var cornersMinQCS: Double = 70
+  var cardsMinQCS: Double = 70
+  var cornersMaxStake: Double = 0.02
+  var cardsMaxStake: Double = 0.02
+  var cornersMinSample: Int = 5
+  var cardsMinSample: Int = 5
+
+  var cornersWeightRecentOwn: Double = 0.35
+  var cornersWeightRecentOpp: Double = 0.25
+  var cornersWeightLeague: Double = 0.15
+  var cornersWeightXG: Double = 0.10
+  var cornersWeightPossession: Double = 0.05
+  var cornersWeightH2H: Double = 0.10
+
+  var cardsWeightRecentOwn: Double = 0.30
+  var cardsWeightRecentOpp: Double = 0.20
+  var cardsWeightLeague: Double = 0.15
+  var cardsWeightFouls: Double = 0.10
+  var cardsWeightReferee: Double = 0.20
+  var cardsWeightH2H: Double = 0.05
 
   init(id: String = "current") {
     self.id = id
@@ -355,6 +473,50 @@ enum TuningService {
       cfg.playerImpactEnabled = Bool(last.beforeValue) ?? cfg.playerImpactEnabled
     case "teamRatingEnabled":
       cfg.teamRatingEnabled = Bool(last.beforeValue) ?? cfg.teamRatingEnabled
+    case "cornersEnabled":
+      cfg.cornersEnabled = Bool(last.beforeValue) ?? cfg.cornersEnabled
+    case "cardsEnabled":
+      cfg.cardsEnabled = Bool(last.beforeValue) ?? cfg.cardsEnabled
+    case "cornersMinEV":
+      cfg.cornersMinEV = Double(last.beforeValue) ?? cfg.cornersMinEV
+    case "cardsMinEV":
+      cfg.cardsMinEV = Double(last.beforeValue) ?? cfg.cardsMinEV
+    case "cornersMinQCS":
+      cfg.cornersMinQCS = Double(last.beforeValue) ?? cfg.cornersMinQCS
+    case "cardsMinQCS":
+      cfg.cardsMinQCS = Double(last.beforeValue) ?? cfg.cardsMinQCS
+    case "cornersMaxStake":
+      cfg.cornersMaxStake = Double(last.beforeValue) ?? cfg.cornersMaxStake
+    case "cardsMaxStake":
+      cfg.cardsMaxStake = Double(last.beforeValue) ?? cfg.cardsMaxStake
+    case "cornersMinSample":
+      cfg.cornersMinSample = Int(last.beforeValue) ?? cfg.cornersMinSample
+    case "cardsMinSample":
+      cfg.cardsMinSample = Int(last.beforeValue) ?? cfg.cardsMinSample
+    case "cornersWeightRecentOwn":
+      cfg.cornersWeightRecentOwn = Double(last.beforeValue) ?? cfg.cornersWeightRecentOwn
+    case "cornersWeightRecentOpp":
+      cfg.cornersWeightRecentOpp = Double(last.beforeValue) ?? cfg.cornersWeightRecentOpp
+    case "cornersWeightLeague":
+      cfg.cornersWeightLeague = Double(last.beforeValue) ?? cfg.cornersWeightLeague
+    case "cornersWeightXG":
+      cfg.cornersWeightXG = Double(last.beforeValue) ?? cfg.cornersWeightXG
+    case "cornersWeightPossession":
+      cfg.cornersWeightPossession = Double(last.beforeValue) ?? cfg.cornersWeightPossession
+    case "cornersWeightH2H":
+      cfg.cornersWeightH2H = Double(last.beforeValue) ?? cfg.cornersWeightH2H
+    case "cardsWeightRecentOwn":
+      cfg.cardsWeightRecentOwn = Double(last.beforeValue) ?? cfg.cardsWeightRecentOwn
+    case "cardsWeightRecentOpp":
+      cfg.cardsWeightRecentOpp = Double(last.beforeValue) ?? cfg.cardsWeightRecentOpp
+    case "cardsWeightLeague":
+      cfg.cardsWeightLeague = Double(last.beforeValue) ?? cfg.cardsWeightLeague
+    case "cardsWeightFouls":
+      cfg.cardsWeightFouls = Double(last.beforeValue) ?? cfg.cardsWeightFouls
+    case "cardsWeightReferee":
+      cfg.cardsWeightReferee = Double(last.beforeValue) ?? cfg.cardsWeightReferee
+    case "cardsWeightH2H":
+      cfg.cardsWeightH2H = Double(last.beforeValue) ?? cfg.cardsWeightH2H
     default: break
     }
     cfg.updatedAt = Date()
@@ -409,6 +571,26 @@ enum TuningService {
       summary: config.teamRatingEnabled ? "активно (≥ 3 матчей на команду)" : "выключено",
       detail: "Старт 1500, HFA 60, K=32→20; влияет на λ через glickoAdjust",
       enabled: config.teamRatingEnabled, flagKey: "teamRatingEnabled"))
+
+    out.append(AutoDecision(id: "corners", title: "Рынок CORNERS",
+      summary: config.cornersEnabled
+        ? String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, sample ≥ %d",
+                 config.cornersMinEV * 100, config.cornersMinQCS, config.cornersMinSample)
+        : "выключен",
+      detail: String(format: "Pinnacle. Вес λ: xG %.2f, H2H %.2f, poss %.2f",
+                     config.cornersWeightXG, config.cornersWeightH2H,
+                     config.cornersWeightPossession),
+      enabled: config.cornersEnabled, flagKey: "cornersEnabled"))
+
+    out.append(AutoDecision(id: "cards", title: "Рынок CARDS",
+      summary: config.cardsEnabled
+        ? String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, sample ≥ %d",
+                 config.cardsMinEV * 100, config.cardsMinQCS, config.cardsMinSample)
+        : "выключен",
+      detail: String(format: "Best available. Вес λ: fouls %.2f, ref %.2f, H2H %.2f",
+                     config.cardsWeightFouls, config.cardsWeightReferee,
+                     config.cardsWeightH2H),
+      enabled: config.cardsEnabled, flagKey: "cardsEnabled"))
 
     return out
   }
@@ -620,8 +802,6 @@ enum CorrelationBuilder {
   var openingOdds: Double?
   var movement: Double?
   var stakeMoney: Double?
-
-  // [8.2] Дата/время начала матча (опционально — безопасная миграция SwiftData)
   var matchStart: Date?
 
   init(signal: BetSignal, status: String = "OPEN") {
@@ -781,6 +961,13 @@ struct ModelComparison: Codable, Hashable, Identifiable {
   var sortino: Double
   var profitFactor: Double
 
+  var enrichmentProgress: Int = 0
+  var enrichmentTotal: Int = 0
+
+  // [posterior-corners] отдельные наборы бакетов для углов и ЖК
+  var posteriorCornersJSON: Data?
+  var posteriorCardsJSON: Data?
+
   init(id: String = "current") {
     self.id = id; self.version = 1
     self.builtAt = nil; self.fromDate = nil; self.toDate = nil
@@ -790,6 +977,7 @@ struct ModelComparison: Codable, Hashable, Identifiable {
     self.perLeagueMarketJSON = nil; self.evBucketsJSON = nil
     self.oddsBucketsJSON = nil; self.classificationJSON = nil
     self.posteriorJSON = nil; self.modelComparisonJSON = nil
+    self.posteriorCornersJSON = nil; self.posteriorCardsJSON = nil
     self.avgROI = 0; self.avgCLV = 0; self.brier = 0; self.logLoss = 0
     self.sharpe = 0; self.sortino = 0; self.profitFactor = 0
   }
@@ -822,6 +1010,15 @@ extension BacktestSnapshot {
   }
   func decodedPosteriorBuckets() -> [PosteriorBucket] {
     guard let d = posteriorJSON else { return [] }
+    return (try? JSONDecoder().decode([PosteriorBucket].self, from: d)) ?? []
+  }
+  // [posterior-corners]
+  func decodedPosteriorCornersBuckets() -> [PosteriorBucket] {
+    guard let d = posteriorCornersJSON else { return [] }
+    return (try? JSONDecoder().decode([PosteriorBucket].self, from: d)) ?? []
+  }
+  func decodedPosteriorCardsBuckets() -> [PosteriorBucket] {
+    guard let d = posteriorCardsJSON else { return [] }
     return (try? JSONDecoder().decode([PosteriorBucket].self, from: d)) ?? []
   }
   func decodedModelComparison() -> [ModelComparison] {
@@ -892,6 +1089,17 @@ struct EquityPoint: Identifiable, Hashable {
   let id: String; let date: Date
   let cumulativeProfit: Double; let cumulativeStaked: Double
   let bets: Int
+}
+
+struct BollingerPoint: Identifiable, Hashable {
+  var id: String
+  let date: Date
+  let index: Int
+  let value: Double
+  let ma: Double?
+  let upper: Double?
+  let lower: Double?
+  let isBreakout: Bool
 }
 
 enum Metrics {
@@ -978,6 +1186,39 @@ enum Metrics {
         cumulativeProfit: cumProfit, cumulativeStaked: cumStaked, bets: i + 1))
     }
     return curve
+  }
+
+  static func bollingerBands(
+    _ curve: [EquityPoint],
+    window: Int = 20,
+    sigmaMultiplier: Double = 2.0
+  ) -> [BollingerPoint] {
+    guard curve.count >= window else { return [] }
+    var out: [BollingerPoint] = []
+    out.reserveCapacity(curve.count)
+    for i in 0..<curve.count {
+      let p = curve[i]
+      if i < window - 1 {
+        out.append(BollingerPoint(
+          id: p.id, date: p.date, index: i,
+          value: p.cumulativeProfit,
+          ma: nil, upper: nil, lower: nil, isBreakout: false))
+        continue
+      }
+      let slice = curve[(i - window + 1)...i].map { $0.cumulativeProfit }
+      let mean = slice.reduce(0, +) / Double(slice.count)
+      let variance = slice.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(slice.count)
+      let sd = sqrt(variance)
+      let upper = mean + sigmaMultiplier * sd
+      let lower = mean - sigmaMultiplier * sd
+      let value = p.cumulativeProfit
+      let breakout = value > upper || value < lower
+      out.append(BollingerPoint(
+        id: p.id, date: p.date, index: i,
+        value: value, ma: mean, upper: upper, lower: lower,
+        isBreakout: breakout))
+    }
+    return out
   }
 }
 
@@ -1262,6 +1503,8 @@ final class BacktestService {
     snapshot.toDate = nil
     snapshot.totalMatches = 0
     snapshot.totalBets = 0
+    snapshot.enrichmentProgress = 0
+    snapshot.enrichmentTotal = 0
     try? context.save()
 
     let client = SStatsClient(settings: settings)
@@ -1425,6 +1668,9 @@ final class BacktestService {
     snapshot.sortino = report.sortino
     snapshot.profitFactor = report.profitFactor
 
+    snapshot.enrichmentTotal = prepared.count
+    snapshot.enrichmentProgress = min(prepared.count, ccCount)
+
     let encoder = JSONEncoder()
     snapshot.perLeagueJSON = try? encoder.encode(
       report.perLeague.mapValues { Self.toStored($0) })
@@ -1440,6 +1686,15 @@ final class BacktestService {
       report.byClassification.mapValues { Self.toStored($0) })
     snapshot.posteriorJSON = try? encoder.encode(
       Self.buildPosteriorBuckets(from: report.betRecords))
+    // [posterior-corners] Отдельные наборы
+    snapshot.posteriorCornersJSON = try? encoder.encode(
+      Self.buildPosteriorBuckets(from: report.betRecords.filter {
+        $0.market == "CORNERS"
+      }))
+    snapshot.posteriorCardsJSON = try? encoder.encode(
+      Self.buildPosteriorBuckets(from: report.betRecords.filter {
+        $0.market == "CARDS"
+      }))
     snapshot.modelComparisonJSON = try? encoder.encode(comparisons)
 
     snapshot.buildStatus = "ready"
@@ -1449,6 +1704,73 @@ final class BacktestService {
 
     progress(1.0, "Готово: \(report.matches) матчей, \(report.bets) ставок")
     return true
+  }
+
+  func continueEnrichmentInBackground(
+    chunkSize: Int = 30,
+    progress: @MainActor @escaping (Int, Int, String) -> Void = { _,_,_ in }
+  ) async {
+    guard let container = AppDependencies.shared.container else { return }
+    let context = ModelContext(container)
+    let snapshot = Self.fetchOrCreate(in: context)
+    guard snapshot.buildStatus == "ready" else { return }
+    guard snapshot.enrichmentProgress < snapshot.enrichmentTotal else { return }
+
+    let settings = AppSettings()
+    let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else { return }
+
+    let client = SStatsClient(settings: settings)
+    let engine = QuantEngine()
+
+    let fromDate = snapshot.fromDate ?? Date().addingTimeInterval(-90*86400)
+    let toDate = snapshot.toDate ?? Date()
+
+    var allMatches: [Match] = []
+    var cursor = fromDate
+    let cal = Calendar(identifier: .gregorian)
+    var pages = 0
+
+    while cursor < toDate && pages < Self.maxPagesPerMonth * Self.yearsBack * Self.monthsPerYear {
+      guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
+      let periodEnd = min(nextMonth, toDate)
+      if let r = try? await client.listGamesRange(
+          from: cursor, to: periodEnd,
+          limit: Self.gamesPerRequest, offset: 0) {
+        let items = r.object?["data"]?.array ?? []
+        let monthMatches = engine.matches(from: JSONValue.object(["data": .array(items)]))
+          .filter { !Self.isExcluded($0) }
+          .filter { Self.isInPool($0.league) }
+          .filter { $0.homeFT != nil && $0.awayFT != nil }
+        allMatches.append(contentsOf: monthMatches)
+      }
+      cursor = nextMonth
+      pages += 1
+      try? await Task.sleep(for: .milliseconds(400))
+    }
+
+    let needEnrich = allMatches.filter { m in
+      guard let arr = m.oddsJSON?.array else { return true }
+      let hasCorners = arr.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCorners) }
+      let hasCards = arr.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCards) }
+      return !hasCorners && !hasCards
+    }.sorted { ($0.start ?? .distantPast) > ($1.start ?? .distantPast) }
+
+    let chunk = needEnrich.prefix(chunkSize)
+    var done = 0
+    for m in chunk {
+      guard let nid = m.numericID else { continue }
+      _ = try? await client.fullOdds(gameId: nid)
+      done += 1
+      try? await Task.sleep(for: .milliseconds(400))
+      progress(done, chunk.count,
+               "Обогащено \(snapshot.enrichmentProgress + done)/\(snapshot.enrichmentTotal)")
+    }
+
+    snapshot.enrichmentProgress = min(snapshot.enrichmentTotal,
+                                       snapshot.enrichmentProgress + done)
+    snapshot.builtAt = Date()
+    try? context.save()
   }
 
   private static func fillCornersCards(into mm: inout Match,
@@ -1657,6 +1979,23 @@ final class BacktestService {
       delta: Self.buildPosteriorBuckets(from: delta.betRecords))
     snapshot.posteriorJSON = try? encoder.encode(newPosterior)
 
+    // [posterior-corners] Merge отдельных наборов
+    let oldCornersP = snapshot.decodedPosteriorCornersBuckets()
+    let newCornersP = Self.mergePosterior(
+      old: oldCornersP,
+      delta: Self.buildPosteriorBuckets(from: delta.betRecords.filter {
+        $0.market == "CORNERS"
+      }))
+    snapshot.posteriorCornersJSON = try? encoder.encode(newCornersP)
+
+    let oldCardsP = snapshot.decodedPosteriorCardsBuckets()
+    let newCardsP = Self.mergePosterior(
+      old: oldCardsP,
+      delta: Self.buildPosteriorBuckets(from: delta.betRecords.filter {
+        $0.market == "CARDS"
+      }))
+    snapshot.posteriorCardsJSON = try? encoder.encode(newCardsP)
+
     snapshot.totalMatches += delta.matches
     snapshot.totalBets += delta.bets
     snapshot.toDate = toDate
@@ -1777,7 +2116,8 @@ final class ScanCoordinator {
     var tuningNote: String? = nil
     var cornersSignals: Int = 0
     var cardsSignals: Int = 0
-    var liveDropped: Int = 0    // [8.2] сколько live-матчей отсеяли
+    var liveDropped: Int = 0
+    var h2hFetched: Int = 0
   }
 
   func scan(settings: AppSettings? = nil,
@@ -1802,6 +2142,10 @@ final class ScanCoordinator {
       guard let ctx = journalContext else { return TuningConfig() }
       return TuningService.fetchOrCreate(in: ctx)
     }()
+
+    let thresholds = SignalThresholds.from(tuning)
+    let cornerWeights = CornerWeights.from(tuning)
+    let cardWeights = CardWeights.from(tuning)
 
     let corrMatrix: CorrelationMatrix = {
       guard let ctx = journalContext else { return .empty }
@@ -1829,17 +2173,16 @@ final class ScanCoordinator {
     if !tuning.correlationEnabled { summary.notes.append("Self-Tuning: correlation отключён") }
     if !tuning.playerImpactEnabled { summary.notes.append("Self-Tuning: player impact отключён") }
     if !tuning.teamRatingEnabled { summary.notes.append("Self-Tuning: TeamRating отключён") }
+    if !thresholds.cornersEnabled { summary.notes.append("Self-Tuning: рынок CORNERS выключен") }
+    if !thresholds.cardsEnabled { summary.notes.append("Self-Tuning: рынок CARDS выключен") }
 
     do {
       let client = SStatsClient(settings: resolvedSettings)
       let engine = QuantEngine()
 
-      // [8.2] Шаг 1 — базовый список матчей, без учёта статуса
       let base = engine.matches(from: try await client.listToday())
         .filter { !Self.isExcluded($0) }
 
-      // [8.2] Шаг 2 — оставляем только НЕ начавшиеся (status == 2, NotStarted).
-      //        Live (3/4/5) и Finished (8) отсеиваем из сигналов.
       var all = base.filter { m in
         guard let st = m.status else { return true }
         return st == 2
@@ -1859,8 +2202,19 @@ final class ScanCoordinator {
 
       let posteriorBuckets: [PosteriorBucket] = tuning.posteriorEnabled
         ? Self.loadPosteriorBuckets() : []
+      // [posterior-corners] отдельные наборы
+      let posteriorCornersBuckets: [PosteriorBucket] = tuning.posteriorEnabled
+        ? Self.loadPosteriorCornersBuckets() : []
+      let posteriorCardsBuckets: [PosteriorBucket] = tuning.posteriorEnabled
+        ? Self.loadPosteriorCardsBuckets() : []
+
       let usableBuckets = posteriorBuckets.filter { $0.n >= 20 }.count
       if usableBuckets > 0 { summary.notes.append("Posterior: \(usableBuckets) надёжных бакетов") }
+      let usableCorners = posteriorCornersBuckets.filter { $0.n >= 20 }.count
+      let usableCards = posteriorCardsBuckets.filter { $0.n >= 20 }.count
+      if usableCorners > 0 || usableCards > 0 {
+        summary.notes.append("Posterior CORNERS/CARDS: \(usableCorners)/\(usableCards) надёжных")
+      }
 
       let excludedRules: [AutoExcludeRule] = tuning.autoExcludeEnabled
         ? Self.loadExcludedRules(minROI: tuning.autoExcludeMinROI,
@@ -1872,6 +2226,7 @@ final class ScanCoordinator {
       var lineupsFound = 0
       var cornersCount = 0
       var cardsCount = 0
+      var h2hFetched = 0
 
       for match in matches {
         guard let h = match.homeID, let a = match.awayID else { continue }
@@ -1892,6 +2247,20 @@ final class ScanCoordinator {
           fullBooks = (try? await client.fullOdds(gameId: nid)) ?? []
         }
 
+        var h2hRecords: [TeamRecord] = []
+        let hasCornersOrCards = fullBooks.contains { book in
+          book.odds.contains { m in
+            m.marketId == MarketID.totalCorners || m.marketId == MarketID.totalCards
+          }
+        }
+        if hasCornersOrCards && (thresholds.cornersEnabled || thresholds.cardsEnabled) {
+          h2hRecords = await client.fetchH2H(
+            homeID: h, awayID: a,
+            homeName: match.home, awayName: match.away,
+            count: 3)
+          if !h2hRecords.isEmpty { h2hFetched += 1 }
+        }
+
         let glicko = try? await client.glicko(match.id)
 
         let ratings: (Double?, Double?) = {
@@ -1910,10 +2279,18 @@ final class ScanCoordinator {
           match: match, info: info, oddsJSON: oddsFromInfo,
           fullOdds: fullBooks,
           homeHistory: hs, awayHistory: awayRecords, glicko: glicko,
+          h2hRecords: h2hRecords,
           posteriorBuckets: posteriorBuckets,
+          posteriorBucketsByMarket: [
+            "CORNERS": posteriorCornersBuckets,
+            "CARDS": posteriorCardsBuckets
+          ],
           posteriorWeight: tuning.posteriorWeight,
           teamRatings: (home: ratings.0, away: ratings.1),
-          upcomingLineups: lineups)
+          upcomingLineups: lineups,
+          thresholds: thresholds,
+          cornerWeights: cornerWeights,
+          cardWeights: cardWeights)
 
         for sig in s {
           if sig.market == "CORNERS" { cornersCount += 1 }
@@ -1941,7 +2318,9 @@ final class ScanCoordinator {
         signalsOut.append(contentsOf: s)
       }
       summary.lineupsFound = lineupsFound
+      summary.h2hFetched = h2hFetched
       if lineupsFound > 0 { summary.notes.append("Lineups: \(lineupsFound)") }
+      if h2hFetched > 0 { summary.notes.append("H2H загружено: \(h2hFetched)") }
       summary.cornersSignals = cornersCount
       summary.cardsSignals = cardsCount
 
@@ -1958,7 +2337,8 @@ final class ScanCoordinator {
         excludedRules: excludedRules,
         stopLoss: stopState,
         correlationMatrix: tuning.correlationEnabled ? corrMatrix : nil,
-        bankroll: resolvedSettings.effectiveBankroll)
+        bankroll: resolvedSettings.effectiveBankroll,
+        thresholds: thresholds)
       summary.finishedAt = Date()
       summary.success = true
 
@@ -1994,6 +2374,21 @@ final class ScanCoordinator {
     let context = ModelContext(container)
     let snap = BacktestService.fetchOrCreate(in: context)
     return snap.decodedPosteriorBuckets()
+  }
+
+  // [posterior-corners]
+  private static func loadPosteriorCornersBuckets() -> [PosteriorBucket] {
+    guard let container = AppDependencies.shared.container else { return [] }
+    let context = ModelContext(container)
+    let snap = BacktestService.fetchOrCreate(in: context)
+    return snap.decodedPosteriorCornersBuckets()
+  }
+
+  private static func loadPosteriorCardsBuckets() -> [PosteriorBucket] {
+    guard let container = AppDependencies.shared.container else { return [] }
+    let context = ModelContext(container)
+    let snap = BacktestService.fetchOrCreate(in: context)
+    return snap.decodedPosteriorCardsBuckets()
   }
 
   private static func parseUpcomingLineups(from info: JSONValue)
@@ -2140,12 +2535,17 @@ final class LiveMonitor: ObservableObject {
   @Published private(set) var lastError: String?
   private var observed: [String: Int?] = [:]
   private var task: Task<Void, Never>?
+  private var cycleCounter: Int = 0
+
+  private let fullOddsEveryNCycles = 5
+
   private init() {}
 
   func observe(gameID: String, numericID: Int?) { observed[gameID] = numericID }
   func clearObserved() {
     observed.removeAll(); snapshots.removeAll()
     previous.removeAll(); movements.removeAll()
+    cycleCounter = 0
   }
   func previousSnapshotForDebug(matchID: String) -> OddsSnapshot? { return previous[matchID] }
 
@@ -2176,10 +2576,21 @@ final class LiveMonitor: ObservableObject {
     var newSnapshots: [String: OddsSnapshot] = [:]
     var newMovements: [LineMovement] = []
 
+    cycleCounter += 1
+    let doFullFetch = (cycleCounter % fullOddsEveryNCycles == 0)
+
     for (gameID, numericID) in observed {
       guard let nid = numericID else { continue }
-      guard let raw = try? await client.odds(numericID: nid) else { continue }
-      let parsed = Self.parseOddsByBook(raw)
+
+      let parsed: [String: [String: Double]]
+      if doFullFetch {
+        guard let books = try? await client.fullOdds(gameId: nid),
+              !books.isEmpty else { continue }
+        parsed = Self.parseFullBooksToDict(books)
+      } else {
+        guard let raw = try? await client.odds(numericID: nid) else { continue }
+        parsed = Self.parseOddsByBook(raw)
+      }
       guard !parsed.isEmpty else { continue }
 
       let snap = OddsSnapshot(gameID: gameID, numericID: nid,
@@ -2212,6 +2623,34 @@ final class LiveMonitor: ObservableObject {
     self.lastTick = Date()
     self.lastError = newSnapshots.isEmpty
       ? (observed.isEmpty ? "Нет активных матчей" : "Не удалось получить котировки") : nil
+  }
+
+  static func parseFullBooksToDict(_ books: [BookmakerOdds]) -> [String: [String: Double]] {
+    var out: [String: [String: Double]] = [:]
+    for b in books {
+      for m in b.odds {
+        let market: String
+        switch m.marketId {
+        case MarketID.goals, MarketID.goalsHome, MarketID.goalsAway:
+          market = "GOALS"
+        case MarketID.totalCorners:
+          market = "CORNERS"
+        case MarketID.totalCards:
+          market = "CARDS"
+        default:
+          continue
+        }
+        for p in m.odds {
+          let line = OddsQuery.extractLine(from: p.name)
+          let key = "\(market)|\(p.name.lowercased())|\(line.map { String($0) } ?? "")"
+          var byBook = out[key] ?? [:]
+          let bidStr = String(b.bookmakerId)
+          byBook[bidStr] = max(byBook[bidStr] ?? 0, p.value)
+          out[key] = byBook
+        }
+      }
+    }
+    return out
   }
 
   static func parseOddsByBook(_ json: JSONValue) -> [String: [String: Double]] {

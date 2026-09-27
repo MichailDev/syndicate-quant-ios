@@ -395,10 +395,6 @@ final class SStatsClient {
     } catch { return [] }
   }
 
-  /// [8.1] Обогащённая история: принудительно тянет /Games/{id} для последних
-  /// N матчей команды, чтобы получить corners / yellowCards / redCards
-  /// (в /Games/list их нет). Используется в SignalDetailView для превью
-  /// по конкретному рынку.
   func fetchTeamHistoryEnriched(teamID: String, count: Int = 5) async -> [TeamRecord] {
     do {
       let list = try await listTeam(teamID, limit: max(count * 2, 15))
@@ -417,6 +413,58 @@ final class SStatsClient {
       }
       return out.sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
     } catch { return [] }
+  }
+
+  /// [Блок 6.2] Личные встречи (H2H).
+  /// Тянем историю home team, фильтруем матчи, где соперник — away team.
+  /// Возвращаем последние `count` матчей (chronological desc).
+  /// Плюс fallback: если по home не нашлось, пробуем со стороны away.
+  func fetchH2H(homeID: String, awayID: String,
+                homeName: String, awayName: String,
+                count: Int = 3) async -> [TeamRecord] {
+    let engine = QuantEngine()
+    let target = max(count, 5)
+
+    // Основной путь: история home, фильтр по away
+    if let list = try? await listTeam(homeID, limit: target * 4) {
+      let items = matches(from: list)
+      let h2hGames = items.filter { m in
+        (m.homeID == awayID && m.awayID == homeID) ||
+        (m.homeID == homeID && m.awayID == awayID)
+      }.prefix(target)
+      var out: [TeamRecord] = []
+      for m in h2hGames {
+        if let payload = try? await gameInfo(m.id),
+           let rec = engine.teamRecord(from: payload, targetID: homeID) {
+          out.append(rec)
+        }
+        try? await Task.sleep(for: .milliseconds(300))
+      }
+      if !out.isEmpty {
+        return out.sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+      }
+    }
+
+    // Fallback: история away, фильтр по home
+    if let list = try? await listTeam(awayID, limit: target * 4) {
+      let items = matches(from: list)
+      let h2hGames = items.filter { m in
+        (m.homeID == awayID && m.awayID == homeID) ||
+        (m.homeID == homeID && m.awayID == awayID)
+      }.prefix(target)
+      var out: [TeamRecord] = []
+      for m in h2hGames {
+        if let payload = try? await gameInfo(m.id),
+           let rec = engine.teamRecord(from: payload, targetID: awayID) {
+          out.append(rec)
+        }
+        try? await Task.sleep(for: .milliseconds(300))
+      }
+      if !out.isEmpty {
+        return out.sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+      }
+    }
+    return []
   }
 
   // MARK: - Cache policy
