@@ -51,6 +51,7 @@
 	<array>
 		<string>com.syndicatequant.app.refresh</string>
 		<string>com.syndicatequant.app.processing</string>
+		<string>com.syndicatequant.app.enrich</string>
 	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
