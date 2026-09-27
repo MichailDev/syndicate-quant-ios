@@ -150,7 +150,7 @@ struct RootView: View {
     }
     .listStyle(.insetGrouped)
     .contentMargins(.top, 4, for: .scrollContent)
-    .navigationTitle("SYNDICATE QUANT")
+    .navigationTitle("OVERBET")
     .navigationBarTitleDisplayMode(.large)
     .refreshable { await refresh() }
   }
