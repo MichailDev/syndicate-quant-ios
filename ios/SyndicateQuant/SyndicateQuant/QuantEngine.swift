@@ -1,5 +1,7 @@
 import Foundation
 
+// MARK: - TeamRecord
+
 struct TeamRecord: Hashable, Codable {
   var id: String
   var date: Date?
@@ -19,6 +21,17 @@ struct TeamRecord: Hashable, Codable {
   var referee: String?
   var isHome: Bool = true
   var players: [PlayerRow] = []
+  var reds: Double? = nil
+  var oppReds: Double? = nil
+
+  var cardsPlusReds: Double? {
+    guard cards != nil || reds != nil else { return nil }
+    return (cards ?? 0) + (reds ?? 0)
+  }
+  var oppCardsPlusReds: Double? {
+    guard oppCards != nil || oppReds != nil else { return nil }
+    return (oppCards ?? 0) + (oppReds ?? 0)
+  }
 }
 
 struct PlayerRow: Hashable, Codable {
@@ -137,7 +150,9 @@ struct QuantEngine {
       oppXg:      number(statistics, ["expectedGoals" + Opp])
                     ?? number(statistics, ["calculatedXg" + Opp]),
       referee: string(o, ["refereeName", "referee"]),
-      isHome: isHome, players: [])
+      isHome: isHome, players: [],
+      reds:    number(statistics, ["redCards" + Pref]),
+      oppReds: number(statistics, ["redCards" + Opp]))
   }
 
   func teamRecord(from payload: JSONValue, targetID: String) -> TeamRecord? {
@@ -165,7 +180,6 @@ struct QuantEngine {
     glicko: JSONValue? = nil,
     h2hRecords: [TeamRecord] = [],
     posteriorBuckets: [PosteriorBucket] = [],
-    // [posterior-corners] Отдельные наборы по рынкам
     posteriorBucketsByMarket: [String: [PosteriorBucket]] = [:],
     posteriorWeight: Double = QuantEngine.defaultPosteriorWeight,
     teamRatings: (home: Double?, away: Double?) = (nil, nil),
@@ -187,21 +201,27 @@ struct QuantEngine {
     var quotes = parseQuotes(oddsJSON)
     quotes.append(contentsOf: parseCornersCardsQuotes(fullOdds))
 
+    // [W3a] OOS-блокировка рынков — фильтруем котировки до группировки.
+    if !thresholds.blockedByOOS.isEmpty {
+      quotes = quotes.filter { !thresholds.blockedByOOS.contains($0.market) }
+    }
+
     var out: [BetSignal] = []
     let grouped = Dictionary(grouping: quotes, by: { key($0) })
     let refereeName = string(info.allObjects().first ?? [:], ["refereeName", "referee"])
     let ref = refereeProfile(homeHistory + awayHistory, refereeName)
 
-    let combinedSample = min(homeHistory.count, awayHistory.count)
-    let sampleClass = SampleClass.classify(combinedSample)
-
     let sourceScore = 90.0
-    let sampleScore = sampleClass.dcsScore
     let consensusScore = min(100.0, Double(max(quotes.count, 1)) * 12.0)
     let freshnessScore = 90.0
     let definitionScore = 85.0
-    let dcs = 0.30 * sourceScore + 0.25 * sampleScore
-      + 0.20 * consensusScore + 0.15 * freshnessScore + 0.10 * definitionScore
+
+    let goalsHomeSample   = homeHistory.compactMap { $0.gf }.count
+    let goalsAwaySample   = awayHistory.compactMap { $0.gf }.count
+    let cornersHomeSample = homeHistory.compactMap { $0.corners }.count
+    let cornersAwaySample = awayHistory.compactMap { $0.corners }.count
+    let cardsHomeSample   = homeHistory.compactMap { $0.cards }.count
+    let cardsAwaySample   = awayHistory.compactMap { $0.cards }.count
 
     let totalDist = QuantMath.totalDistribution(matchModel.matrix)
 
@@ -210,19 +230,41 @@ struct QuantEngine {
       guard let median = QuantMath.median(qs.map { $0.odds }) else { continue }
       guard let q = qs.max(by: { $0.odds < $1.odds }) else { continue }
 
+      // [W3a] Дополнительная страховка (на случай если блокировка
+      // выставилась уже после группировки).
+      if thresholds.blockedByOOS.contains(q.market) { continue }
+
       if q.market == "CORNERS" && !thresholds.cornersEnabled { continue }
       if q.market == "CARDS"   && !thresholds.cardsEnabled   { continue }
-      if q.market == "CORNERS" && combinedSample < thresholds.cornersMinSample { continue }
-      if q.market == "CARDS"   && combinedSample < thresholds.cardsMinSample   { continue }
+
+      let marketHomeSample: Int
+      let marketAwaySample: Int
+      switch q.market {
+      case "GOALS":
+        marketHomeSample = goalsHomeSample
+        marketAwaySample = goalsAwaySample
+      case "CORNERS":
+        marketHomeSample = cornersHomeSample
+        marketAwaySample = cornersAwaySample
+      case "CARDS":
+        marketHomeSample = cardsHomeSample
+        marketAwaySample = cardsAwaySample
+      default:
+        marketHomeSample = homeHistory.count
+        marketAwaySample = awayHistory.count
+      }
+      let marketSample = min(marketHomeSample, marketAwaySample)
+      let marketSampleClass = SampleClass.classify(marketSample)
+
+      let dcs = 0.30 * sourceScore + 0.25 * marketSampleClass.dcsScore
+              + 0.20 * consensusScore + 0.15 * freshnessScore
+              + 0.10 * definitionScore
 
       let sharp = sharpGuard(qs, median: median)
       let mss = marketSupportScore(quotes: qs, median: median)
 
       let p: Double
       let modelName: String
-      var voteCount: Int? = nil
-      var voteDetail: String? = nil
-
       if q.market == "GOALS" {
         p = totalProbabilityFromDistribution(q, dist: totalDist)
         modelName = "ENSEMBLE(DC/BIV/NB)+MC"
@@ -240,7 +282,6 @@ struct QuantEngine {
         modelName = "NB+XG+POSS+H2H"
       } else { continue }
 
-      // [posterior-corners] Выбор набора бакетов: per-market → fallback global
       let effectiveBuckets: [PosteriorBucket] = {
         if let perMarket = posteriorBucketsByMarket[q.market], !perMarket.isEmpty {
           return perMarket
@@ -252,33 +293,17 @@ struct QuantEngine {
         match: match, q: q, p: p, dcs: dcs, quotes: qs,
         sharp: sharp, mss: mss,
         modelOutcomes: matchModel.outcomes, modelName: modelName,
-        sampleClass: sampleClass,
-        homeSample: homeHistory.count, awaySample: awayHistory.count,
+        sampleClass: marketSampleClass,
+        homeSample: marketHomeSample, awaySample: marketAwaySample,
+        sample: marketSample,
         posteriorBuckets: effectiveBuckets,
         posteriorWeight: posteriorWeight,
-        modelVote: voteCount) {
-
-        var keep = true
-        if q.market == "CORNERS" {
-          if s.ev < thresholds.cornersMinEV { keep = false }
-          if s.qcs < thresholds.cornersMinQCS { keep = false }
-          s.stake = min(s.stake, thresholds.cornersMaxStake)
-        } else if q.market == "CARDS" {
-          if s.ev < thresholds.cardsMinEV { keep = false }
-          if s.qcs < thresholds.cardsMinQCS { keep = false }
-          s.stake = min(s.stake, thresholds.cardsMaxStake)
-        } else if q.market == "GOALS" {
-          if s.ev < thresholds.goalsMinEV { keep = false }
-          if s.qcs < thresholds.goalsMinQCS { keep = false }
-          s.stake = min(s.stake, thresholds.goalsMaxStake)
-        }
-        guard keep else { continue }
+        thresholds: thresholds,
+        modelVote: nil) {
 
         if hImpact < 0.999 || aImpact < 0.999 {
           s.playerImpactHome = hImpact; s.playerImpactAway = aImpact
         }
-        s.modelVote = voteCount
-        s.modelVoteDetail = voteDetail
         out.append(s)
       }
     }
@@ -323,9 +348,15 @@ struct QuantEngine {
     let aOwn = QuantMath.shrink(awayHistory.compactMap { $0.corners }, baseline: nil, k: 8) ?? 5.0
     let aOpp = QuantMath.shrink(awayHistory.compactMap { $0.oppCorners }, baseline: nil, k: 8) ?? 5.0
 
+    let recentTotal = weights.recentOwn + weights.recentOpp
+    let ownShare = recentTotal > 0 ? weights.recentOwn / recentTotal : 0.55
+    let oppShare = recentTotal > 0 ? weights.recentOpp / recentTotal : 0.45
+
+    let homeExpected = ownShare * hOwn + oppShare * aOpp
+    let awayExpected = ownShare * aOwn + oppShare * hOpp
+    let recentExpected = homeExpected + awayExpected
+
     let leagueAvgTotal = 10.5
-    let recentOwn = hOwn + aOwn
-    let recentOpp = hOpp + aOpp
 
     let allXG = (homeHistory + awayHistory).compactMap { $0.xg }
     let avgXG = allXG.isEmpty ? 1.30
@@ -341,22 +372,21 @@ struct QuantEngine {
       guard let c = r.corners, let oc = r.oppCorners else { return nil }
       return c + oc
     }
-    let h2hAvg = h2hTotals.isEmpty ? nil
+    let h2hAvg = h2hTotals.isEmpty ? leagueAvgTotal
       : h2hTotals.reduce(0, +) / Double(h2hTotals.count)
 
-    let cOwn = recentOwn
-    let cOpp = recentOpp
+    let cRecent = recentExpected
     let cLeague = leagueAvgTotal
-    let cXG = recentOwn * xgAdj
-    let cPoss = recentOwn * possAdj
-    let cH2H = h2hAvg ?? cLeague
+    let cXG = recentExpected * xgAdj
+    let cPoss = recentExpected * possAdj
+    let cH2H = h2hAvg
 
-    let sumW = weights.recentOwn + weights.recentOpp + weights.leagueAvg
-      + weights.xgFactor + weights.possession + weights.h2h
+    let wRecent = weights.recentOwn + weights.recentOpp
+    let sumW = wRecent + weights.leagueAvg
+             + weights.xgFactor + weights.possession + weights.h2h
     let sumSafe = sumW > 0 ? sumW : 1.0
 
-    let lambda = (weights.recentOwn * cOwn
-                + weights.recentOpp * cOpp
+    let lambda = (wRecent * cRecent
                 + weights.leagueAvg * cLeague
                 + weights.xgFactor * cXG
                 + weights.possession * cPoss
@@ -380,7 +410,7 @@ struct QuantEngine {
                              weights: weights)
 
     let totals = (homeHistory + awayHistory).compactMap { r -> Double? in
-      guard let c = r.cards, let oc = r.oppCards else { return nil }
+      guard let c = r.cardsPlusReds, let oc = r.oppCardsPlusReds else { return nil }
       return c + oc
     }
     let nbVar = lambda + (lambda * lambda) / QuantMath.nbCardsR
@@ -394,10 +424,10 @@ struct QuantEngine {
     h2hRecords: [TeamRecord], ref: RefProfile,
     weights: CardWeights
   ) -> Double {
-    let hOwn = QuantMath.shrink(homeHistory.compactMap { $0.cards }, baseline: nil, k: 8) ?? 2.0
-    let hOpp = QuantMath.shrink(homeHistory.compactMap { $0.oppCards }, baseline: nil, k: 8) ?? 2.0
-    let aOwn = QuantMath.shrink(awayHistory.compactMap { $0.cards }, baseline: nil, k: 8) ?? 2.0
-    let aOpp = QuantMath.shrink(awayHistory.compactMap { $0.oppCards }, baseline: nil, k: 8) ?? 2.0
+    let hOwn = QuantMath.shrink(homeHistory.compactMap { $0.cardsPlusReds }, baseline: nil, k: 8) ?? 2.0
+    let hOpp = QuantMath.shrink(homeHistory.compactMap { $0.oppCardsPlusReds }, baseline: nil, k: 8) ?? 2.0
+    let aOwn = QuantMath.shrink(awayHistory.compactMap { $0.cardsPlusReds }, baseline: nil, k: 8) ?? 2.0
+    let aOpp = QuantMath.shrink(awayHistory.compactMap { $0.oppCardsPlusReds }, baseline: nil, k: 8) ?? 2.0
 
     let leagueAvgTotal = 4.0
     let recentOwn = hOwn + aOwn
@@ -415,7 +445,7 @@ struct QuantEngine {
     }()
 
     let h2hTotals = h2hRecords.compactMap { r -> Double? in
-      guard let c = r.cards, let oc = r.oppCards else { return nil }
+      guard let c = r.cardsPlusReds, let oc = r.oppCardsPlusReds else { return nil }
       return c + oc
     }
     let h2hAvg = h2hTotals.isEmpty ? nil
@@ -557,9 +587,10 @@ struct QuantEngine {
     dcs: Double, quotes: [Quote], sharp: SharpGuard, mss: Double,
     modelOutcomes: (home: Double, draw: Double, away: Double),
     modelName: String, sampleClass: SampleClass,
-    homeSample: Int, awaySample: Int,
+    homeSample: Int, awaySample: Int, sample: Int,
     posteriorBuckets: [PosteriorBucket],
     posteriorWeight: Double,
+    thresholds: SignalThresholds,
     modelVote: Int? = nil
   ) -> BetSignal? {
     let pRaw = p
@@ -619,16 +650,24 @@ struct QuantEngine {
     let rs = max(0, 100 * (1 - interval.uncertainty))
     let qcs = 0.30 * mes + 0.20 * dcs + 0.20 * ms + 0.15 * ts + 0.15 * rs
 
-    let classification = classify(ev: ev, robustEV: robustEV, qcs: qcs,
-                                  ms: ms, dcs: dcs, anomaly: anomaly,
-                                  extreme: extreme, conflict: conflict,
-                                  modelVote: modelVote)
+    let classification = classify(
+      ev: ev, robustEV: robustEV, qcs: qcs,
+      ms: ms, dcs: dcs, mss: mss,
+      uncertainty: interval.uncertainty, sample: sample,
+      market: q.market, thresholds: thresholds,
+      anomaly: anomaly, extreme: extreme, conflict: conflict,
+      modelVote: modelVote)
     guard classification != "X NO BET" else { return nil }
 
     let band = UncertaintyBand.from(interval.uncertainty)
     let fullKelly = QuantMath.kelly(p: robustP, odds: q.odds)
     let quarterKelly = 0.25 * fullKelly
-    let stakeCap: Double = (classification == "S BET") ? 0.025 : 0.02
+    let stakeCap: Double
+    switch q.market {
+    case "CORNERS": stakeCap = thresholds.cornersMaxStake
+    case "CARDS":   stakeCap = thresholds.cardsMaxStake
+    default:        stakeCap = thresholds.goalsMaxStake
+    }
     let rawStake = min(stakeCap, quarterKelly * band.kellyMultiplier)
 
     var signal = BetSignal(
@@ -677,21 +716,62 @@ struct QuantEngine {
   }
 
   private func classify(ev: Double, robustEV: Double, qcs: Double,
-                        ms: Double, dcs: Double,
+                        ms: Double, dcs: Double, mss: Double,
+                        uncertainty: Double, sample: Int,
+                        market: String,
+                        thresholds: SignalThresholds,
                         anomaly: Bool, extreme: Bool, conflict: Bool,
                         modelVote: Int? = nil) -> String {
     if anomaly || extreme || conflict { return "X NO BET" }
+
+    let minEV: Double
+    let minRobustEV: Double
+    let minQCS: Double
+    let minMSS: Double
+    let maxUncertainty: Double
+    let minSample: Int
+    switch market {
+    case "CORNERS":
+      minEV = thresholds.cornersMinEV
+      minRobustEV = thresholds.cornersMinRobustEV
+      minQCS = thresholds.cornersMinQCS
+      minMSS = thresholds.cornersMinMSS
+      maxUncertainty = thresholds.cornersMaxUncertainty
+      minSample = thresholds.cornersMinSample
+    case "CARDS":
+      minEV = thresholds.cardsMinEV
+      minRobustEV = thresholds.cardsMinRobustEV
+      minQCS = thresholds.cardsMinQCS
+      minMSS = thresholds.cardsMinMSS
+      maxUncertainty = thresholds.cardsMaxUncertainty
+      minSample = thresholds.cardsMinSample
+    default:
+      minEV = thresholds.goalsMinEV
+      minRobustEV = thresholds.goalsMinRobustEV
+      minQCS = thresholds.goalsMinQCS
+      minMSS = thresholds.goalsMinMSS
+      maxUncertainty = thresholds.goalsMaxUncertainty
+      minSample = thresholds.goalsMinSample
+    }
+
+    guard sample >= minSample else { return "X NO BET" }
+    guard uncertainty <= maxUncertainty else { return "X NO BET" }
+    guard robustEV >= minRobustEV else { return "X NO BET" }
+    guard mss >= minMSS else { return "X NO BET" }
+
     let canS: Bool; let canA: Bool
     if let v = modelVote { canS = (v >= 4); canA = (v >= 3) }
     else { canS = true; canA = true }
 
-    if canS && robustEV > 0 && ev >= 0.07 && qcs >= 85 && ms >= 50 && dcs >= 60 {
+    if canS && robustEV > 0 && ev >= max(0.07, minEV)
+       && qcs >= max(85, minQCS) && ms >= 50 && dcs >= 60 {
       return "S BET"
     }
-    if canA && robustEV > 0 && ev >= 0.05 && qcs >= 78 && ms >= 50 && dcs >= 60 {
+    if canA && robustEV > 0 && ev >= max(0.05, minEV)
+       && qcs >= max(78, minQCS) && ms >= 50 && dcs >= 60 {
       return "A BET"
     }
-    if ev >= 0.03 && robustEV > 0 { return "B LEAN" }
+    if ev >= minEV && robustEV > 0 { return "B LEAN" }
     if ev > 0 { return "C WATCH" }
     return "X NO BET"
   }
@@ -712,9 +792,21 @@ struct QuantEngine {
       .filter { $0.robustEV > 0 }
       .filter { s in
         switch s.market {
-        case "CORNERS": return s.qcs >= thresholds.cornersMinQCS && s.dcs >= 60
-        case "CARDS":   return s.qcs >= thresholds.cardsMinQCS && s.dcs >= 60
-        default:        return s.qcs >= thresholds.goalsMinQCS && s.dcs >= 60
+        case "CORNERS":
+          return s.qcs >= thresholds.cornersMinQCS
+              && s.robustEV >= thresholds.cornersMinRobustEV
+              && s.uncertainty <= thresholds.cornersMaxUncertainty
+              && s.dcs >= 60
+        case "CARDS":
+          return s.qcs >= thresholds.cardsMinQCS
+              && s.robustEV >= thresholds.cardsMinRobustEV
+              && s.uncertainty <= thresholds.cardsMaxUncertainty
+              && s.dcs >= 60
+        default:
+          return s.qcs >= thresholds.goalsMinQCS
+              && s.robustEV >= thresholds.goalsMinRobustEV
+              && s.uncertainty <= thresholds.goalsMaxUncertainty
+              && s.dcs >= 60
         }
       }
       .filter { !AutoExclude.isExcluded(league: $0.league, market: $0.market,
@@ -879,8 +971,8 @@ struct QuantEngine {
     let r = records.filter {
       ($0.referee ?? "").caseInsensitiveCompare(name) == .orderedSame
     }
-    let cards = r.map { ($0.cards ?? 0) + ($0.oppCards ?? 0) }
-    let allCards = records.compactMap { ($0.cards ?? 0) + ($0.oppCards ?? 0) }
+    let cards = r.map { ($0.cardsPlusReds ?? 0) + ($0.oppCardsPlusReds ?? 0) }
+    let allCards = records.compactMap { ($0.cardsPlusReds ?? 0) + ($0.oppCardsPlusReds ?? 0) }
     let leagueMean = QuantMath.mean(allCards) ?? 4.0
     let totalCardsInt = Int(cards.reduce(0, +))
     let totalGames = max(cards.count, 1)

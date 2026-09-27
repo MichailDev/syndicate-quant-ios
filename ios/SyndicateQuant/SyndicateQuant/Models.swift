@@ -85,8 +85,6 @@ enum SampleClass: String, Codable {
   }
 }
 
-// MARK: - Uncertainty band
-
 enum UncertaintyBand {
   case low, medium, high
   static func from(_ u: Double) -> UncertaintyBand {
@@ -114,43 +112,70 @@ enum UncertaintyBand {
 
 struct SignalThresholds: Hashable {
   var goalsMinEV: Double
+  var goalsMinRobustEV: Double
   var goalsMinQCS: Double
+  var goalsMinMSS: Double
+  var goalsMaxUncertainty: Double
+  var goalsMinSample: Int
   var goalsMaxStake: Double
 
   var cornersEnabled: Bool
   var cornersMinEV: Double
+  var cornersMinRobustEV: Double
   var cornersMinQCS: Double
-  var cornersMaxStake: Double
+  var cornersMinMSS: Double
+  var cornersMaxUncertainty: Double
   var cornersMinSample: Int
+  var cornersMaxStake: Double
 
   var cardsEnabled: Bool
   var cardsMinEV: Double
+  var cardsMinRobustEV: Double
   var cardsMinQCS: Double
-  var cardsMaxStake: Double
+  var cardsMinMSS: Double
+  var cardsMaxUncertainty: Double
   var cardsMinSample: Int
+  var cardsMaxStake: Double
+
+  var blockedByOOS: Set<String> = []
 
   static let `default` = SignalThresholds(
-    goalsMinEV: 0.03, goalsMinQCS: 78, goalsMaxStake: 0.025,
+    goalsMinEV: 0.03, goalsMinRobustEV: 0.0,
+    goalsMinQCS: 78, goalsMinMSS: 0, goalsMaxUncertainty: 0.25,
+    goalsMinSample: 6, goalsMaxStake: 0.025,
     cornersEnabled: true,
-    cornersMinEV: 0.03, cornersMinQCS: 70,
-    cornersMaxStake: 0.02, cornersMinSample: 5,
+    cornersMinEV: 0.03, cornersMinRobustEV: 0.0,
+    cornersMinQCS: 70, cornersMinMSS: 30, cornersMaxUncertainty: 0.22,
+    cornersMinSample: 5, cornersMaxStake: 0.02,
     cardsEnabled: true,
-    cardsMinEV: 0.03, cardsMinQCS: 70,
-    cardsMaxStake: 0.02, cardsMinSample: 5)
+    cardsMinEV: 0.03, cardsMinRobustEV: 0.0,
+    cardsMinQCS: 70, cardsMinMSS: 30, cardsMaxUncertainty: 0.22,
+    cardsMinSample: 5, cardsMaxStake: 0.02)
 
   static func from(_ cfg: TuningConfig) -> SignalThresholds {
     SignalThresholds(
-      goalsMinEV: 0.03, goalsMinQCS: 78, goalsMaxStake: 0.025,
+      goalsMinEV: 0.03,
+      goalsMinRobustEV: cfg.goalsMinRobustEV,
+      goalsMinQCS: 78, goalsMinMSS: 0,
+      goalsMaxUncertainty: cfg.goalsMaxUncertainty,
+      goalsMinSample: cfg.goalsMinSample,
+      goalsMaxStake: 0.025,
       cornersEnabled: cfg.cornersEnabled,
       cornersMinEV: cfg.cornersMinEV,
+      cornersMinRobustEV: cfg.cornersMinRobustEV,
       cornersMinQCS: cfg.cornersMinQCS,
-      cornersMaxStake: cfg.cornersMaxStake,
+      cornersMinMSS: cfg.cornersMinMSS,
+      cornersMaxUncertainty: cfg.cornersMaxUncertainty,
       cornersMinSample: cfg.cornersMinSample,
+      cornersMaxStake: cfg.cornersMaxStake,
       cardsEnabled: cfg.cardsEnabled,
       cardsMinEV: cfg.cardsMinEV,
+      cardsMinRobustEV: cfg.cardsMinRobustEV,
       cardsMinQCS: cfg.cardsMinQCS,
-      cardsMaxStake: cfg.cardsMaxStake,
-      cardsMinSample: cfg.cardsMinSample)
+      cardsMinMSS: cfg.cardsMinMSS,
+      cardsMaxUncertainty: cfg.cardsMaxUncertainty,
+      cardsMinSample: cfg.cardsMinSample,
+      cardsMaxStake: cfg.cardsMaxStake)
   }
 }
 
@@ -332,6 +357,227 @@ struct BetSignal: Identifiable, Codable, Hashable {
   }
 }
 
+// MARK: - Historical market cache
+
+@Model final class HistoricalMarketCache {
+  @Attribute(.unique) var gameID: String
+  var numericID: Int
+  var start: Date?
+  var league: String
+  var homeID: String?
+  var awayID: String?
+  var home: String
+  var away: String
+  var oddsJSON: Data?
+  var enriched: Bool
+  var hasCorners: Bool
+  var hasCards: Bool
+  var failedAttempts: Int
+  var lastError: String?
+  var updatedAt: Date
+
+  init(gameID: String, numericID: Int, start: Date?, league: String,
+       homeID: String?, awayID: String?, home: String, away: String) {
+    self.gameID = gameID
+    self.numericID = numericID
+    self.start = start
+    self.league = league
+    self.homeID = homeID
+    self.awayID = awayID
+    self.home = home
+    self.away = away
+    self.oddsJSON = nil
+    self.enriched = false
+    self.hasCorners = false
+    self.hasCards = false
+    self.failedAttempts = 0
+    self.lastError = nil
+    self.updatedAt = Date()
+  }
+}
+
+@MainActor
+enum HistoricalMarketCacheService {
+  @discardableResult
+  static func upsert(from match: Match, in context: ModelContext) -> HistoricalMarketCache? {
+    guard let nid = match.numericID else { return nil }
+    let gid = match.id
+    let d = FetchDescriptor<HistoricalMarketCache>(
+      predicate: #Predicate { $0.gameID == gid })
+    if let existing = try? context.fetch(d).first {
+      existing.numericID = nid
+      existing.start = match.start
+      existing.league = match.league
+      existing.homeID = match.homeID
+      existing.awayID = match.awayID
+      existing.home = match.home
+      existing.away = match.away
+      existing.updatedAt = Date()
+      return existing
+    }
+    let row = HistoricalMarketCache(
+      gameID: match.id, numericID: nid, start: match.start,
+      league: match.league, homeID: match.homeID, awayID: match.awayID,
+      home: match.home, away: match.away)
+    context.insert(row)
+    return row
+  }
+
+  static func markEnriched(gameID: String, oddsData: Data,
+                           hasCorners: Bool, hasCards: Bool,
+                           in context: ModelContext) {
+    let gid = gameID
+    let d = FetchDescriptor<HistoricalMarketCache>(
+      predicate: #Predicate { $0.gameID == gid })
+    guard let row = try? context.fetch(d).first else { return }
+    row.oddsJSON = oddsData
+    row.hasCorners = hasCorners
+    row.hasCards = hasCards
+    row.enriched = hasCorners || hasCards
+    row.failedAttempts = 0
+    row.lastError = nil
+    row.updatedAt = Date()
+  }
+
+  static func markFailed(gameID: String, error: String, in context: ModelContext) {
+    let gid = gameID
+    let d = FetchDescriptor<HistoricalMarketCache>(
+      predicate: #Predicate { $0.gameID == gid })
+    guard let row = try? context.fetch(d).first else { return }
+    row.failedAttempts += 1
+    row.lastError = error
+    row.updatedAt = Date()
+  }
+
+  static func progress(in context: ModelContext) -> (enriched: Int, total: Int) {
+    let all = (try? context.fetch(FetchDescriptor<HistoricalMarketCache>())) ?? []
+    let enriched = all.reduce(0) { $0 + ($1.enriched ? 1 : 0) }
+    return (enriched, all.count)
+  }
+
+  static func candidates(limit: Int, in context: ModelContext) -> [HistoricalMarketCache] {
+    let all = (try? context.fetch(FetchDescriptor<HistoricalMarketCache>())) ?? []
+    let filtered = all
+      .filter { !$0.enriched && $0.failedAttempts < 3 }
+      .sorted { ($0.start ?? .distantPast) > ($1.start ?? .distantPast) }
+    return Array(filtered.prefix(limit))
+  }
+}
+
+// MARK: - Pre-match line snapshot
+
+@Model final class LineSnapshot {
+  @Attribute(.unique) var id: String
+  var gameID: String
+  var numericID: Int?
+  var market: String
+  var selection: String
+  var line: Double?
+  var startTime: Date?
+  var league: String
+  var home: String
+  var away: String
+  var takenAt: Date
+  var minutesToStart: Int
+  var bucketMinutes: Int
+  var avgOdds: Double
+  var bestOdds: Double
+  var worstOdds: Double
+  var booksCount: Int
+  var bookmakerJSON: Data?
+
+  init(id: String, gameID: String, numericID: Int?,
+       market: String, selection: String, line: Double?,
+       startTime: Date?, league: String, home: String, away: String,
+       takenAt: Date, minutesToStart: Int, bucketMinutes: Int,
+       avgOdds: Double, bestOdds: Double, worstOdds: Double,
+       booksCount: Int, bookmakerJSON: Data?) {
+    self.id = id
+    self.gameID = gameID
+    self.numericID = numericID
+    self.market = market
+    self.selection = selection
+    self.line = line
+    self.startTime = startTime
+    self.league = league
+    self.home = home
+    self.away = away
+    self.takenAt = takenAt
+    self.minutesToStart = minutesToStart
+    self.bucketMinutes = bucketMinutes
+    self.avgOdds = avgOdds
+    self.bestOdds = bestOdds
+    self.worstOdds = worstOdds
+    self.booksCount = booksCount
+    self.bookmakerJSON = bookmakerJSON
+  }
+}
+
+@MainActor
+enum LineSnapshotService {
+  static func bucket(minutesToStart: Int, maxWindow: Int = 60) -> Int? {
+    if minutesToStart <= 0 { return nil }
+    if minutesToStart > maxWindow { return nil }
+    if minutesToStart > 30 { return 60 }
+    if minutesToStart > 15 { return 30 }
+    if minutesToStart > 5  { return 15 }
+    return 5
+  }
+
+  @discardableResult
+  static func save(gameID: String, numericID: Int?,
+                   market: String, selection: String, line: Double?,
+                   startTime: Date?, league: String, home: String, away: String,
+                   bucketMinutes: Int, minutesToStart: Int,
+                   byBook: [String: Double],
+                   in context: ModelContext) -> Bool {
+    let sid = "\(gameID)|\(market)|\(selection.lowercased())|\(line.map { String($0) } ?? "na")|\(bucketMinutes)"
+    let d = FetchDescriptor<LineSnapshot>(predicate: #Predicate { $0.id == sid })
+    if let _ = try? context.fetch(d).first { return false }
+
+    let values = Array(byBook.values)
+    guard !values.isEmpty else { return false }
+    let avg = values.reduce(0, +) / Double(values.count)
+    let best = values.max() ?? avg
+    let worst = values.min() ?? avg
+
+    let bookJSON: Data? = {
+      let dict = Dictionary(uniqueKeysWithValues: byBook.map { ($0.key, $0.value) })
+      return try? JSONEncoder().encode(dict)
+    }()
+
+    let snap = LineSnapshot(
+      id: sid, gameID: gameID, numericID: numericID,
+      market: market, selection: selection, line: line,
+      startTime: startTime, league: league, home: home, away: away,
+      takenAt: Date(), minutesToStart: minutesToStart, bucketMinutes: bucketMinutes,
+      avgOdds: avg, bestOdds: best, worstOdds: worst,
+      booksCount: values.count, bookmakerJSON: bookJSON)
+    context.insert(snap)
+    return true
+  }
+
+  static func history(gameID: String, market: String, selection: String,
+                      line: Double?, in context: ModelContext) -> [LineSnapshot] {
+    let gid = gameID
+    let d = FetchDescriptor<LineSnapshot>(
+      predicate: #Predicate { $0.gameID == gid })
+    let all = (try? context.fetch(d)) ?? []
+    let selLower = selection.lowercased()
+    return all
+      .filter { $0.market == market && $0.selection.lowercased() == selLower }
+      .filter { s in
+        if let l = line { return s.line == l }
+        return s.line == nil
+      }
+      .sorted { $0.takenAt < $1.takenAt }
+  }
+
+  static func totalCount(in context: ModelContext) -> Int {
+    (try? context.fetch(FetchDescriptor<LineSnapshot>()))?.count ?? 0
+  }
+}
+
 // MARK: - Tuning config
 
 @Model final class TuningConfig {
@@ -359,6 +605,25 @@ struct BetSignal: Identifiable, Codable, Hashable {
   var cardsMaxStake: Double = 0.02
   var cornersMinSample: Int = 5
   var cardsMinSample: Int = 5
+
+  var goalsMinRobustEV: Double = 0.0
+  var goalsMinSample: Int = 6
+  var goalsMaxUncertainty: Double = 0.25
+
+  var cornersMinRobustEV: Double = 0.0
+  var cornersMinMSS: Double = 30
+  var cornersMaxUncertainty: Double = 0.22
+
+  var cardsMinRobustEV: Double = 0.0
+  var cardsMinMSS: Double = 30
+  var cardsMaxUncertainty: Double = 0.22
+
+  var oosGateEnabled: Bool = false
+  var oosMinBets: Int = 100
+  var oosWindowDays: Int = 90
+  var goalsOOSMinROI: Double = -0.03
+  var cornersOOSMinROI: Double = -0.03
+  var cardsOOSMinROI: Double = -0.03
 
   var cornersWeightRecentOwn: Double = 0.35
   var cornersWeightRecentOpp: Double = 0.25
@@ -493,6 +758,36 @@ enum TuningService {
       cfg.cornersMinSample = Int(last.beforeValue) ?? cfg.cornersMinSample
     case "cardsMinSample":
       cfg.cardsMinSample = Int(last.beforeValue) ?? cfg.cardsMinSample
+    case "goalsMinRobustEV":
+      cfg.goalsMinRobustEV = Double(last.beforeValue) ?? cfg.goalsMinRobustEV
+    case "goalsMinSample":
+      cfg.goalsMinSample = Int(last.beforeValue) ?? cfg.goalsMinSample
+    case "goalsMaxUncertainty":
+      cfg.goalsMaxUncertainty = Double(last.beforeValue) ?? cfg.goalsMaxUncertainty
+    case "cornersMinRobustEV":
+      cfg.cornersMinRobustEV = Double(last.beforeValue) ?? cfg.cornersMinRobustEV
+    case "cornersMinMSS":
+      cfg.cornersMinMSS = Double(last.beforeValue) ?? cfg.cornersMinMSS
+    case "cornersMaxUncertainty":
+      cfg.cornersMaxUncertainty = Double(last.beforeValue) ?? cfg.cornersMaxUncertainty
+    case "cardsMinRobustEV":
+      cfg.cardsMinRobustEV = Double(last.beforeValue) ?? cfg.cardsMinRobustEV
+    case "cardsMinMSS":
+      cfg.cardsMinMSS = Double(last.beforeValue) ?? cfg.cardsMinMSS
+    case "cardsMaxUncertainty":
+      cfg.cardsMaxUncertainty = Double(last.beforeValue) ?? cfg.cardsMaxUncertainty
+    case "oosGateEnabled":
+      cfg.oosGateEnabled = Bool(last.beforeValue) ?? cfg.oosGateEnabled
+    case "oosMinBets":
+      cfg.oosMinBets = Int(last.beforeValue) ?? cfg.oosMinBets
+    case "oosWindowDays":
+      cfg.oosWindowDays = Int(last.beforeValue) ?? cfg.oosWindowDays
+    case "goalsOOSMinROI":
+      cfg.goalsOOSMinROI = Double(last.beforeValue) ?? cfg.goalsOOSMinROI
+    case "cornersOOSMinROI":
+      cfg.cornersOOSMinROI = Double(last.beforeValue) ?? cfg.cornersOOSMinROI
+    case "cardsOOSMinROI":
+      cfg.cardsOOSMinROI = Double(last.beforeValue) ?? cfg.cardsOOSMinROI
     case "cornersWeightRecentOwn":
       cfg.cornersWeightRecentOwn = Double(last.beforeValue) ?? cfg.cornersWeightRecentOwn
     case "cornersWeightRecentOpp":
@@ -572,26 +867,134 @@ enum TuningService {
       detail: "Старт 1500, HFA 60, K=32→20; влияет на λ через glickoAdjust",
       enabled: config.teamRatingEnabled, flagKey: "teamRatingEnabled"))
 
+    let oosReport = OOSBuilder.build(from: journal, windowDays: config.oosWindowDays)
+    let blocked = OOSBuilder.blockedMarkets(report: oosReport, cfg: config)
+    let oosSummary: String = {
+      if !config.oosGateEnabled { return "выключено" }
+      if blocked.isEmpty { return "активно · блокировок нет" }
+      return "активно · блок: \(blocked.sorted().joined(separator: ", "))"
+    }()
+    out.append(AutoDecision(id: "oos", title: "OOS-валидация",
+      summary: oosSummary,
+      detail: String(format: "Окно %d дней · n≥%d · порог ROI −%.1f%%",
+                     config.oosWindowDays, config.oosMinBets,
+                     abs(config.goalsOOSMinROI) * 100),
+      enabled: config.oosGateEnabled, flagKey: "oosGateEnabled"))
+
     out.append(AutoDecision(id: "corners", title: "Рынок CORNERS",
       summary: config.cornersEnabled
-        ? String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, sample ≥ %d",
-                 config.cornersMinEV * 100, config.cornersMinQCS, config.cornersMinSample)
+        ? String(format: "EV ≥ %.1f%%, robEV ≥ %.1f%%, QCS ≥ %.0f, MSS ≥ %.0f, sample ≥ %d, unc ≤ %.2f",
+                 config.cornersMinEV * 100, config.cornersMinRobustEV * 100,
+                 config.cornersMinQCS, config.cornersMinMSS,
+                 config.cornersMinSample, config.cornersMaxUncertainty)
         : "выключен",
-      detail: String(format: "Pinnacle. Вес λ: xG %.2f, H2H %.2f, poss %.2f",
+      detail: String(format: "Pinnacle. Вес λ: own %.2f/opp %.2f · xG %.2f · H2H %.2f · poss %.2f",
+                     config.cornersWeightRecentOwn, config.cornersWeightRecentOpp,
                      config.cornersWeightXG, config.cornersWeightH2H,
                      config.cornersWeightPossession),
       enabled: config.cornersEnabled, flagKey: "cornersEnabled"))
 
     out.append(AutoDecision(id: "cards", title: "Рынок CARDS",
       summary: config.cardsEnabled
-        ? String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, sample ≥ %d",
-                 config.cardsMinEV * 100, config.cardsMinQCS, config.cardsMinSample)
+        ? String(format: "EV ≥ %.1f%%, robEV ≥ %.1f%%, QCS ≥ %.0f, MSS ≥ %.0f, sample ≥ %d, unc ≤ %.2f",
+                 config.cardsMinEV * 100, config.cardsMinRobustEV * 100,
+                 config.cardsMinQCS, config.cardsMinMSS,
+                 config.cardsMinSample, config.cardsMaxUncertainty)
         : "выключен",
       detail: String(format: "Best available. Вес λ: fouls %.2f, ref %.2f, H2H %.2f",
                      config.cardsWeightFouls, config.cardsWeightReferee,
                      config.cardsWeightH2H),
       enabled: config.cardsEnabled, flagKey: "cardsEnabled"))
 
+    return out
+  }
+}
+
+// MARK: - OOS validation
+
+struct MarketOOSReport: Codable, Hashable {
+  var market: String
+  var bets: Int
+  var wins: Int
+  var losses: Int
+  var pushes: Int
+  var staked: Double
+  var profit: Double
+  var roi: Double
+  var hitRate: Double
+}
+
+struct OOSValidationReport: Codable, Hashable {
+  var generatedAt: Date
+  var totalEntries: Int
+  var windowDays: Int
+  var windowStart: Date?
+  var byMarket: [String: MarketOOSReport]
+
+  static let empty = OOSValidationReport(
+    generatedAt: .distantPast, totalEntries: 0,
+    windowDays: 0, windowStart: nil, byMarket: [:])
+
+  func report(for market: String) -> MarketOOSReport? { byMarket[market] }
+}
+
+enum OOSBuilder {
+  static func build(from journal: [JournalEntry],
+                    windowDays: Int = 90) -> OOSValidationReport {
+    let cutoff = Date().addingTimeInterval(-Double(max(1, windowDays)) * 86400)
+    let closed = journal.filter {
+      $0.status == "CLOSED"
+        && $0.createdAt >= cutoff
+        && ($0.result == "WIN" || $0.result == "LOSS" || $0.result == "PUSH")
+    }
+    guard !closed.isEmpty else {
+      return OOSValidationReport(generatedAt: Date(), totalEntries: 0,
+                                 windowDays: windowDays, windowStart: nil, byMarket: [:])
+    }
+
+    var byMarket: [String: MarketOOSReport] = [:]
+    let grouped = Dictionary(grouping: closed, by: { $0.market })
+    for (mk, list) in grouped {
+      var wins = 0, losses = 0, pushes = 0
+      var staked = 0.0, profit = 0.0
+      for e in list {
+        staked += e.stake
+        if let p = e.profit { profit += p }
+        switch e.result {
+        case "WIN": wins += 1
+        case "LOSS": losses += 1
+        case "PUSH": pushes += 1
+        default: break
+        }
+      }
+      let roi = staked > 0 ? profit / staked : 0
+      let dec = wins + losses
+      let hitRate = dec > 0 ? Double(wins) / Double(dec) : 0
+      byMarket[mk] = MarketOOSReport(
+        market: mk, bets: list.count, wins: wins, losses: losses, pushes: pushes,
+        staked: staked, profit: profit, roi: roi, hitRate: hitRate)
+    }
+    return OOSValidationReport(
+      generatedAt: Date(),
+      totalEntries: closed.count,
+      windowDays: windowDays,
+      windowStart: closed.map { $0.createdAt }.min(),
+      byMarket: byMarket)
+  }
+
+  static func blockedMarkets(report: OOSValidationReport,
+                             cfg: TuningConfig) -> Set<String> {
+    guard cfg.oosGateEnabled else { return [] }
+    var out: Set<String> = []
+    for (mk, r) in report.byMarket where r.bets >= cfg.oosMinBets {
+      let threshold: Double
+      switch mk {
+      case "CORNERS": threshold = cfg.cornersOOSMinROI
+      case "CARDS":   threshold = cfg.cardsOOSMinROI
+      default:        threshold = cfg.goalsOOSMinROI
+      }
+      if r.roi < threshold { out.insert(mk) }
+    }
     return out
   }
 }
@@ -883,8 +1286,6 @@ enum CorrelationBuilder {
   }
 }
 
-// MARK: - Stored segment stats
-
 struct StoredSegmentStats: Codable, Hashable {
   var bets: Int; var wins: Int; var losses: Int; var pushes: Int
   var profit: Double; var staked: Double
@@ -934,6 +1335,24 @@ struct ModelComparison: Codable, Hashable, Identifiable {
   var avgAwayP: Double
 }
 
+// MARK: - Walk-forward delta
+
+struct WalkForwardDelta: Codable, Hashable {
+  var matches: Int
+  var bets: Int
+  var wins: Int
+  var losses: Int
+  var pushes: Int
+  var roi: Double
+  var sharpe: Double
+  var sortino: Double
+  var profitFactor: Double
+  var brier: Double
+  var logLoss: Double
+  var avgCLV: Double
+  var hitRate: Double
+}
+
 @Model final class BacktestSnapshot {
   @Attribute(.unique) var id: String
   var version: Int
@@ -967,10 +1386,18 @@ struct ModelComparison: Codable, Hashable, Identifiable {
   var posteriorCornersJSON: Data?
   var posteriorCardsJSON: Data?
 
-  // [Build checkpoint] Курсор сборки и число накопленных матчей.
-  // Позволяет продолжить после выхода приложения из фона.
   var buildCursorTimestamp: Double = 0
   var buildMatchesCount: Int = 0
+
+  var buildJobID: String? = nil
+  var historicalCacheCount: Int = 0
+
+  var oosValidationJSON: Data? = nil
+
+  var trainReportJSON: Data? = nil
+  var validationReportJSON: Data? = nil
+  var holdoutReportJSON: Data? = nil
+  var walkForwardMode: String = "off"
 
   init(id: String = "current") {
     self.id = id; self.version = 1
@@ -1027,6 +1454,22 @@ extension BacktestSnapshot {
   func decodedModelComparison() -> [ModelComparison] {
     guard let d = modelComparisonJSON else { return [] }
     return (try? JSONDecoder().decode([ModelComparison].self, from: d)) ?? []
+  }
+  func decodedOOSReport() -> OOSValidationReport {
+    guard let d = oosValidationJSON else { return .empty }
+    return (try? JSONDecoder().decode(OOSValidationReport.self, from: d)) ?? .empty
+  }
+  func decodedTrainReport() -> WalkForwardDelta? {
+    guard let d = trainReportJSON else { return nil }
+    return try? JSONDecoder().decode(WalkForwardDelta.self, from: d)
+  }
+  func decodedValidationReport() -> WalkForwardDelta? {
+    guard let d = validationReportJSON else { return nil }
+    return try? JSONDecoder().decode(WalkForwardDelta.self, from: d)
+  }
+  func decodedHoldoutReport() -> WalkForwardDelta? {
+    guard let d = holdoutReportJSON else { return nil }
+    return try? JSONDecoder().decode(WalkForwardDelta.self, from: d)
   }
 }
 
@@ -1088,6 +1531,46 @@ struct CalibrationBucket: Identifiable {
   let predicted: Double; let actual: Double; let count: Int
 }
 
+struct MarketCLV: Codable, Hashable {
+  var count: Int
+  var avgCLV: Double
+  var positiveRate: Double
+}
+
+struct CLVReport {
+  var totalWithCLV: Int
+  var positiveCount: Int
+  var neutralCount: Int
+  var negativeCount: Int
+  var avgCLV: Double
+  var medianCLV: Double
+  var byMarket: [String: MarketCLV]
+  var pnlPositive: Double
+  var pnlNegative: Double
+  var positiveRate: Double
+  var verdict: String
+  var note: String
+}
+
+enum MarketRegime: String {
+  case normal          = "NORMAL"
+  case highVolatility  = "HIGH VOL"
+  case lowLiquidity    = "LOW LIQ"
+  case lineDislocation = "DISLOCATION"
+  case unknown         = "UNKNOWN"
+
+  var label: String { rawValue }
+}
+
+struct MarketRegimeReport {
+  var regime: MarketRegime
+  var avgBooksPerMarket: Double
+  var avgSpreadPct: Double
+  var sharpMovements: Int
+  var totalMovements: Int
+  var note: String
+}
+
 struct EquityPoint: Identifiable, Hashable {
   let id: String; let date: Date
   let cumulativeProfit: Double; let cumulativeStaked: Double
@@ -1103,6 +1586,76 @@ struct BollingerPoint: Identifiable, Hashable {
   let upper: Double?
   let lower: Double?
   let isBreakout: Bool
+}
+
+struct BollingerRisk {
+  enum State: String {
+    case normal = "NORMAL"
+    case expanding = "EXPANDING"
+    case high = "HIGH"
+    case risk = "RISK"
+  }
+
+  struct Report {
+    var state: State
+    var width: Double?
+    var avgWidth: Double?
+    var widthRatio: Double
+    var recentBreakouts: Int
+    var breakoutRate: Double
+    var window: Int
+    var note: String
+  }
+
+  static func evaluate(_ bands: [BollingerPoint], window: Int = 20) -> Report {
+    guard bands.count >= window + 2 else {
+      return Report(state: .normal, width: nil, avgWidth: nil,
+                    widthRatio: 1, recentBreakouts: 0, breakoutRate: 0,
+                    window: window,
+                    note: "Недостаточно данных (\(bands.count)/\(window + 2))")
+    }
+
+    var widths: [Double] = []
+    widths.reserveCapacity(bands.count)
+    for p in bands {
+      if let u = p.upper, let l = p.lower, u >= l { widths.append(u - l) }
+    }
+    guard widths.count >= window else {
+      return Report(state: .normal, width: nil, avgWidth: nil,
+                    widthRatio: 1, recentBreakouts: 0, breakoutRate: 0,
+                    window: window, note: "Нет полос")
+    }
+
+    let recent = Array(widths.suffix(window))
+    let currentWidth = recent.last ?? 0
+    let avgWidth = recent.reduce(0, +) / Double(recent.count)
+    let widthRatio = avgWidth > 0 ? currentWidth / avgWidth : 1
+
+    let tail = Array(bands.suffix(window))
+    let breakouts = tail.filter { $0.isBreakout }.count
+    let breakoutRate = Double(breakouts) / Double(max(tail.count, 1))
+
+    let state: State
+    let note: String
+    if widthRatio > 1.5 && breakoutRate > 0.25 {
+      state = .risk
+      note = "Высокая волатильность P/L и частые выходы за полосу"
+    } else if widthRatio > 1.5 {
+      state = .high
+      note = "Полосы расширяются — волатильность P/L растёт"
+    } else if breakoutRate > 0.25 {
+      state = .expanding
+      note = "Частые выходы за полосу при стабильной ширине"
+    } else {
+      state = .normal
+      note = "Штатный режим волатильности"
+    }
+    return Report(state: state,
+                  width: currentWidth, avgWidth: avgWidth,
+                  widthRatio: widthRatio,
+                  recentBreakouts: breakouts, breakoutRate: breakoutRate,
+                  window: window, note: note)
+  }
 }
 
 enum Metrics {
@@ -1222,6 +1775,70 @@ enum Metrics {
         isBreakout: breakout))
     }
     return out
+  }
+
+  static func clvReport(_ entries: [JournalEntry]) -> CLVReport {
+    let closed = entries.filter { $0.status == "CLOSED" && $0.clv != nil }
+    guard !closed.isEmpty else {
+      return CLVReport(
+        totalWithCLV: 0, positiveCount: 0, neutralCount: 0, negativeCount: 0,
+        avgCLV: 0, medianCLV: 0, byMarket: [:],
+        pnlPositive: 0, pnlNegative: 0, positiveRate: 0,
+        verdict: "NO DATA",
+        note: "Нет закрытых записей с CLV")
+    }
+    let clvs = closed.compactMap { $0.clv }
+    let avg = clvs.reduce(0, +) / Double(clvs.count)
+    let median = QuantMath.median(clvs) ?? 0
+
+    let pos = closed.filter { ($0.clv ?? 0) > 0.005 }
+    let neg = closed.filter { ($0.clv ?? 0) < -0.005 }
+    let neu = closed.count - pos.count - neg.count
+
+    var byMarket: [String: MarketCLV] = [:]
+    let grouped = Dictionary(grouping: closed, by: { $0.market })
+    for (mk, list) in grouped {
+      let vals = list.compactMap { $0.clv }
+      guard !vals.isEmpty else { continue }
+      let a = vals.reduce(0, +) / Double(vals.count)
+      let p = Double(list.filter { ($0.clv ?? 0) > 0.005 }.count) / Double(list.count)
+      byMarket[mk] = MarketCLV(count: list.count, avgCLV: a, positiveRate: p)
+    }
+
+    let pnlPos = pos.compactMap { $0.profit }.reduce(0, +)
+    let pnlNeg = neg.compactMap { $0.profit }.reduce(0, +)
+    let rate = Double(pos.count) / Double(closed.count)
+
+    let verdict: String
+    let note: String
+    if avg > 0.015 && rate > 0.55 {
+      verdict = "STRONG"
+      note = "Сигналы системно берут цену лучше закрытия — edge до рынка подтверждён"
+    } else if avg > 0.005 && rate > 0.45 {
+      verdict = "OK"
+      note = "Средний CLV положительный, доля плюсовых ставок приемлемая"
+    } else if avg > -0.005 && rate > 0.35 {
+      verdict = "WEAK"
+      note = "CLV около нуля — преимущество слабое, следите за выборкой"
+    } else if avg < -0.01 {
+      verdict = "NEGATIVE"
+      note = "Цена систематически хуже закрытия — edge под вопросом"
+    } else {
+      verdict = "MIXED"
+      note = "CLV асимметричный — нестабильная картина"
+    }
+    return CLVReport(
+      totalWithCLV: closed.count,
+      positiveCount: pos.count, neutralCount: neu, negativeCount: neg.count,
+      avgCLV: avg, medianCLV: median, byMarket: byMarket,
+      pnlPositive: pnlPos, pnlNegative: pnlNeg,
+      positiveRate: rate, verdict: verdict, note: note)
+  }
+
+  // [W3c] OOS wrapper для UI.
+  static func oosFromJournal(_ entries: [JournalEntry],
+                             windowDays: Int = 90) -> OOSValidationReport {
+    OOSBuilder.build(from: entries, windowDays: windowDays)
   }
 }
 
@@ -1475,16 +2092,15 @@ final class BacktestService {
 
   private var isBuilding = false
 
-  // MARK: - Build checkpoint
-
-  /// Структура чекпоинта. Сохраняется в Documents/build_checkpoint.json
-  /// после каждого обработанного месяца сбора.
   struct Checkpoint: Codable {
-    var cursor: Double                 // TimeIntervalSince1970
-    var fromDate: Double               // TimeIntervalSince1970
-    var toDate: Double                 // TimeIntervalSince1970
+    var jobID: String?
+    var fromDate: Double
+    var toDate: Double
+    var cursor: Double
     var matches: [Match]
     var histories: [String: [TeamRecord]]
+    var matchesCount: Int?
+    var historiesCount: Int?
   }
 
   static var checkpointURL: URL {
@@ -1506,15 +2122,19 @@ final class BacktestService {
     return cp
   }
 
-  static func saveCheckpoint(cursor: Date, fromDate: Date, toDate: Date,
+  static func saveCheckpoint(jobID: String,
+                             cursor: Date, fromDate: Date, toDate: Date,
                              matches: [Match],
                              histories: [String: [TeamRecord]]) {
     let cp = Checkpoint(
-      cursor: cursor.timeIntervalSince1970,
+      jobID: jobID,
       fromDate: fromDate.timeIntervalSince1970,
       toDate: toDate.timeIntervalSince1970,
+      cursor: cursor.timeIntervalSince1970,
       matches: matches,
-      histories: histories)
+      histories: histories,
+      matchesCount: matches.count,
+      historiesCount: histories.count)
     if let data = try? JSONEncoder().encode(cp) {
       try? data.write(to: checkpointURL, options: .atomic)
     }
@@ -1523,8 +2143,6 @@ final class BacktestService {
   static func clearCheckpoint() {
     try? FileManager.default.removeItem(at: checkpointURL)
   }
-
-  // MARK: - buildFullBase
 
   func buildFullBase(
     progress: @MainActor @escaping (Double, String) -> Void
@@ -1562,38 +2180,31 @@ final class BacktestService {
       return false
     }
 
-    // ── Определяем: свежий старт или продолжение
     var cursor: Date = fromDate
     var allMatches: [Match] = []
     var allHistories: [String: [TeamRecord]] = [:]
     var resumed = false
+    var jobID: String = snapshot.buildJobID ?? UUID().uuidString
 
-    if let cp = Self.loadCheckpoint() {
-      let cpFrom = Date(timeIntervalSince1970: cp.fromDate)
-      let cpTo = Date(timeIntervalSince1970: cp.toDate)
-      let dayTolerance: TimeInterval = 60 * 60 * 24
-      let sameWindow =
-        abs(cpFrom.timeIntervalSince(fromDate)) < dayTolerance &&
-        abs(cpTo.timeIntervalSince(toDate)) < dayTolerance
-
-      if sameWindow {
-        cursor = Date(timeIntervalSince1970: cp.cursor)
-        allMatches = cp.matches
-        allHistories = cp.histories
-        resumed = true
-        snapshot.buildStatus = "building"
-        snapshot.buildMatchesCount = allMatches.count
-        snapshot.buildCursorTimestamp = cp.cursor
-        try? context.save()
-        progress(0, "Продолжаю сбор с \(Self.shortDay(cursor)) · матчей: \(allMatches.count)")
-      } else {
-        Self.clearCheckpoint()
-      }
+    if snapshot.buildStatus == "building",
+       let cp = Self.loadCheckpoint(),
+       let cpJobID = cp.jobID,
+       cpJobID == jobID {
+      cursor = Date(timeIntervalSince1970: cp.cursor)
+      allMatches = cp.matches
+      allHistories = cp.histories
+      resumed = true
+      snapshot.buildMatchesCount = allMatches.count
+      snapshot.buildCursorTimestamp = cp.cursor
+      try? context.save()
+      progress(0, "Продолжаю сбор с \(Self.shortDay(cursor)) · матчей: \(allMatches.count)")
+    } else {
+      Self.clearCheckpoint()
     }
 
     if !resumed {
-      // Свежий старт
       Self.clearCheckpoint()
+      jobID = UUID().uuidString
       snapshot.buildStatus = "building"
       snapshot.buildProgress = 0
       snapshot.lastError = nil
@@ -1606,15 +2217,14 @@ final class BacktestService {
       snapshot.enrichmentTotal = 0
       snapshot.buildCursorTimestamp = fromDate.timeIntervalSince1970
       snapshot.buildMatchesCount = 0
+      snapshot.buildJobID = jobID
       try? context.save()
     }
 
     var seenIDs = Set(allMatches.map { $0.id })
     var monthIndex = max(0, cal.dateComponents([.month], from: fromDate, to: cursor).month ?? 0)
     let totalMonths = Self.yearsBack * Self.monthsPerYear
-    var lastSaved = Date()
 
-    // ── Основной цикл
     while cursor < toDate {
       guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
       let periodEnd = min(nextMonth, toDate)
@@ -1659,23 +2269,31 @@ final class BacktestService {
         for (k, v) in records { allHistories[k, default: []].append(contentsOf: v) }
       }
 
-      // ── Перейти к следующему месяцу
       cursor = nextMonth
       monthIndex += 1
 
-      // ── Чекпоинт после каждого месяца (важно — до sleep)
-      Self.saveCheckpoint(cursor: cursor, fromDate: fromDate, toDate: toDate,
+      Self.saveCheckpoint(jobID: jobID,
+                          cursor: cursor, fromDate: fromDate, toDate: toDate,
                           matches: allMatches, histories: allHistories)
       snapshot.buildCursorTimestamp = cursor.timeIntervalSince1970
       snapshot.buildMatchesCount = allMatches.count
       snapshot.buildProgress = monthProgress
       try? context.save()
-      lastSaved = Date()
     }
 
     for (k, v) in allHistories {
       allHistories[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
     }
+
+    for m in allMatches {
+      _ = HistoricalMarketCacheService.upsert(from: m, in: context)
+    }
+    try? context.save()
+    let cacheSeed = HistoricalMarketCacheService.progress(in: context)
+    snapshot.historicalCacheCount = cacheSeed.total
+    snapshot.enrichmentTotal = cacheSeed.total
+    snapshot.enrichmentProgress = cacheSeed.enriched
+    try? context.save()
 
     progress(0.60, "Матчей собрано: \(allMatches.count). Дотягиваю odds и statistics…")
 
@@ -1719,6 +2337,19 @@ final class BacktestService {
           merged.append(contentsOf: extra)
           mm.oddsJSON = .array(merged)
           prepared[i] = mm
+
+          if let encoded = try? JSONEncoder().encode(extra) {
+            let hasC = extra.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCorners) }
+            let hasK = extra.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCards) }
+            if hasC || hasK {
+              HistoricalMarketCacheService.markEnriched(
+                gameID: mm.id, oddsData: encoded,
+                hasCorners: hasC, hasCards: hasK, in: context)
+            } else {
+              HistoricalMarketCacheService.markFailed(
+                gameID: mm.id, error: "Нет market 45/80 в /Odds", in: context)
+            }
+          }
         }
       }
       if i % 25 == 0 {
@@ -1727,6 +2358,13 @@ final class BacktestService {
       }
       try? await Task.sleep(for: .milliseconds(400))
     }
+
+    try? context.save()
+    let cacheAfter = HistoricalMarketCacheService.progress(in: context)
+    snapshot.historicalCacheCount = cacheAfter.total
+    snapshot.enrichmentTotal = cacheAfter.total
+    snapshot.enrichmentProgress = cacheAfter.enriched
+    try? context.save()
 
     prepared.sort { ($0.start ?? .distantPast) < ($1.start ?? .distantPast) }
 
@@ -1738,12 +2376,26 @@ final class BacktestService {
       return false
     }
 
-    progress(0.85, "Walk-forward на \(prepared.count) матчах…")
-    let report = backtester.run(matches: prepared, histories: allHistories)
+    // [W3b] Train 60% / Validation 20% / Holdout 20%.
+    let totalPrepared = prepared.count
+    let trainEnd = max(1, Int(Double(totalPrepared) * 0.60))
+    let valEnd = max(trainEnd + 1, Int(Double(totalPrepared) * 0.80))
+
+    let trainMatches = Array(prepared[0..<trainEnd])
+    let valMatches = Array(prepared[trainEnd..<min(valEnd, totalPrepared)])
+    let holdoutMatches = Array(prepared[min(valEnd, totalPrepared)..<totalPrepared])
+
+    progress(0.83, "Walk-forward train \(trainMatches.count) / val \(valMatches.count) / holdout \(holdoutMatches.count)…")
+    let trainReport = backtester.run(matches: trainMatches, histories: allHistories)
+    let valReport = backtester.run(matches: valMatches, histories: allHistories)
+    let holdoutReport = backtester.run(matches: holdoutMatches, histories: allHistories)
+
+    // Для summary и posterior — только train + val.
+    let report = backtester.run(matches: trainMatches + valMatches, histories: allHistories)
 
     progress(0.90, "Сравнение моделей (E5)…")
     let comparisons = MultiModelBacktester().run(
-      matches: prepared, histories: allHistories)
+      matches: trainMatches + valMatches, histories: allHistories)
 
     progress(0.95, "Сохраняю снапшот…")
 
@@ -1764,6 +2416,12 @@ final class BacktestService {
     snapshot.enrichmentProgress = min(prepared.count, ccCount)
 
     let encoder = JSONEncoder()
+
+    snapshot.trainReportJSON = try? encoder.encode(Self.walkForwardDelta(trainReport))
+    snapshot.validationReportJSON = try? encoder.encode(Self.walkForwardDelta(valReport))
+    snapshot.holdoutReportJSON = try? encoder.encode(Self.walkForwardDelta(holdoutReport))
+    snapshot.walkForwardMode = "602020"
+
     snapshot.perLeagueJSON = try? encoder.encode(
       report.perLeague.mapValues { Self.toStored($0) })
     snapshot.perMarketJSON = try? encoder.encode(
@@ -1788,21 +2446,26 @@ final class BacktestService {
       }))
     snapshot.modelComparisonJSON = try? encoder.encode(comparisons)
 
+    // OOS-отчёт по журналу.
+    let journalDescriptor = FetchDescriptor<JournalEntry>()
+    let journal = (try? context.fetch(journalDescriptor)) ?? []
+    let cfg = TuningService.fetchOrCreate(in: context)
+    let oosReport = OOSBuilder.build(from: journal, windowDays: cfg.oosWindowDays)
+    snapshot.oosValidationJSON = try? encoder.encode(oosReport)
+
     snapshot.buildStatus = "ready"
     snapshot.buildProgress = 1.0
     snapshot.lastError = nil
     snapshot.buildCursorTimestamp = 0
     snapshot.buildMatchesCount = 0
+    snapshot.buildJobID = nil
     try? context.save()
 
-    // ── Убираем чекпоинт — сбор завершён
     Self.clearCheckpoint()
 
     progress(1.0, "Готово: \(report.matches) матчей, \(report.bets) ставок")
     return true
   }
-
-  // MARK: - Enrichment
 
   func continueEnrichmentInBackground(
     chunkSize: Int = 30,
@@ -1811,67 +2474,79 @@ final class BacktestService {
     guard let container = AppDependencies.shared.container else { return }
     let context = ModelContext(container)
     let snapshot = Self.fetchOrCreate(in: context)
-    guard snapshot.buildStatus == "ready" else { return }
-    guard snapshot.enrichmentProgress < snapshot.enrichmentTotal else { return }
 
     let settings = AppSettings()
     let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !key.isEmpty else { return }
 
     let client = SStatsClient(settings: settings)
-    let engine = QuantEngine()
 
-    let fromDate = snapshot.fromDate ?? Date().addingTimeInterval(-90*86400)
-    let toDate = snapshot.toDate ?? Date()
+    let (enrichedBefore, total) = HistoricalMarketCacheService.progress(in: context)
+    snapshot.enrichmentProgress = enrichedBefore
+    snapshot.enrichmentTotal = total
+    snapshot.historicalCacheCount = total
+    try? context.save()
 
-    var allMatches: [Match] = []
-    var cursor = fromDate
-    let cal = Calendar(identifier: .gregorian)
-    var pages = 0
+    guard total > 0 else {
+      progress(0, 0, "Кэш пуст — сначала соберите базу (Авто → Собрать базу)")
+      return
+    }
+    if enrichedBefore >= total {
+      progress(total, total, "Все \(total) матчей обогащены")
+      return
+    }
 
-    while cursor < toDate && pages < Self.maxPagesPerMonth * Self.yearsBack * Self.monthsPerYear {
-      guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
-      let periodEnd = min(nextMonth, toDate)
-      if let r = try? await client.listGamesRange(
-          from: cursor, to: periodEnd,
-          limit: Self.gamesPerRequest, offset: 0) {
-        let items = r.object?["data"]?.array ?? []
-        let monthMatches = engine.matches(from: JSONValue.object(["data": .array(items)]))
-          .filter { !Self.isExcluded($0) }
-          .filter { Self.isInPool($0.league) }
-          .filter { $0.homeFT != nil && $0.awayFT != nil }
-        allMatches.append(contentsOf: monthMatches)
+    let candidates = HistoricalMarketCacheService.candidates(limit: chunkSize, in: context)
+    guard !candidates.isEmpty else {
+      progress(enrichedBefore, total, "Нет кандидатов (failedAttempts ≥ 3?)")
+      return
+    }
+
+    var newlyEnriched = 0
+    for (i, row) in candidates.enumerated() {
+      do {
+        let books = try await client.fullOdds(gameId: row.numericID)
+        if books.isEmpty {
+          HistoricalMarketCacheService.markFailed(
+            gameID: row.gameID, error: "Пустой ответ /Odds", in: context)
+          continue
+        }
+        let markets = Self.oddsJSONFromBookmakers(books)
+        if markets.isEmpty {
+          HistoricalMarketCacheService.markFailed(
+            gameID: row.gameID, error: "Нет market 45/80", in: context)
+          continue
+        }
+        let data = try JSONEncoder().encode(markets)
+        let hasC = markets.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCorners) }
+        let hasK = markets.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCards) }
+        HistoricalMarketCacheService.markEnriched(
+          gameID: row.gameID, oddsData: data,
+          hasCorners: hasC, hasCards: hasK, in: context)
+        newlyEnriched += 1
+      } catch {
+        HistoricalMarketCacheService.markFailed(
+          gameID: row.gameID, error: error.localizedDescription, in: context)
       }
-      cursor = nextMonth
-      pages += 1
+      try? context.save()
+
+      if i % 5 == 0 {
+        let (e, t) = HistoricalMarketCacheService.progress(in: context)
+        progress(e, t, "Обогащено \(e)/\(t)")
+      }
       try? await Task.sleep(for: .milliseconds(400))
     }
 
-    let needEnrich = allMatches.filter { m in
-      guard let arr = m.oddsJSON?.array else { return true }
-      let hasCorners = arr.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCorners) }
-      let hasCards = arr.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCards) }
-      return !hasCorners && !hasCards
-    }.sorted { ($0.start ?? .distantPast) > ($1.start ?? .distantPast) }
-
-    let chunk = needEnrich.prefix(chunkSize)
-    var done = 0
-    for m in chunk {
-      guard let nid = m.numericID else { continue }
-      _ = try? await client.fullOdds(gameId: nid)
-      done += 1
-      try? await Task.sleep(for: .milliseconds(400))
-      progress(done, chunk.count,
-               "Обогащено \(snapshot.enrichmentProgress + done)/\(snapshot.enrichmentTotal)")
-    }
-
-    snapshot.enrichmentProgress = min(snapshot.enrichmentTotal,
-                                       snapshot.enrichmentProgress + done)
+    let (finalE, finalT) = HistoricalMarketCacheService.progress(in: context)
+    snapshot.enrichmentProgress = finalE
+    snapshot.enrichmentTotal = finalT
+    snapshot.historicalCacheCount = finalT
     snapshot.builtAt = Date()
     try? context.save()
-  }
 
-  // MARK: - Helpers
+    progress(finalE, finalT,
+             "Обогащено \(finalE)/\(finalT) (+\(newlyEnriched) за проход)")
+  }
 
   private static func fillCornersCards(into mm: inout Match,
                                        from stats: [String: JSONValue]) {
@@ -1905,7 +2580,7 @@ final class BacktestService {
     }
   }
 
-  private static func oddsJSONFromBookmakers(_ books: [BookmakerOdds]) -> [JSONValue] {
+  static func oddsJSONFromBookmakers(_ books: [BookmakerOdds]) -> [JSONValue] {
     var out: [JSONValue] = []
 
     if let pin = books.first(where: { $0.bookmakerId == SStatsClient.pinnacleBookmakerId }),
@@ -1958,17 +2633,20 @@ final class BacktestService {
     matches: [Match]
   ) -> [String: StoredSegmentStats] {
     var out: [String: StoredSegmentStats] = [:]
-    for (league, _) in report.perLeague {
-      for (market, ms) in report.perMarket {
-        let key = "\(league)|\(market)"
-        if let existing = out[key] {
-          out[key] = merge(existing, toStored(ms))
-        } else {
-          out[key] = toStored(ms)
-        }
-      }
+    for (key, s) in report.perLeagueMarket {
+      out[key] = toStored(s)
     }
     return out
+  }
+
+  static func walkForwardDelta(_ r: WalkForwardReport) -> WalkForwardDelta {
+    WalkForwardDelta(
+      matches: r.matches, bets: r.bets,
+      wins: r.wins, losses: r.losses, pushes: r.pushes,
+      roi: r.roi, sharpe: r.sharpe, sortino: r.sortino,
+      profitFactor: r.profitFactor,
+      brier: r.brier, logLoss: r.logLoss, avgCLV: r.avgCLV,
+      hitRate: r.hitRate)
   }
 
   func updateIncremental() async -> Bool {
@@ -2060,6 +2738,9 @@ final class BacktestService {
       snapshot.decodedLeagueStats(), delta.perLeague.mapValues { Self.toStored($0) })
     let newMarkets = Self.mergeSegmentDict(
       snapshot.decodedMarketStats(), delta.perMarket.mapValues { Self.toStored($0) })
+    let newLeagueMarket = Self.mergeSegmentDict(
+      snapshot.decodedLeagueMarketStats(),
+      delta.perLeagueMarket.mapValues { Self.toStored($0) })
     let newEV = Self.mergeSegmentDict(
       snapshot.decodedEVBuckets(), delta.byEVBucket.mapValues { Self.toStored($0) })
     let newOdds = Self.mergeSegmentDict(
@@ -2069,6 +2750,7 @@ final class BacktestService {
 
     snapshot.perLeagueJSON = try? encoder.encode(newLeagues)
     snapshot.perMarketJSON = try? encoder.encode(newMarkets)
+    snapshot.perLeagueMarketJSON = try? encoder.encode(newLeagueMarket)
     snapshot.evBucketsJSON = try? encoder.encode(newEV)
     snapshot.oddsBucketsJSON = try? encoder.encode(newOdds)
     snapshot.classificationJSON = try? encoder.encode(newClass)
@@ -2094,6 +2776,12 @@ final class BacktestService {
         $0.market == "CARDS"
       }))
     snapshot.posteriorCardsJSON = try? encoder.encode(newCardsP)
+
+    let journalDescriptor = FetchDescriptor<JournalEntry>()
+    let journal = (try? context.fetch(journalDescriptor)) ?? []
+    let cfg = TuningService.fetchOrCreate(in: context)
+    let oosReport = OOSBuilder.build(from: journal, windowDays: cfg.oosWindowDays)
+    snapshot.oosValidationJSON = try? encoder.encode(oosReport)
 
     snapshot.totalMatches += delta.matches
     snapshot.totalBets += delta.bets
@@ -2223,6 +2911,7 @@ final class ScanCoordinator {
     var cardsSignals: Int = 0
     var liveDropped: Int = 0
     var h2hFetched: Int = 0
+    var oosBlocked: [String] = []
   }
 
   func scan(settings: AppSettings? = nil,
@@ -2248,23 +2937,40 @@ final class ScanCoordinator {
       return TuningService.fetchOrCreate(in: ctx)
     }()
 
-    let thresholds = SignalThresholds.from(tuning)
+    var thresholds = SignalThresholds.from(tuning)
+    let journalEntries: [JournalEntry] = {
+      guard let ctx = journalContext else { return [] }
+      let d = FetchDescriptor<JournalEntry>()
+      return (try? ctx.fetch(d)) ?? []
+    }()
+
+    if tuning.oosGateEnabled {
+      let oosReport = OOSBuilder.build(from: journalEntries,
+                                       windowDays: tuning.oosWindowDays)
+      let blocked = OOSBuilder.blockedMarkets(report: oosReport, cfg: tuning)
+      thresholds.blockedByOOS = blocked
+      summary.oosBlocked = Array(blocked).sorted()
+      if !blocked.isEmpty {
+        summary.notes.append("OOS-блок: \(summary.oosBlocked.joined(separator: ", "))")
+      }
+      if let container = container {
+        let snapCtx = ModelContext(container)
+        let snap = BacktestService.fetchOrCreate(in: snapCtx)
+        snap.oosValidationJSON = try? JSONEncoder().encode(oosReport)
+        try? snapCtx.save()
+      }
+    }
+
     let cornerWeights = CornerWeights.from(tuning)
     let cardWeights = CardWeights.from(tuning)
 
     let corrMatrix: CorrelationMatrix = {
-      guard let ctx = journalContext else { return .empty }
-      let d = FetchDescriptor<JournalEntry>()
-      guard let entries = try? ctx.fetch(d) else { return .empty }
-      return CorrelationBuilder.build(from: entries)
+      CorrelationBuilder.build(from: journalEntries)
     }()
     summary.correlationPairs = corrMatrix.marketPairsN.count + corrMatrix.leaguePairsN.count
 
     let streak: (streak: Int, state: VolatilityState) = {
-      guard let ctx = journalContext else { return (0, .normal) }
-      let d = FetchDescriptor<JournalEntry>()
-      guard let entries = try? ctx.fetch(d) else { return (0, .normal) }
-      return VolatilityStop.evaluate(entries,
+      VolatilityStop.evaluate(journalEntries,
         capThreshold: tuning.stopLossCapStreak,
         pauseThreshold: tuning.stopLossPauseStreak)
     }()
@@ -2581,8 +3287,6 @@ enum OddsFormatter {
   }
 }
 
-// MARK: - Notification name
-
 extension Notification.Name {
   static let openSignal = Notification.Name("com.syndicatequant.openSignal")
 }
@@ -2627,6 +3331,14 @@ struct LineMovement: Identifiable, Hashable {
   var direction: String { delta > 0 ? "▲" : (delta < 0 ? "▼" : "·") }
 }
 
+struct ObservedGame {
+  var numericID: Int?
+  var startTime: Date?
+  var league: String
+  var home: String
+  var away: String
+}
+
 @MainActor
 final class LiveMonitor: ObservableObject {
   static let shared = LiveMonitor()
@@ -2636,20 +3348,34 @@ final class LiveMonitor: ObservableObject {
   @Published private(set) var isRunning: Bool = false
   @Published private(set) var lastTick: Date?
   @Published private(set) var lastError: String?
-  private var observed: [String: Int?] = [:]
+  @Published private(set) var preMatchSnapshotsSaved: Int = 0
+
+  private var observed: [String: ObservedGame] = [:]
   private var task: Task<Void, Never>?
   private var cycleCounter: Int = 0
+  private var cachedContext: ModelContext?
 
   private let fullOddsEveryNCycles = 5
 
   private init() {}
 
-  func observe(gameID: String, numericID: Int?) { observed[gameID] = numericID }
+  func observe(gameID: String, numericID: Int?,
+               startTime: Date? = nil,
+               league: String = "",
+               home: String = "",
+               away: String = "") {
+    observed[gameID] = ObservedGame(
+      numericID: numericID, startTime: startTime,
+      league: league, home: home, away: away)
+  }
+
   func clearObserved() {
     observed.removeAll(); snapshots.removeAll()
     previous.removeAll(); movements.removeAll()
+    preMatchSnapshotsSaved = 0
     cycleCounter = 0
   }
+
   func previousSnapshotForDebug(matchID: String) -> OddsSnapshot? { return previous[matchID] }
 
   func start(settings: AppSettings) {
@@ -2681,9 +3407,10 @@ final class LiveMonitor: ObservableObject {
 
     cycleCounter += 1
     let doFullFetch = (cycleCounter % fullOddsEveryNCycles == 0)
+    let now = Date()
 
-    for (gameID, numericID) in observed {
-      guard let nid = numericID else { continue }
+    for (gameID, obs) in observed {
+      guard let nid = obs.numericID else { continue }
 
       let parsed: [String: [String: Double]]
       if doFullFetch {
@@ -2697,7 +3424,7 @@ final class LiveMonitor: ObservableObject {
       guard !parsed.isEmpty else { continue }
 
       let snap = OddsSnapshot(gameID: gameID, numericID: nid,
-                              takenAt: Date(), byKey: parsed)
+                              takenAt: now, byKey: parsed)
 
       if let prev = previous[gameID] {
         for (k, _) in parsed {
@@ -2717,6 +3444,34 @@ final class LiveMonitor: ObservableObject {
             delta: delta, booksAgreeing: moving.count, isSharp: isSharp))
         }
       }
+
+      if settings.preMatchHistoryEnabled,
+         let startTime = obs.startTime,
+         startTime > now {
+        let minutes = Int(startTime.timeIntervalSince(now) / 60.0)
+        if let bucket = LineSnapshotService.bucket(
+            minutesToStart: minutes,
+            maxWindow: settings.preMatchCaptureWindowMin),
+           let ctx = persistContext() {
+          for (k, byBook) in parsed {
+            let parts = k.split(separator: "|").map(String.init)
+            guard parts.count >= 2 else { continue }
+            let market = parts[0]
+            let selection = parts[1]
+            let line: Double? = parts.count > 2 ? Double(parts[2]) : nil
+            let didSave = LineSnapshotService.save(
+              gameID: gameID, numericID: nid,
+              market: market, selection: selection, line: line,
+              startTime: startTime, league: obs.league,
+              home: obs.home, away: obs.away,
+              bucketMinutes: bucket, minutesToStart: minutes,
+              byBook: byBook, in: ctx)
+            if didSave { preMatchSnapshotsSaved += 1 }
+          }
+          try? ctx.save()
+        }
+      }
+
       previous[gameID] = snap
       newSnapshots[gameID] = snap
     }
@@ -2726,6 +3481,14 @@ final class LiveMonitor: ObservableObject {
     self.lastTick = Date()
     self.lastError = newSnapshots.isEmpty
       ? (observed.isEmpty ? "Нет активных матчей" : "Не удалось получить котировки") : nil
+  }
+
+  private func persistContext() -> ModelContext? {
+    if let c = cachedContext { return c }
+    guard let container = AppDependencies.shared.container else { return nil }
+    let c = ModelContext(container)
+    cachedContext = c
+    return c
   }
 
   static func parseFullBooksToDict(_ books: [BookmakerOdds]) -> [String: [String: Double]] {
@@ -2822,5 +3585,63 @@ final class LiveMonitor: ObservableObject {
   private static func numberFrom(_ o: [String: JSONValue], _ keys: [String]) -> Double? {
     for k in keys { if let n = o[k]?.number { return n } }
     return nil
+  }
+
+  static func classifyRegime(snapshots: [OddsSnapshot],
+                             movements: [LineMovement]) -> MarketRegimeReport {
+    guard !snapshots.isEmpty else {
+      return MarketRegimeReport(
+        regime: .unknown, avgBooksPerMarket: 0, avgSpreadPct: 0,
+        sharpMovements: 0, totalMovements: 0,
+        note: "Нет активных котировок — запустите live-монитор")
+    }
+
+    var spreads: [Double] = []
+    var bookCounts: [Int] = []
+    for snap in snapshots.values {
+      for (_, byBook) in snap.byKey {
+        bookCounts.append(byBook.count)
+        if byBook.count >= 2 {
+          let vals = Array(byBook.values)
+          let mn = vals.min() ?? 1
+          let mx = vals.max() ?? 1
+          if mn > 1 { spreads.append((mx - mn) / mn) }
+        }
+      }
+    }
+    let avgSpread = spreads.isEmpty ? 0 : spreads.reduce(0, +) / Double(spreads.count)
+    let avgBooks = bookCounts.isEmpty
+      ? 0 : Double(bookCounts.reduce(0, +)) / Double(bookCounts.count)
+
+    let total = movements.count
+    let sharp = movements.filter { $0.isSharp }.count
+    let bigMovers = movements.filter { abs($0.delta) > 0.02 }.count
+
+    let regime: MarketRegime
+    let note: String
+    if total == 0 {
+      regime = .normal
+      note = "Движений пока нет — базовый цикл"
+    } else if sharp >= 3 && total >= 3 {
+      regime = .lineDislocation
+      note = "\(sharp) sharp-движений на \(total) — резкий переезд линий в 3+ книгах"
+    } else if avgBooks > 0 && avgBooks < 4 {
+      regime = .lowLiquidity
+      note = String(format: "Средне %.1f книг/рынок — тонкий рынок, котировки менее надёжны", avgBooks)
+    } else if bigMovers >= 5 || avgSpread > 0.10 {
+      regime = .highVolatility
+      note = String(format: "%d крупных движений, средний спред %.1f%% — рынок волатильный",
+                    bigMovers, avgSpread * 100)
+    } else {
+      regime = .normal
+      note = "Штатный режим рынка"
+    }
+    return MarketRegimeReport(
+      regime: regime,
+      avgBooksPerMarket: avgBooks,
+      avgSpreadPct: avgSpread,
+      sharpMovements: sharp,
+      totalMovements: total,
+      note: note)
   }
 }

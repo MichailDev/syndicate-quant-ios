@@ -6,19 +6,19 @@ import Network
 actor ResponseCache {
   static let shared = ResponseCache()
   private struct Entry { let json: JSONValue; let expiresAt: Date }
-  private struct Envelope: Codable { let payload: Data; let expiresAt: Date }
+  nonisolated private struct Envelope: Codable { let payload: Data; let expiresAt: Date }
   private var memory: [String: Entry] = [:]
   private let fm = FileManager.default
   private let dir: URL
 
   private init() {
-    let base = (try? fm.url(for: .cachesDirectory, in: .userDomainMask,
-                             appropriateFor: nil, create: true))
+    let base = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
+                                             appropriateFor: nil, create: true))
       ?? URL(fileURLWithPath: NSTemporaryDirectory())
     let d = base.appendingPathComponent("SStatsCache", isDirectory: true)
-    try? fm.createDirectory(at: d, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
     self.dir = d
-    try? purgeExpiredOnDisk()
+    Self.purgeExpiredOnDisk(in: d)
   }
 
   func get(key: String) -> JSONValue? {
@@ -54,7 +54,8 @@ actor ResponseCache {
     dir.appendingPathComponent(ResponseCache.fnv1a(key) + ".json")
   }
 
-  private func purgeExpiredOnDisk() throws {
+  nonisolated static func purgeExpiredOnDisk(in dir: URL) {
+    let fm = FileManager.default
     let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
     for f in files {
       guard let data = try? Data(contentsOf: f),
@@ -64,7 +65,7 @@ actor ResponseCache {
     }
   }
 
-  private static func fnv1a(_ s: String) -> String {
+  nonisolated private static func fnv1a(_ s: String) -> String {
     var h: UInt64 = 1469598103934665603
     for b in s.utf8 { h ^= UInt64(b); h &*= 1099511628211 }
     return String(h, radix: 16)
@@ -415,17 +416,12 @@ final class SStatsClient {
     } catch { return [] }
   }
 
-  /// [Блок 6.2] Личные встречи (H2H).
-  /// Тянем историю home team, фильтруем матчи, где соперник — away team.
-  /// Возвращаем последние `count` матчей (chronological desc).
-  /// Плюс fallback: если по home не нашлось, пробуем со стороны away.
   func fetchH2H(homeID: String, awayID: String,
                 homeName: String, awayName: String,
                 count: Int = 3) async -> [TeamRecord] {
     let engine = QuantEngine()
     let target = max(count, 5)
 
-    // Основной путь: история home, фильтр по away
     if let list = try? await listTeam(homeID, limit: target * 4) {
       let items = matches(from: list)
       let h2hGames = items.filter { m in
@@ -445,7 +441,6 @@ final class SStatsClient {
       }
     }
 
-    // Fallback: история away, фильтр по home
     if let list = try? await listTeam(awayID, limit: target * 4) {
       let items = matches(from: list)
       let h2hGames = items.filter { m in
@@ -594,6 +589,7 @@ final class SStatsClient {
       let pref = home ? "home" : "away"
       let opp = home ? "away" : "home"
       let stats = o["statistics"]?.object ?? o
+      // [W1-#5] Добавлены reds/oppReds для модели CARDS.
       let rec = TeamRecord(
         id: string(o, ["id", "Id", "gameId", "game_id", "eventId", "flashId"]) ?? UUID().uuidString,
         date: date(o),
@@ -614,7 +610,11 @@ final class SStatsClient {
         oppXg: number(stats, ["expectedGoals" + (home ? "Away" : "Home"), "opp_xg"]),
         referee: string(o, ["refereeName", "referee"]),
         isHome: home,
-        players: parsePlayers(o: o, stats: stats, side: pref))
+        players: parsePlayers(o: o, stats: stats, side: pref),
+        reds: number(stats, ["redCards" + (home ? "Home" : "Away"),
+                             pref + "Reds", "reds"]),
+        oppReds: number(stats, ["redCards" + (home ? "Away" : "Home"),
+                                opp + "Reds"]))
       if rec.gf != nil || rec.ga != nil { out.append(rec) }
     }
     return out

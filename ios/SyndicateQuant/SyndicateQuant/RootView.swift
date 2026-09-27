@@ -43,17 +43,13 @@ struct RootView: View {
   @State private var apiReachable: String = "—"
   @State private var apiKeyState: String = "—"
   @State private var lastSettleStatus: String = "—"
-
   @State private var btProgressText = ""
-
   @State private var selectedTab: Int = 0
   @State private var pendingSignalID: String?
-
   @State private var selfTestResults: [QuantMathSelfTest.Check] = []
 
   private var currentSnapshot: BacktestSnapshot? { snapshots.first }
   private var tuningConfig: TuningConfig? { tuningConfigs.first }
-
   private var correlationMatrix: CorrelationMatrix {
     CorrelationBuilder.build(from: journal)
   }
@@ -73,11 +69,10 @@ struct RootView: View {
     }
     .tint(.blue)
     .preferredColorScheme(settings.colorScheme.toColorScheme)
-     .task {
+    .task {
       _ = BacktestService.fetchOrCreate(in: context)
       _ = TuningService.fetchOrCreate(in: context)
       await refresh()
-      // Авто-возобновление сборки, если она была прервана выходом из фона
       if currentSnapshot?.buildStatus == "building",
          BacktestService.hasCheckpoint() {
         await runFullBuild()
@@ -129,6 +124,8 @@ struct RootView: View {
           Label("Обновить", systemImage: "arrow.clockwise")
         }
         .disabled(busy)
+      } footer: {
+        Text("Скан проверяет матчи выбранной лиги по 3 рынкам: тоталы голов, углы Pinnacle, карточки best available. Сигналы автоматически уходят в Журнал при открытии карточки.")
       }
 
       if signals.isEmpty {
@@ -175,12 +172,17 @@ struct RootView: View {
         }
         .disabled(busy)
         Text(lastSettleStatus).font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Settlement")
+      } footer: {
+        Text("Запрашивает /Games/{id} по каждой открытой записи, определяет WIN/LOSS/PUSH, считает профит и CLV (Closing Line Value — насколько ваш коэффициент лучше закрывающего).")
       }
 
       if journal.isEmpty {
         Section { ContentUnavailableView("Журнал пуст", systemImage: "tray") }
       } else {
         Section("Статистика") { journalStatsView() }
+        clvFirstSection
         equitySection
         Section("Калибровка") { calibrationView() }
         Section("Записи") {
@@ -201,6 +203,74 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
+  // MARK: - CLV-first
+
+  @ViewBuilder
+  private var clvFirstSection: some View {
+    let rep = Metrics.clvReport(journal)
+    Section {
+      HStack {
+        Text("Вердикт").font(.subheadline)
+        Spacer()
+        Text(rep.verdict).font(.subheadline.bold())
+          .foregroundStyle(clvVerdictColor(rep.verdict))
+      }
+      Text(rep.note).font(.caption).foregroundStyle(.secondary)
+
+      if rep.totalWithCLV == 0 {
+        Text("Пока нет записей с CLV. Запустите settle после тура.")
+          .font(.caption2).foregroundStyle(.secondary)
+      } else {
+        HStack(spacing: 14) {
+          miniBlock("+CLV", "\(rep.positiveCount)")
+          miniBlock("±0", "\(rep.neutralCount)")
+          miniBlock("−CLV", "\(rep.negativeCount)")
+          miniBlock("Доля +", String(format: "%.0f%%", rep.positiveRate * 100))
+        }
+        HStack(spacing: 14) {
+          miniBlock("avg CLV", String(format: "%+.2f%%", rep.avgCLV * 100))
+          miniBlock("median", String(format: "%+.2f%%", rep.medianCLV * 100))
+          miniBlock("P/L +CLV", String(format: "%+.3f", rep.pnlPositive))
+            .foregroundStyle(rep.pnlPositive >= 0 ? .green : .red)
+          miniBlock("P/L −CLV", String(format: "%+.3f", rep.pnlNegative))
+            .foregroundStyle(rep.pnlNegative >= 0 ? .green : .red)
+        }
+        if !rep.byMarket.isEmpty {
+          Text("По рынкам:").font(.caption2).foregroundStyle(.secondary)
+          ForEach(rep.byMarket.keys.sorted(), id: \.self) { mk in
+            if let m = rep.byMarket[mk] {
+              HStack {
+                Text(mk).font(.caption.monospacedDigit())
+                Spacer()
+                Text(String(format: "n=%d · +%.0f%% · avg %+.2f%%",
+                            m.count, m.positiveRate * 100, m.avgCLV * 100))
+                  .font(.caption2.monospacedDigit())
+                  .foregroundStyle(m.avgCLV > 0 ? .green : .red)
+              }
+            }
+          }
+        }
+        Text("Порог «+CLV» = +0.5%, «−CLV» = −0.5%.")
+          .font(.caption2).foregroundStyle(.tertiary)
+      }
+    } header: {
+      Text("CLV-first")
+    } footer: {
+      Text("CLV-first — отдельно измеряем, берут ли сигналы систематически лучшую цену, чем закрытие. STRONG/OK = edge до рынка подтверждён. NEGATIVE = цена хуже закрытия, стратегия под вопросом.")
+    }
+  }
+
+  private func clvVerdictColor(_ v: String) -> Color {
+    switch v {
+    case "STRONG":   return .green
+    case "OK":       return .blue
+    case "WEAK":     return .yellow
+    case "MIXED":    return .orange
+    case "NEGATIVE": return .red
+    default:         return .gray
+    }
+  }
+
   @ViewBuilder
   private var equitySection: some View {
     let curve = Metrics.equityCurve(journal, bankroll: settings.effectiveBankroll)
@@ -208,7 +278,7 @@ struct RootView: View {
     let breakouts = bands.filter { $0.isBreakout }
     let lastBand = bands.last
 
-    Section("Equity curve") {
+    Section {
       if curve.count < 2 {
         Text("Нужно минимум 2 закрытые записи")
           .font(.caption).foregroundStyle(.secondary)
@@ -271,13 +341,31 @@ struct RootView: View {
             miniBlock("Breakouts", "\(breakouts.count)")
           }
           .padding(.vertical, 2)
-          Text("MA(20) ± 2σ по последним 20 ставкам. Точки — выход за полосу.")
-            .font(.caption2).foregroundStyle(.secondary)
+
+          let risk = BollingerRisk.evaluate(bands, window: 20)
+          HStack(spacing: 8) {
+            Text("Risk").font(.caption2).foregroundStyle(.secondary)
+            Text(risk.state.rawValue).font(.caption.bold())
+              .foregroundStyle(bollingerRiskColor(risk.state))
+            Spacer()
+            if let w = risk.width, let aw = risk.avgWidth {
+              Text(String(format: "w %.3f / avg %.3f", w, aw))
+                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            Text(String(format: "BO %d/%d",
+                        risk.recentBreakouts, risk.window))
+              .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+          }
+          Text(risk.note).font(.caption2).foregroundStyle(.tertiary)
         } else {
           Text("Полосы Боллинджера появятся после 20 закрытых записей.")
             .font(.caption2).foregroundStyle(.secondary)
         }
       }
+    } header: {
+      Text("Equity curve")
+    } footer: {
+      Text("Накопленный P/L. Синяя — факт. Фиолетовая MA(20) — скользящее среднее. Серые пунктиры — MA ± 2σ (полосы Боллинджера). Точки — breakout. BollingerRisk — диагностика волатильности P/L (не влияет на размер стейка).")
     }
   }
 
@@ -418,13 +506,38 @@ struct RootView: View {
     }
   }
 
+  private func bollingerRiskColor(_ s: BollingerRisk.State) -> Color {
+    switch s {
+    case .normal:    return .green
+    case .expanding: return .yellow
+    case .high:      return .orange
+    case .risk:      return .red
+    }
+  }
+
+  private func marketRegimeColor(_ r: MarketRegime) -> Color {
+    switch r {
+    case .normal:          return .green
+    case .highVolatility:  return .orange
+    case .lowLiquidity:    return .yellow
+    case .lineDislocation: return .red
+    case .unknown:         return .gray
+    }
+  }
+
+  private func oosMarketColor(_ roi: Double, threshold: Double) -> Color {
+    if roi < threshold { return .red }
+    if roi < 0 { return .orange }
+    return .green
+  }
+
   // MARK: - Авто
 
   private var autoView: some View {
     List {
       Section {
         Text("Backtest Service").font(.headline)
-        Text("Auto-Exclude, posterior (B2), TeamRating (B3), корреляция (B4), stop-loss (B5), player impact (B6), voting (D3), сравнение моделей (E5), пороги и веса CORNERS/CARDS.")
+        Text("Все механизмы автотюнинга, обучения и диагностики. Здесь собирается база за 2 года, обогащаются котировки углов/ЖК, настраиваются пороги, и ведутся отчёты OOS + walk-forward.")
           .font(.caption).foregroundStyle(.secondary)
       }
 
@@ -433,13 +546,15 @@ struct RootView: View {
       liveMonitorSection
       leagueMarketHeatmapSection
       modelComparisonSection
+      walkForwardSection
+      oosValidationSection
 
       volatilitySection
       correlationSection
       playerImpactSection
 
       if let snap = currentSnapshot {
-        Section("Статус") {
+        Section {
           LabeledContent("Состояние", value: snap.buildStatus)
           ProgressView(value: snap.buildProgress)
           LabeledContent("Прогресс",
@@ -465,10 +580,14 @@ struct RootView: View {
           if let err = snap.lastError {
             Text(err).font(.caption).foregroundStyle(.red)
           }
+        } header: {
+          Text("Статус снапшота")
+        } footer: {
+          Text("Снапшот — агрегат по всей собранной базе: средний ROI, Sharpe, Sortino, Profit Factor, Brier, avgCLV. Обновляется после каждого пересбора или докачки.")
         }
       }
 
-      Section("Действия") {
+      Section {
         let snap = currentSnapshot
         let isResumable = (snap?.buildStatus == "building"
                            && (snap?.buildMatchesCount ?? 0) > 0)
@@ -490,10 +609,10 @@ struct RootView: View {
         if !btProgressText.isEmpty {
           Text(btProgressText).font(.caption.monospaced()).foregroundStyle(.secondary)
         }
-        if isResumable {
-          Text("Прогресс сохраняется после каждого месяца — можно смело сворачивать и возвращаться.")
-            .font(.caption2).foregroundStyle(.secondary)
-        }
+      } header: {
+        Text("Действия")
+      } footer: {
+        Text("Прогресс сборки сохраняется после каждого месяца в Documents/build_checkpoint.json — можно смело сворачивать и возвращаться. Докачка берёт только последние 7 дней.")
       }
 
       if let snap = currentSnapshot {
@@ -508,8 +627,10 @@ struct RootView: View {
 
       teamRatingsSection
 
-      Section("Принцип") {
+      Section {
         Text("NO DATA → NO NUMBER → NO EDGE → NO BET").font(.subheadline).bold()
+      } header: {
+        Text("Принцип")
       }
 
       Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
@@ -519,7 +640,6 @@ struct RootView: View {
     .navigationBarTitleDisplayMode(.large)
   }
 
-  // [Блок 5] Enrichment progress + кнопка «Продолжить»
   @ViewBuilder
   private var enrichmentSection: some View {
     if let snap = currentSnapshot, snap.enrichmentTotal > 0 {
@@ -546,11 +666,11 @@ struct RootView: View {
                   systemImage: "arrow.triangle.branch")
           }
           .disabled(busy)
-          Text("Обогащение работает, пока приложение открыто. Обычно нужно 1–3 подхода.")
-            .font(.caption2).foregroundStyle(.secondary)
         }
       } header: {
         Text("Обогащение котировок")
+      } footer: {
+        Text("Скачиваем /Odds/{id} для матчей, у которых ещё нет marketId 45 (углы Pinnacle) или 80 (карточки best). Успешные матчи сохраняются в HistoricalMarketCache — прогресс не теряется при перезапуске. Ночью BGTask добавляет ещё ~60 матчей при зарядке.")
       }
     }
   }
@@ -559,9 +679,7 @@ struct RootView: View {
   private var modelComparisonSection: some View {
     let list = currentSnapshot?.decodedModelComparison() ?? []
     if !list.isEmpty {
-      Section("Model comparison (E5)") {
-        Text("Brier и LogLoss ниже — модель лучше.")
-          .font(.caption2).foregroundStyle(.secondary)
+      Section {
         ForEach(list) { c in
           VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -579,7 +697,100 @@ struct RootView: View {
           }
           .padding(.vertical, 2)
         }
+      } header: {
+        Text("Model comparison (E5)")
+      } footer: {
+        Text("DC — Dixon-Coles. BIV — Bivariate Poisson. NB — Negative Binomial. ENS — ансамбль. Brier и LogLoss ниже — модель точнее. P(H)/P(D)/P(A) — средние вероятности модели по выборке.")
       }
+    }
+  }
+
+  // MARK: - W3b Walk-forward
+
+  @ViewBuilder
+  private var walkForwardSection: some View {
+    if let snap = currentSnapshot,
+       let train = snap.decodedTrainReport(),
+       let val = snap.decodedValidationReport(),
+       let holdout = snap.decodedHoldoutReport() {
+      Section {
+        wfBlock(title: "Train (60%)", color: .blue, delta: train)
+        wfBlock(title: "Validation (20%)", color: .purple, delta: val)
+        wfBlock(title: "Holdout (20%)", color: .orange, delta: holdout)
+      } header: {
+        Text("Walk-forward (W3b)")
+      } footer: {
+        Text("Train + Validation → в Self-Tuning (пороги, posterior, auto-exclude). Holdout не участвует в обучении — это независимая проверка. Если holdout сильно хуже train — модель переобучена.")
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func wfBlock(title: String, color: Color, delta: WalkForwardDelta) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack {
+        Text(title).font(.subheadline.bold()).foregroundStyle(color)
+        Spacer()
+        Text("n=\(delta.bets)").font(.caption2).foregroundStyle(.secondary)
+      }
+      HStack(spacing: 14) {
+        miniBlock("ROI", String(format: "%+.1f%%", delta.roi * 100))
+          .foregroundStyle(delta.roi >= 0 ? .green : .red)
+        miniBlock("Sharpe", String(format: "%.2f", delta.sharpe))
+        miniBlock("ProfitF", String(format: "%.2f", delta.profitFactor))
+        miniBlock("Brier", String(format: "%.3f", delta.brier))
+        miniBlock("avgCLV", String(format: "%+.2f%%", delta.avgCLV * 100))
+          .foregroundStyle(delta.avgCLV >= 0 ? .green : .red)
+      }
+      HStack(spacing: 14) {
+        miniBlock("Матчей", "\(delta.matches)")
+        miniBlock("W/L/P", "\(delta.wins)/\(delta.losses)/\(delta.pushes)")
+        miniBlock("Hit", String(format: "%.0f%%", delta.hitRate * 100))
+      }
+    }
+    .padding(.vertical, 2)
+  }
+
+  // MARK: - W3a OOS-валидация
+
+  @ViewBuilder
+  private var oosValidationSection: some View {
+    let cfg = tuningConfig
+    let enabled = cfg?.oosGateEnabled ?? false
+    let window = cfg?.oosWindowDays ?? 90
+    let minBets = cfg?.oosMinBets ?? 100
+    let report = Metrics.oosFromJournal(journal, windowDays: window)
+    let blocked = cfg.map { OOSBuilder.blockedMarkets(report: report, cfg: $0) } ?? []
+
+    Section {
+      LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
+      LabeledContent("Окно", value: "\(window) дней")
+      LabeledContent("Min n", value: "\(minBets)")
+      if blocked.isEmpty {
+        Text("Блокировок нет").font(.caption).foregroundStyle(.secondary)
+      } else {
+        Text("Заблокировано: \(blocked.sorted().joined(separator: ", "))")
+          .font(.caption).foregroundStyle(.red)
+      }
+      if report.byMarket.isEmpty {
+        Text("Пока нет закрытых записей в окне.").font(.caption2).foregroundStyle(.secondary)
+      } else {
+        ForEach(report.byMarket.keys.sorted(), id: \.self) { mk in
+          if let r = report.byMarket[mk] {
+            HStack {
+              Text(mk).font(.subheadline)
+              Spacer()
+              Text(String(format: "%+.1f%% · n=%d", r.roi * 100, r.bets))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(r.roi >= 0 ? .green : .red)
+            }
+          }
+        }
+      }
+    } header: {
+      Text("OOS-валидация журнала (W3a)")
+    } footer: {
+      Text("Out-of-sample по реальному журналу (не бэктест). Если за окно n ≥ Min и ROI < порога — рынок автоматически блокируется в сканере (X NO BET). Пороги задаются в Self-Tuning.")
     }
   }
 
@@ -613,14 +824,41 @@ struct RootView: View {
         }
         .disabled(!settings.liveMonitorEnabled || signals.isEmpty)
       }
+      if settings.preMatchHistoryEnabled {
+        LabeledContent("Pre-match snapshots",
+                       value: "\(liveMonitor.preMatchSnapshotsSaved)")
+      }
     } header: {
       Text("Live (D1)")
     } footer: {
-      Text("Каждый 5-й цикл — полные котировки (углы+ЖК). Остальные — только голы.")
+      Text("Live-монитор опрашивает котировки активных матчей. Каждый 5-й цикл — полные котировки (голы + углы + ЖК). Остальные — только голы. Это экономит лимит SStats.")
+    }
+
+    let regime = LiveMonitor.classifyRegime(
+      snapshots: liveMonitor.snapshots,
+      movements: liveMonitor.movements)
+    Section {
+      HStack {
+        Text("Состояние").font(.subheadline)
+        Spacer()
+        Text(regime.regime.label).font(.subheadline.bold())
+          .foregroundStyle(marketRegimeColor(regime.regime))
+      }
+      Text(regime.note).font(.caption).foregroundStyle(.secondary)
+      HStack(spacing: 14) {
+        miniBlock("Книг/рынок", String(format: "%.1f", regime.avgBooksPerMarket))
+        miniBlock("Спред", String(format: "%.1f%%", regime.avgSpreadPct * 100))
+        miniBlock("Sharp", "\(regime.sharpMovements)")
+        miniBlock("Движений", "\(regime.totalMovements)")
+      }
+    } header: {
+      Text("Регим рынка (W2b)")
+    } footer: {
+      Text("NORMAL — штатный режим. HIGH VOL — широкие спреды. LOW LIQ — мало книг. DISLOCATION — резкий переезд линий в 3+ книгах. Диагностика, не влияет на размер стейка.")
     }
 
     if !liveMonitor.movements.isEmpty {
-      Section("Движения линии (D2)") {
+      Section {
         let top = liveMonitor.movements.prefix(5)
         ForEach(Array(top)) { m in
           HStack(alignment: .top, spacing: 8) {
@@ -645,6 +883,10 @@ struct RootView: View {
               .foregroundStyle(m.delta < 0 ? .green : .red)
           }
         }
+      } header: {
+        Text("Движения линии (D2)")
+      } footer: {
+        Text("Если ≥ 3 книги двигают цену в одну сторону > 2% — линия помечается SHARP (вероятен инсайд или smart money).")
       }
     }
   }
@@ -658,7 +900,7 @@ struct RootView: View {
           VStack(alignment: .leading, spacing: 2) {
             Text("Self-Tuning панель").font(.headline)
             if let cfg = tuningConfig {
-              Text("Активных: \(activeCount(cfg)) из 8 · порогов: 15 · весов: 12")
+              Text("Активных: \(activeCount(cfg)) из 9 · порогов: 24 · весов: 12")
                 .font(.caption).foregroundStyle(.secondary)
             } else {
               Text("Открыть настройки автотюнинга")
@@ -668,6 +910,8 @@ struct RootView: View {
           Spacer()
         }
       }
+    } footer: {
+      Text("Все ручные пороги и тумблеры. Каждое изменение логируется с возможностью отката.")
     }
   }
 
@@ -681,6 +925,7 @@ struct RootView: View {
     if cfg.teamRatingEnabled { n += 1 }
     if cfg.cornersEnabled { n += 1 }
     if cfg.cardsEnabled { n += 1 }
+    if cfg.oosGateEnabled { n += 1 }
     return n
   }
 
@@ -690,9 +935,7 @@ struct RootView: View {
     if !stats.isEmpty {
       let leagues = LeaguePool.pool.map { $0.name }
       let markets = ["GOALS", "CARDS", "CORNERS"]
-      Section("Лиги × Рынки (ROI)") {
-        Text("Цвет: зелёный — плюс, красный — минус. Точки: n ставок.")
-          .font(.caption2).foregroundStyle(.secondary)
+      Section {
         ScrollView(.horizontal, showsIndicators: false) {
           Grid(horizontalSpacing: 6, verticalSpacing: 6) {
             GridRow {
@@ -713,6 +956,10 @@ struct RootView: View {
           }
           .padding(.vertical, 4)
         }
+      } header: {
+        Text("Лиги × Рынки (ROI)")
+      } footer: {
+        Text("Разбивка ROI по каждой лиге и рынку отдельно. Зелёный — плюс. Красный — минус. n = число ставок в ячейке.")
       }
     }
   }
@@ -750,7 +997,7 @@ struct RootView: View {
     let pause = tuningConfig?.stopLossPauseStreak ?? VolatilityStop.defaultPauseThreshold
     let enabled = tuningConfig?.stopLossEnabled ?? true
     let ev = VolatilityStop.evaluate(journal, capThreshold: cap, pauseThreshold: pause)
-    Section("Volatility stop (B5)") {
+    Section {
       LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
       LabeledContent("Текущая серия", value: "\(ev.streak)")
       LabeledContent("Состояние", value: enabled ? ev.state.label : "OFF")
@@ -768,6 +1015,10 @@ struct RootView: View {
         Text("Работаем в штатном режиме.")
           .font(.caption).foregroundStyle(.secondary)
       }
+    } header: {
+      Text("Volatility stop (B5)")
+    } footer: {
+      Text("Автоматическая защита от длинных серий проигрышей. NORMAL — штатно. CAP — стейк урезан до 5%. PAUSE — новые ставки не создаются.")
     }
   }
 
@@ -775,7 +1026,7 @@ struct RootView: View {
   private var correlationSection: some View {
     let m = correlationMatrix
     let enabled = tuningConfig?.correlationEnabled ?? true
-    Section("Correlation matrix (B4)") {
+    Section {
       LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
       if m.totalPairs == 0 {
         Text("Нужно ≥ 20 пар закрытых записей в одном дне для эмпирики.")
@@ -805,16 +1056,22 @@ struct RootView: View {
           }
         }
       }
+    } header: {
+      Text("Correlation matrix (B4)")
+    } footer: {
+      Text("φ-коэффициенты между рынками и лигами из журнала. Если две ставки в портфеле сильно коррелируют (≥ 0.65), вторая отсекается. Fallback — структурные значения.")
     }
   }
 
   @ViewBuilder
   private var playerImpactSection: some View {
     let enabled = tuningConfig?.playerImpactEnabled ?? true
-    Section("Player impact (B6)") {
+    Section {
       LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
-      Text("Применяется, когда в gameInfo есть состав (lineups) и у команды ≥ 6 игроков в истории. Отсутствие топ-8 → −5…−12% к λ.")
-        .font(.caption).foregroundStyle(.secondary)
+    } header: {
+      Text("Player impact (B6)")
+    } footer: {
+      Text("Коррекция λ, если в gameInfo есть составы (lineups) и у команды ≥ 6 игроков в истории. Отсутствие 3–4 топ-8 → λ × 0.92…0.95. Отсутствие 5+ → λ × 0.88.")
     }
   }
 
@@ -823,10 +1080,8 @@ struct RootView: View {
     let top = Array(teamRatings.prefix(20))
     let enabled = tuningConfig?.teamRatingEnabled ?? true
     if !top.isEmpty || !enabled {
-      Section("Team ratings (B3)") {
+      Section {
         LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
-        Text("Elo, старт 1500, HFA 60, K=32→20. Применяются после 3 матчей.")
-          .font(.caption2).foregroundStyle(.secondary)
         ForEach(top) { r in
           HStack {
             VStack(alignment: .leading, spacing: 2) {
@@ -844,6 +1099,10 @@ struct RootView: View {
             }
           }
         }
+      } header: {
+        Text("Team ratings (B3)")
+      } footer: {
+        Text("Elo, старт 1500, HFA 60, K=32→20. Применяются после ≥ 3 матчей. Влияют на λ через glickoAdjust (не более ±12%).")
       }
     }
   }
@@ -856,7 +1115,7 @@ struct RootView: View {
     let enabled = cfg?.autoExcludeEnabled ?? true
     let rules = AutoExclude.rules(from: snap, minROI: minROI, minBets: minBets)
     let excluded = rules.filter { $0.excluded }
-    Section("Auto-Exclude") {
+    Section {
       LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
       LabeledContent("Порог",
                      value: String(format: "ROI < %.1f%%, n ≥ %d",
@@ -882,6 +1141,10 @@ struct RootView: View {
           }
         }
       }
+    } header: {
+      Text("Auto-Exclude")
+    } footer: {
+      Text("Комбинации лига+рынок с плохим ROI в бэктесте автоматически отсеиваются в сканере.")
     }
   }
 
@@ -893,7 +1156,7 @@ struct RootView: View {
     let buckets = snap.decodedPosteriorBuckets()
     let nonEmpty = buckets.filter { $0.n > 0 }
     let usable = nonEmpty.filter { $0.n >= 20 }.count
-    Section("Posterior buckets (B2)") {
+    Section {
       LabeledContent("Флаг", value: enabled ? "включён" : "ВЫКЛ")
       LabeledContent("Вес w", value: String(format: "%.2f", w))
       if nonEmpty.isEmpty {
@@ -916,6 +1179,10 @@ struct RootView: View {
           }
         }
       }
+    } header: {
+      Text("Posterior buckets (B2)")
+    } footer: {
+      Text("Байесовская коррекция вероятности: p_adj = (1-w)·p + w·p_post. p_post — исторически фактический hit rate для того же бакета вероятности. Применяется только для бакетов с n ≥ 20.")
     }
   }
 
@@ -1021,7 +1288,6 @@ struct RootView: View {
     try? context.save()
   }
 
-  // [Блок 5] Продолжить обогащение
   private func runEnrichment() async {
     guard !busy else { return }
     busy = true
@@ -1044,7 +1310,7 @@ struct RootView: View {
           ? "не задан" : "\(settings.apiKey.count) симв.")
         LabeledContent("Engine", value: settings.engineVersion)
       }
-      Section("Проверки") {
+      Section {
         Button { Task { await runChecks() } } label: {
           Label("Запустить проверки", systemImage: "checkmark.shield")
         }
@@ -1056,8 +1322,12 @@ struct RootView: View {
           LabeledContent("Last refresh",
                          value: lr.formatted(date: .omitted, time: .shortened))
         }
+      } header: {
+        Text("Проверки")
+      } footer: {
+        Text("Проверяет доступность SStats, валидность ключа и запускает settlement открытых записей.")
       }
-      Section("Self-tests (E4)") {
+      Section {
         Button { selfTestResults = QuantMathSelfTest.runAll() } label: {
           Label("Запустить unit-тесты", systemImage: "checkmark.seal")
         }
@@ -1085,6 +1355,10 @@ struct RootView: View {
           Text("Нажмите кнопку — 15 проверок QuantMath.")
             .font(.caption2).foregroundStyle(.secondary)
         }
+      } header: {
+        Text("Self-tests (E4)")
+      } footer: {
+        Text("15 юнит-тестов QuantMath: медиана, EV, Kelly, DC/BIV, split линий, β-shrink, NB-PMF. Все должны быть зелёными. Известная косметика: median чётная использует верхнюю медиану.")
       }
       Section("Sample / Consensus") {
         let m = Metrics.compute(journal)
@@ -1094,9 +1368,85 @@ struct RootView: View {
         LabeledContent("Avg CLV", value: String(format: "%+.2f%%", m.avgCLV * 100))
         LabeledContent("Brier", value: String(format: "%.3f", m.brier))
       }
+      Section("CLV-first (W2b)") {
+        let rep = Metrics.clvReport(journal)
+        LabeledContent("Вердикт", value: rep.verdict)
+        LabeledContent("Записей с CLV", value: "\(rep.totalWithCLV)")
+        LabeledContent("+CLV доля",
+                       value: String(format: "%.0f%%", rep.positiveRate * 100))
+        LabeledContent("avg CLV", value: String(format: "%+.2f%%", rep.avgCLV * 100))
+        LabeledContent("median CLV",
+                       value: String(format: "%+.2f%%", rep.medianCLV * 100))
+      }
+      Section {
+        LabeledContent("Статус", value: settings.preMatchHistoryEnabled ? "вкл" : "выкл")
+        LabeledContent("Окно", value: "\(settings.preMatchCaptureWindowMin) мин")
+        LabeledContent("Снимков за сессию",
+                       value: "\(liveMonitor.preMatchSnapshotsSaved)")
+        let total = LineSnapshotService.totalCount(in: context)
+        LabeledContent("Всего в БД", value: "\(total)")
+      } header: {
+        Text("Pre-match line history (W2b)")
+      } footer: {
+        Text("Снимки котировок за T-60/30/15/5 минут до старта. Позволяют измерить реальное движение линии и отличить настоящий edge от one-off аномалии цены.")
+      }
+      Section {
+        let snap = currentSnapshot
+        let train = snap?.decodedTrainReport()
+        let val = snap?.decodedValidationReport()
+        let holdout = snap?.decodedHoldoutReport()
+        LabeledContent("Режим", value: snap?.walkForwardMode ?? "off")
+        if let t = train {
+          LabeledContent("Train ROI", value: String(format: "%+.2f%%", t.roi * 100))
+          LabeledContent("Train n", value: "\(t.bets)")
+        }
+        if let v = val {
+          LabeledContent("Val ROI", value: String(format: "%+.2f%%", v.roi * 100))
+          LabeledContent("Val n", value: "\(v.bets)")
+        }
+        if let h = holdout {
+          LabeledContent("Holdout ROI", value: String(format: "%+.2f%%", h.roi * 100))
+          LabeledContent("Holdout n", value: "\(h.bets)")
+        }
+      } header: {
+        Text("Walk-forward (W3b)")
+      } footer: {
+        Text("Self-Tuning обучается на Train+Validation. Holdout — независимая проверка. Сильное расхождение → модель переобучена.")
+      }
+      Section {
+        let cfg = tuningConfig
+        let report = Metrics.oosFromJournal(journal, windowDays: cfg?.oosWindowDays ?? 90)
+        LabeledContent("Флаг", value: (cfg?.oosGateEnabled ?? false) ? "вкл" : "выкл")
+        LabeledContent("Окно", value: "\(cfg?.oosWindowDays ?? 90) дней")
+        LabeledContent("Записей в окне", value: "\(report.totalEntries)")
+        let blocked = cfg.map { OOSBuilder.blockedMarkets(report: report, cfg: $0) } ?? []
+        LabeledContent("Заблокировано", value: blocked.isEmpty ? "—" : blocked.sorted().joined(separator: ", "))
+      } header: {
+        Text("OOS-валидация (W3a)")
+      } footer: {
+        Text("OOS по реальному журналу. Если рынок системно убыточен за окно — блокируется в сканере до восстановления.")
+      }
+      Section {
+        let snap = currentSnapshot
+        let allSample = sampleBreakdown(signals)
+        LabeledContent("FULL", value: "\(allSample.full)")
+        LabeledContent("GOOD", value: "\(allSample.good)")
+        LabeledContent("USABLE", value: "\(allSample.usable)")
+        LabeledContent("INS", value: "\(allSample.ins)")
+        LabeledContent("С SHARP", value: "\(signals.filter { $0.sharpMoney == true }.count)")
+        LabeledContent("С posterior", value: "\(signals.filter { $0.posteriorWeight != nil }.count)")
+        if snap != nil {
+          let cached = snap?.historicalCacheCount ?? 0
+          LabeledContent("Historical cache", value: "\(cached) матчей")
+        }
+      } header: {
+        Text("Data Health (W3c)")
+      } footer: {
+        Text("Сводка качества входных данных по последнему скану. FULL/GOOD/USABLE/INS — размер рыночной выборки. Чем больше INS — тем менее надёжны сигналы.")
+      }
       Section("Self-Tuning") {
         if let cfg = tuningConfig {
-          LabeledContent("Активных механизмов", value: "\(activeCount(cfg)) из 8")
+          LabeledContent("Активных механизмов", value: "\(activeCount(cfg)) из 9")
           LabeledContent("posteriorWeight",
                          value: String(format: "%.2f", cfg.posteriorWeight))
           LabeledContent("autoExcludeMinROI",
@@ -1105,13 +1455,15 @@ struct RootView: View {
           LabeledContent("stopLossCap/Pause",
                          value: "\(cfg.stopLossCapStreak)/\(cfg.stopLossPauseStreak)")
           LabeledContent("CORNERS",
-                         value: String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, stake ≤ %.1f%%",
+                         value: String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, MSS ≥ %.0f, stake ≤ %.1f%%",
                                        cfg.cornersMinEV * 100, cfg.cornersMinQCS,
-                                       cfg.cornersMaxStake * 100))
+                                       cfg.cornersMinMSS, cfg.cornersMaxStake * 100))
           LabeledContent("CARDS",
-                         value: String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, stake ≤ %.1f%%",
+                         value: String(format: "EV ≥ %.1f%%, QCS ≥ %.0f, MSS ≥ %.0f, stake ≤ %.1f%%",
                                        cfg.cardsMinEV * 100, cfg.cardsMinQCS,
-                                       cfg.cardsMaxStake * 100))
+                                       cfg.cardsMinMSS, cfg.cardsMaxStake * 100))
+          LabeledContent("OOS gate",
+                         value: cfg.oosGateEnabled ? "вкл · n≥\(cfg.oosMinBets)" : "выкл")
           LabeledContent("Событий в логе", value: "\(tuningEvents.count)")
         } else {
           Text("Конфиг не создан").font(.caption).foregroundStyle(.secondary)
@@ -1127,7 +1479,7 @@ struct RootView: View {
         LabeledContent("Размер банка",
                        value: String(format: "%.0f", settings.bankroll))
       }
-      Section("Live-монитор (D1)") {
+      Section {
         LabeledContent("Статус", value: liveMonitor.isRunning ? "идёт" : "стоп")
         LabeledContent("Матчей", value: "\(liveMonitor.snapshots.count)")
         LabeledContent("Движений", value: "\(liveMonitor.movements.count)")
@@ -1137,6 +1489,12 @@ struct RootView: View {
           LabeledContent("Last tick",
                          value: t.formatted(date: .omitted, time: .standard))
         }
+        let regime = LiveMonitor.classifyRegime(
+          snapshots: liveMonitor.snapshots,
+          movements: liveMonitor.movements)
+        LabeledContent("Регим рынка", value: regime.regime.label)
+      } header: {
+        Text("Live-монитор (D1)")
       }
       Section("Team ratings (B3)") {
         LabeledContent("Всего команд", value: "\(teamRatings.count)")
@@ -1149,7 +1507,7 @@ struct RootView: View {
         LabeledContent("Market-пар (n≥20)", value: "\(m.marketPairsN.count)")
         LabeledContent("League-пар (n≥20)", value: "\(m.leaguePairsN.count)")
       }
-      Section("Backtest snapshot") {
+      Section {
         if let snap = currentSnapshot {
           LabeledContent("Status", value: snap.buildStatus)
           LabeledContent("Progress",
@@ -1159,6 +1517,10 @@ struct RootView: View {
           if snap.enrichmentTotal > 0 {
             LabeledContent("Enrichment",
                            value: "\(snap.enrichmentProgress)/\(snap.enrichmentTotal)")
+          }
+          if snap.historicalCacheCount > 0 {
+            LabeledContent("Historical cache",
+                           value: "\(snap.historicalCacheCount) матчей")
           }
           if snap.totalBets > 0 {
             LabeledContent("avgROI",
@@ -1181,15 +1543,15 @@ struct RootView: View {
         } else {
           Text("Снапшот ещё не создан").font(.caption).foregroundStyle(.secondary)
         }
+      } header: {
+        Text("Backtest snapshot")
       }
       Section("Пул лиг") {
         ForEach(LeaguePool.pool, id: \.id) { lg in
           Text("\(lg.id) · \(lg.name)").font(.subheadline)
         }
       }
-      Section("League baselines (prior)") {
-        Text("Структурные приоритеты. sampleSize=0 → prior, не измеренные данные.")
-          .font(.caption2).foregroundStyle(.secondary)
+      Section {
         ForEach(LeagueBaselines.all) { b in
           VStack(alignment: .leading, spacing: 4) {
             Text(b.name).font(.subheadline).bold()
@@ -1202,13 +1564,19 @@ struct RootView: View {
           }
           .padding(.vertical, 2)
         }
+      } header: {
+        Text("League baselines (prior)")
+      } footer: {
+        Text("Структурные приоры λ для каждой лиги. sampleSize=0 → это prior, а не измеренные данные. Используются как fallback, когда истории мало.")
       }
-      Section("Принципы") {
+      Section {
         Text("NO DATA → NO NUMBER → NO EDGE → NO BET").font(.subheadline).bold()
         Text("Quarter Kelly · max 2% · S BET до 2.5%")
           .font(.caption).foregroundStyle(.secondary)
         Text("Portfolio cap 10% bankroll в день")
           .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Принципы")
       }
       if !diagnostics.isEmpty {
         Section("Последний запуск") {
@@ -1222,6 +1590,19 @@ struct RootView: View {
     .listStyle(.insetGrouped)
     .navigationTitle("Контроль")
     .navigationBarTitleDisplayMode(.large)
+  }
+
+  private func sampleBreakdown(_ sigs: [BetSignal]) -> (full: Int, good: Int, usable: Int, ins: Int) {
+    var f = 0, g = 0, u = 0, i = 0
+    for s in sigs {
+      switch s.sampleClass {
+      case "FULL": f += 1
+      case "GOOD": g += 1
+      case "USABLE": u += 1
+      default: i += 1
+      }
+    }
+    return (f, g, u, i)
   }
 
   private func runChecks() async {
@@ -1250,11 +1631,13 @@ struct RootView: View {
 
   private var settingsView: some View {
     Form {
-      Section("SStats API") {
+      Section {
         SecureField("API key", text: $settings.apiKey)
           .textInputAutocapitalization(.never).autocorrectionDisabled()
+      } header: {
+        Text("SStats API")
+      } footer: {
         Text("Ключ хранится в Keychain и не попадает в репозиторий.")
-          .font(.caption).foregroundStyle(.secondary)
       }
       Section("Отображение") {
         Picker("Формат коэффициентов", selection: $settings.oddsFormatRaw) {
@@ -1265,7 +1648,7 @@ struct RootView: View {
           ForEach(AppColorScheme.allCases) { s in Text(s.label).tag(s.rawValue) }
         }
       }
-      Section("Банк") {
+      Section {
         Toggle("Ставки в деньгах", isOn: $settings.useMoneyStakes)
         if settings.useMoneyStakes {
           HStack {
@@ -1276,24 +1659,43 @@ struct RootView: View {
               .frame(width: 140).monospacedDigit()
           }
         }
-        Text("При включённом режиме стейк отображается в деньгах (2% банка = 0.02 × размер).")
-          .font(.caption2).foregroundStyle(.secondary)
+      } header: {
+        Text("Банк")
+      } footer: {
+        Text("Включённый режим показывает стейк в деньгах: 2% банка = 0.02 × размер банка.")
       }
-      Section("Live-монитор") {
+      Section {
         Toggle("Следить за линией", isOn: $settings.liveMonitorEnabled)
         if settings.liveMonitorEnabled {
           Stepper("Интервал: \(settings.liveMonitorIntervalSec) сек",
                   value: $settings.liveMonitorIntervalSec, in: 30...300, step: 30)
         }
+      } header: {
+        Text("Live-монитор")
+      } footer: {
         Text("Каждый 5-й цикл — полные котировки (углы+ЖК). Остальные — только голы.")
-          .font(.caption2).foregroundStyle(.secondary)
       }
-      Section("Автообновление") {
+      Section {
+        Toggle("Сохранять движение линии до старта",
+               isOn: $settings.preMatchHistoryEnabled)
+        if settings.preMatchHistoryEnabled {
+          Stepper("Окно снимков: \(settings.preMatchCaptureWindowMin) мин",
+                  value: $settings.preMatchCaptureWindowMin,
+                  in: 15...180, step: 15)
+        }
+      } header: {
+        Text("Pre-match line history (W2b)")
+      } footer: {
+        Text("Снимки пишутся в 4 контрольных точках (T-60/30/15/5) пока активен Live-монитор.")
+      }
+      Section {
         Toggle("Фоновое обновление", isOn: $settings.autoRefresh)
         Stepper("Интервал: \(settings.refreshMinutes) мин",
                 value: $settings.refreshMinutes, in: 15...120, step: 15)
-        Text("iOS сама решает, когда запускать фон (обычно ≥30 мин).")
-          .font(.caption2).foregroundStyle(.secondary)
+      } header: {
+        Text("Автообновление")
+      } footer: {
+        Text("iOS сама решает, когда запускать фон (обычно ≥ 30 мин).")
       }
       Section("Параметры модели") {
         Stepper("История: \(settings.historyMatches) матчей",
@@ -1307,8 +1709,10 @@ struct RootView: View {
           Label("Сбросить дубликаты", systemImage: "arrow.counterclockwise")
         }
       }
-      Section("Принцип") {
+      Section {
         Text("NO DATA → NO NUMBER → NO EDGE → NO BET").bold()
+      } header: {
+        Text("Принцип")
       }
       Section { Color.clear.frame(height: 56).listRowBackground(Color.clear) }
     }
@@ -1331,7 +1735,13 @@ struct RootView: View {
 
     liveMonitor.clearObserved()
     for s in signals {
-      liveMonitor.observe(gameID: s.gameID, numericID: Int(s.gameID))
+      liveMonitor.observe(
+        gameID: s.gameID,
+        numericID: Int(s.gameID),
+        startTime: s.startTime,
+        league: s.league,
+        home: s.home,
+        away: s.away)
     }
     if settings.liveMonitorEnabled && !signals.isEmpty {
       liveMonitor.start(settings: settings)
@@ -1347,6 +1757,9 @@ struct RootView: View {
     diagnostics.append("corrPairs=\(summary.correlationPairs)")
     diagnostics.append("lineups=\(summary.lineupsFound)")
     diagnostics.append("h2h=\(summary.h2hFetched)")
+    if !summary.oosBlocked.isEmpty {
+      diagnostics.append("oosBlocked=\(summary.oosBlocked.joined(separator: ","))")
+    }
   }
 
   private func settleJournal() async {
@@ -1490,8 +1903,45 @@ struct SignalDetailView: View {
 
       matchPreviewSection
 
+      // [W3c] Data Health
+      Section {
+        HStack {
+          Text("Sample").font(.subheadline)
+          Spacer()
+          Text(signal.sampleClass).font(.subheadline.bold())
+            .foregroundStyle(sampleColor(signal.sampleClass))
+        }
+        LabeledContent("Матчей хозяев", value: "\(signal.homeSample)")
+        LabeledContent("Матчей гостей", value: "\(signal.awaySample)")
+        LabeledContent("Букмекеров", value: "\(signal.bookmakers)")
+        LabeledContent("DCS", value: String(format: "%.0f", signal.dcs))
+        LabeledContent("MS", value: String(format: "%.0f", signal.ms))
+        if let mss = signal.mss {
+          LabeledContent("MSS", value: String(format: "%.0f", mss))
+        }
+        LabeledContent("Uncertainty",
+                       value: String(format: "%.3f · %@", signal.uncertainty, signal.uncertaintyBand))
+        LabeledContent("Market MAD", value: String(format: "%.2f", signal.marketMAD))
+        if let src = signal.oddsSource {
+          LabeledContent("Источник", value: src)
+        }
+        if signal.sharpMoney == true {
+          LabeledContent("Sharp", value: "да")
+        }
+        if signal.posteriorWeight != nil {
+          LabeledContent("Posterior", value: "применён")
+        }
+        if signal.playerImpactHome != nil || signal.playerImpactAway != nil {
+          LabeledContent("Player impact", value: "применён")
+        }
+      } header: {
+        Text("Data Health (W3c)")
+      } footer: {
+        Text("Качество входных данных конкретного сигнала. FULL/GOOD — надёжно. USABLE — приемлемо. INS — мало данных, сигнал менее устойчив.")
+      }
+
       if let src = signal.oddsSource {
-        Section("Источник котировки") {
+        Section {
           LabeledContent("Источник", value: src)
           if signal.market == "CORNERS" {
             Text("Edge считается против sharp-линии Pinnacle (bookmakerId=4).")
@@ -1500,13 +1950,14 @@ struct SignalDetailView: View {
             Text("Edge считается против лучшей доступной котировки среди букмекеров.")
               .font(.caption2).foregroundStyle(.secondary)
           }
+        } header: {
+          Text("Источник котировки")
         }
       }
 
-      // [Блок 6.4] MSS
       if let mss = signal.mss,
          signal.market == "CORNERS" || signal.market == "CARDS" {
-        Section("Market support (MSS)") {
+        Section {
           HStack {
             Text("MSS").font(.subheadline.bold())
             Spacer()
@@ -1514,12 +1965,14 @@ struct SignalDetailView: View {
               .font(.subheadline.monospacedDigit().bold())
               .foregroundStyle(mss >= 70 ? .green : (mss >= 40 ? .primary : .orange))
           }
+        } header: {
+          Text("Market support (MSS)")
+        } footer: {
           Text("Оценка согласованности котировок: чем выше — тем сильнее рынок подтверждает сигнал. Учитывает ширину спреда между книгами и согласие sharp-книг.")
-            .font(.caption2).foregroundStyle(.secondary)
         }
       }
 
-      Section("Классификация") {
+      Section {
         HStack {
           Text("Класс").font(.subheadline)
           Spacer()
@@ -1534,9 +1987,13 @@ struct SignalDetailView: View {
           Label("Аномальная цена (flag)", systemImage: "exclamationmark.triangle")
             .foregroundStyle(.orange).font(.caption)
         }
+      } header: {
+        Text("Классификация")
+      } footer: {
+        Text("S BET — лучший сигнал (EV ≥ 7%, QCS ≥ 85). A BET — хороший. B LEAN — edge есть. C WATCH — минимальный. X NO BET — не проходит фильтр.")
       }
 
-      Section("Цена и вероятность") {
+      Section {
         LabeledContent("Odds", value: OddsFormatter.format(signal.odds, as: settings.oddsFormat))
         LabeledContent("Fair odds",
                        value: OddsFormatter.format(signal.fairOdds, as: settings.oddsFormat))
@@ -1549,6 +2006,10 @@ struct SignalDetailView: View {
                        value: String(format: "%.2f%%", signal.marketProbability * 100))
         LabeledContent("EV", value: String(format: "%+.2f%%", signal.ev * 100))
         LabeledContent("Robust EV", value: String(format: "%+.2f%%", signal.robustEV * 100))
+      } header: {
+        Text("Цена и вероятность")
+      } footer: {
+        Text("EV = p × odds − 1. Robust EV — то же, но с поправкой на неопределённость. Fair odds = 1/p.")
       }
 
       if let best = signal.bestOdds,
@@ -1626,7 +2087,7 @@ struct SignalDetailView: View {
         }
       }
 
-      Section("Интервал неопределённости") {
+      Section {
         HStack {
           intervalBlock("P10", String(format: "%.1f%%", signal.probabilityLow * 100))
           intervalBlock("P50", String(format: "%.1f%%", signal.probability * 100))
@@ -1635,9 +2096,13 @@ struct SignalDetailView: View {
         LabeledContent("Uncertainty", value: String(format: "%.3f", signal.uncertainty))
         LabeledContent("Band", value: signal.uncertaintyBand)
         LabeledContent("Market MAD", value: String(format: "%.2f", signal.marketMAD))
+      } header: {
+        Text("Интервал неопределённости")
+      } footer: {
+        Text("P10/P50/P90 — вероятностный интервал. Узкий интервал = уверенная модель. Band влияет на размер стейка: LOW ×1.0, MED ×0.75, HIGH ×0.5.")
       }
 
-      Section("Компоненты QCS") {
+      Section {
         Text("QCS = 0.30·MES + 0.20·DCS + 0.20·MS + 0.15·TS + 0.15·RS")
           .font(.caption2).foregroundStyle(.secondary)
         scoreRow("DCS", signal.dcs, w: "0.20")
@@ -1651,6 +2116,10 @@ struct SignalDetailView: View {
           Text(String(format: "%.1f", signal.qcs))
             .font(.subheadline.monospacedDigit().bold())
         }
+      } header: {
+        Text("Компоненты QCS")
+      } footer: {
+        Text("QCS — композитный скор качества сигнала (0–100). Порог для S BET — 85, для A BET — 78.")
       }
 
       Section("Sample") {
@@ -1659,7 +2128,7 @@ struct SignalDetailView: View {
         LabeledContent("Матчей гостей", value: "\(signal.awaySample)")
       }
 
-      Section("Kelly / Stake") {
+      Section {
         LabeledContent("Full Kelly",
                        value: String(format: "%.2f%%", signal.kellyFraction * 100))
         LabeledContent("Quarter Kelly",
@@ -1677,6 +2146,10 @@ struct SignalDetailView: View {
               .font(.subheadline.monospacedDigit().bold())
           }
         }
+      } header: {
+        Text("Kelly / Stake")
+      } footer: {
+        Text("Quarter Kelly — консервативный подход (25% от полной формулы Келли). Stake cap — верхняя граница по классу/рынку.")
       }
 
       if signal.portfolioCorrelation > 0 {
@@ -1702,9 +2175,18 @@ struct SignalDetailView: View {
     .task { await loadPreview() }
   }
 
+  private func sampleColor(_ s: String) -> Color {
+    switch s {
+    case "FULL":   return .green
+    case "GOOD":   return .blue
+    case "USABLE": return .yellow
+    default:       return .orange
+    }
+  }
+
   @ViewBuilder
   private var matchPreviewSection: some View {
-    Section("Форма (последние 5 матчей)") {
+    Section {
       if previewLoading && homeHistory.isEmpty && awayHistory.isEmpty {
         HStack {
           ProgressView().scaleEffect(0.8)
@@ -1721,6 +2203,8 @@ struct SignalDetailView: View {
         Text(marketHintLine)
           .font(.caption2).foregroundStyle(.tertiary)
       }
+    } header: {
+      Text("Форма (последние 5 матчей)")
     }
   }
 
@@ -1775,7 +2259,7 @@ struct SignalDetailView: View {
       return String(format: "avg %.1f", avg)
     case "CARDS":
       let vals = records.compactMap { r -> Double? in
-        guard let c = r.cards, let oc = r.oppCards else { return nil }
+        guard let c = r.cardsPlusReds, let oc = r.oppCardsPlusReds else { return nil }
         return c + oc
       }
       guard !vals.isEmpty else { return "avg —" }
@@ -1807,8 +2291,8 @@ struct SignalDetailView: View {
       .clipShape(RoundedRectangle(cornerRadius: 6))
 
     case "CARDS":
-      let own = r.cards.map { String(format: "%.0f", $0) } ?? "—"
-      let opp = r.oppCards.map { String(format: "%.0f", $0) } ?? "—"
+      let own = r.cardsPlusReds.map { String(format: "%.0f", $0) } ?? "—"
+      let opp = r.oppCardsPlusReds.map { String(format: "%.0f", $0) } ?? "—"
       VStack(spacing: 1) {
         Text("\(own)·\(opp)").font(.caption2.bold())
         Text("ЖК").font(.caption2).opacity(0.6)
@@ -2016,6 +2500,7 @@ struct SelfTuningView: View {
         marketsSection(cfg)
         thresholdsSection(cfg)
         marketThresholdsSection(cfg)
+        oosThresholdsSection(cfg)
         cornersWeightsSection(cfg)
         cardsWeightsSection(cfg)
         eventsSection
@@ -2057,8 +2542,11 @@ struct SelfTuningView: View {
         }
         .padding(.vertical, 2)
       }
-    } header: { Text("Активные механизмы") }
-    footer: { Text("Отключённый механизм не применяется при следующем скане.") }
+    } header: {
+      Text("Активные механизмы")
+    } footer: {
+      Text("Отключённый механизм не применяется при следующем скане.")
+    }
   }
 
   @ViewBuilder
@@ -2084,8 +2572,11 @@ struct SelfTuningView: View {
             .font(.caption2).foregroundStyle(.secondary)
         }
       }
-    } header: { Text("Рынки") }
-    footer: { Text("Выключенный рынок не генерирует сигналы — ни в скане, ни в portfolio.") }
+    } header: {
+      Text("Рынки")
+    } footer: {
+      Text("Выключенный рынок не генерирует сигналы — ни в скане, ни в portfolio.")
+    }
   }
 
   private func setFlag(_ key: String, value: Bool, in cfg: TuningConfig) {
@@ -2099,6 +2590,7 @@ struct SelfTuningView: View {
     case "teamRatingEnabled": cfg.teamRatingEnabled = value
     case "cornersEnabled": cfg.cornersEnabled = value
     case "cardsEnabled": cfg.cardsEnabled = value
+    case "oosGateEnabled": cfg.oosGateEnabled = value
     default: return
     }
     cfg.updatedAt = Date()
@@ -2118,6 +2610,7 @@ struct SelfTuningView: View {
     case "teamRatingEnabled": return cfg.teamRatingEnabled
     case "cornersEnabled": return cfg.cornersEnabled
     case "cardsEnabled": return cfg.cardsEnabled
+    case "oosGateEnabled": return cfg.oosGateEnabled
     default: return false
     }
   }
@@ -2164,7 +2657,9 @@ struct SelfTuningView: View {
         },
         currentString: { "\(cfg.stopLossPauseStreak)" },
         step: 1, rangeLabel: "> cap · … · 15")
-    } header: { Text("Пороги (глобальные)") }
+    } header: {
+      Text("Пороги (глобальные)")
+    }
   }
 
   @ViewBuilder
@@ -2196,7 +2691,27 @@ struct SelfTuningView: View {
         },
         currentString: { "\(cfg.cornersMinSample)" },
         step: 1, rangeLabel: "2 – 20")
-    } header: { Text("Пороги CORNERS (углы)") }
+
+      thresholdRow("cornersMinRobustEV", label: "CORNERS min robustEV",
+        formattedValue: String(format: "%.1f%%", cfg.cornersMinRobustEV * 100),
+        onDelta: { d in cfg.cornersMinRobustEV = max(-0.05, min(0.10, cfg.cornersMinRobustEV + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersMinRobustEV) },
+        step: 0.005, rangeLabel: "−5% … 10%")
+
+      thresholdRow("cornersMinMSS", label: "CORNERS min MSS",
+        formattedValue: String(format: "%.0f", cfg.cornersMinMSS),
+        onDelta: { d in cfg.cornersMinMSS = max(0, min(100, cfg.cornersMinMSS + d)) },
+        currentString: { String(format: "%.0f", cfg.cornersMinMSS) },
+        step: 5, rangeLabel: "0 – 100")
+
+      thresholdRow("cornersMaxUncertainty", label: "CORNERS max uncertainty",
+        formattedValue: String(format: "%.2f", cfg.cornersMaxUncertainty),
+        onDelta: { d in cfg.cornersMaxUncertainty = max(0.05, min(0.40, cfg.cornersMaxUncertainty + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersMaxUncertainty) },
+        step: 0.01, rangeLabel: "0.05 – 0.40")
+    } header: {
+      Text("Пороги CORNERS (углы)")
+    }
 
     Section {
       thresholdRow("cardsMinEV", label: "CARDS min EV",
@@ -2225,10 +2740,111 @@ struct SelfTuningView: View {
         },
         currentString: { "\(cfg.cardsMinSample)" },
         step: 1, rangeLabel: "2 – 20")
-    } header: { Text("Пороги CARDS (ЖК)") }
+
+      thresholdRow("cardsMinRobustEV", label: "CARDS min robustEV",
+        formattedValue: String(format: "%.1f%%", cfg.cardsMinRobustEV * 100),
+        onDelta: { d in cfg.cardsMinRobustEV = max(-0.05, min(0.10, cfg.cardsMinRobustEV + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsMinRobustEV) },
+        step: 0.005, rangeLabel: "−5% … 10%")
+
+      thresholdRow("cardsMinMSS", label: "CARDS min MSS",
+        formattedValue: String(format: "%.0f", cfg.cardsMinMSS),
+        onDelta: { d in cfg.cardsMinMSS = max(0, min(100, cfg.cardsMinMSS + d)) },
+        currentString: { String(format: "%.0f", cfg.cardsMinMSS) },
+        step: 5, rangeLabel: "0 – 100")
+
+      thresholdRow("cardsMaxUncertainty", label: "CARDS max uncertainty",
+        formattedValue: String(format: "%.2f", cfg.cardsMaxUncertainty),
+        onDelta: { d in cfg.cardsMaxUncertainty = max(0.05, min(0.40, cfg.cardsMaxUncertainty + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsMaxUncertainty) },
+        step: 0.01, rangeLabel: "0.05 – 0.40")
+    } header: {
+      Text("Пороги CARDS (ЖК)")
+    }
+
+    Section {
+      thresholdRow("goalsMinRobustEV", label: "GOALS min robustEV",
+        formattedValue: String(format: "%.1f%%", cfg.goalsMinRobustEV * 100),
+        onDelta: { d in cfg.goalsMinRobustEV = max(-0.05, min(0.10, cfg.goalsMinRobustEV + d)) },
+        currentString: { String(format: "%.4f", cfg.goalsMinRobustEV) },
+        step: 0.005, rangeLabel: "−5% … 10%")
+
+      thresholdRow("goalsMinSample", label: "GOALS min sample",
+        formattedValue: "\(cfg.goalsMinSample)",
+        onDelta: { d in
+          let v = cfg.goalsMinSample + Int(d.rounded())
+          cfg.goalsMinSample = max(2, min(20, v))
+        },
+        currentString: { "\(cfg.goalsMinSample)" },
+        step: 1, rangeLabel: "2 – 20")
+
+      thresholdRow("goalsMaxUncertainty", label: "GOALS max uncertainty",
+        formattedValue: String(format: "%.2f", cfg.goalsMaxUncertainty),
+        onDelta: { d in cfg.goalsMaxUncertainty = max(0.05, min(0.40, cfg.goalsMaxUncertainty + d)) },
+        currentString: { String(format: "%.4f", cfg.goalsMaxUncertainty) },
+        step: 0.01, rangeLabel: "0.05 – 0.40")
+    } header: {
+      Text("Пороги GOALS")
+    }
   }
 
-  // [Блок 6.3] Веса λ для углов
+  // [W3a] OOS-пороги
+  @ViewBuilder
+  private func oosThresholdsSection(_ cfg: TuningConfig) -> some View {
+    Section {
+      Toggle(isOn: Binding(
+        get: { cfg.oosGateEnabled },
+        set: { v in setFlag("oosGateEnabled", value: v, in: cfg) }
+      )) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("OOS-блокировка рынков").font(.subheadline)
+          Text("Блокирует рынок, если журнал за окно показывает минус.")
+            .font(.caption2).foregroundStyle(.secondary)
+        }
+      }
+
+      thresholdRow("oosWindowDays", label: "Окно наблюдения (дней)",
+        formattedValue: "\(cfg.oosWindowDays)",
+        onDelta: { d in
+          let v = cfg.oosWindowDays + Int(d.rounded())
+          cfg.oosWindowDays = max(14, min(365, v))
+        },
+        currentString: { "\(cfg.oosWindowDays)" },
+        step: 5, rangeLabel: "14 – 365")
+
+      thresholdRow("oosMinBets", label: "Min n в окне",
+        formattedValue: "\(cfg.oosMinBets)",
+        onDelta: { d in
+          let v = cfg.oosMinBets + Int(d.rounded())
+          cfg.oosMinBets = max(20, min(500, v))
+        },
+        currentString: { "\(cfg.oosMinBets)" },
+        step: 10, rangeLabel: "20 – 500")
+
+      thresholdRow("goalsOOSMinROI", label: "GOALS min ROI (OOS)",
+        formattedValue: String(format: "%.1f%%", cfg.goalsOOSMinROI * 100),
+        onDelta: { d in cfg.goalsOOSMinROI = max(-0.20, min(0.05, cfg.goalsOOSMinROI + d)) },
+        currentString: { String(format: "%.4f", cfg.goalsOOSMinROI) },
+        step: 0.005, rangeLabel: "−20% … 5%")
+
+      thresholdRow("cornersOOSMinROI", label: "CORNERS min ROI (OOS)",
+        formattedValue: String(format: "%.1f%%", cfg.cornersOOSMinROI * 100),
+        onDelta: { d in cfg.cornersOOSMinROI = max(-0.20, min(0.05, cfg.cornersOOSMinROI + d)) },
+        currentString: { String(format: "%.4f", cfg.cornersOOSMinROI) },
+        step: 0.005, rangeLabel: "−20% … 5%")
+
+      thresholdRow("cardsOOSMinROI", label: "CARDS min ROI (OOS)",
+        formattedValue: String(format: "%.1f%%", cfg.cardsOOSMinROI * 100),
+        onDelta: { d in cfg.cardsOOSMinROI = max(-0.20, min(0.05, cfg.cardsOOSMinROI + d)) },
+        currentString: { String(format: "%.4f", cfg.cardsOOSMinROI) },
+        step: 0.005, rangeLabel: "−20% … 5%")
+    } header: {
+      Text("OOS-валидация (W3a)")
+    } footer: {
+      Text("Out-of-sample по реальному журналу. Если по рынку n ≥ Min и ROI ниже порога — рынок автоматически блокируется в сканере. Обновляется после каждой докачки.")
+    }
+  }
+
   @ViewBuilder
   private func cornersWeightsSection(_ cfg: TuningConfig) -> some View {
     Section {
@@ -2267,11 +2883,13 @@ struct SelfTuningView: View {
         onDelta: { d in cfg.cornersWeightH2H = max(0, min(1, cfg.cornersWeightH2H + d)) },
         currentString: { String(format: "%.4f", cfg.cornersWeightH2H) },
         step: 0.05, rangeLabel: "0.00 – 1.00")
-    } header: { Text("Веса λ CORNERS") }
-    footer: { Text("Сумма весов не обязана быть 1 — нормализуется автоматически.") }
+    } header: {
+      Text("Веса λ CORNERS")
+    } footer: {
+      Text("Сумма весов не обязана быть 1 — нормализуется автоматически. Own/Opp разлагают λ на «создаёт» и «позволяет».")
+    }
   }
 
-  // [Блок 6.3] Веса λ для ЖК
   @ViewBuilder
   private func cardsWeightsSection(_ cfg: TuningConfig) -> some View {
     Section {
@@ -2310,8 +2928,11 @@ struct SelfTuningView: View {
         onDelta: { d in cfg.cardsWeightH2H = max(0, min(1, cfg.cardsWeightH2H + d)) },
         currentString: { String(format: "%.4f", cfg.cardsWeightH2H) },
         step: 0.05, rangeLabel: "0.00 – 1.00")
-    } header: { Text("Веса λ CARDS") }
-    footer: { Text("Сумма весов не обязана быть 1 — нормализуется автоматически.") }
+    } header: {
+      Text("Веса λ CARDS")
+    } footer: {
+      Text("Сумма весов не обязана быть 1 — нормализуется автоматически.")
+    }
   }
 
   @ViewBuilder
@@ -2399,8 +3020,11 @@ struct SelfTuningView: View {
           .padding(.vertical, 2)
         }
       }
-    } header: { Text("Журнал изменений") }
-    footer: { Text("Показываются последние 30 событий.") }
+    } header: {
+      Text("Журнал изменений")
+    } footer: {
+      Text("Показываются последние 30 событий. Каждое изменение порога или тумблера логируется с возможностью отката.")
+    }
   }
 
   private func kindLabel(_ k: String) -> String {
@@ -2450,7 +3074,21 @@ struct SelfTuningView: View {
         cfg.cardsMaxStake = 0.02
         cfg.cornersMinSample = 5
         cfg.cardsMinSample = 5
-        // [Блок 6.3] веса
+        cfg.goalsMinRobustEV = 0.0
+        cfg.goalsMinSample = 6
+        cfg.goalsMaxUncertainty = 0.25
+        cfg.cornersMinRobustEV = 0.0
+        cfg.cornersMinMSS = 30
+        cfg.cornersMaxUncertainty = 0.22
+        cfg.cardsMinRobustEV = 0.0
+        cfg.cardsMinMSS = 30
+        cfg.cardsMaxUncertainty = 0.22
+        cfg.oosGateEnabled = false
+        cfg.oosMinBets = 100
+        cfg.oosWindowDays = 90
+        cfg.goalsOOSMinROI = -0.03
+        cfg.cornersOOSMinROI = -0.03
+        cfg.cardsOOSMinROI = -0.03
         cfg.cornersWeightRecentOwn = 0.35
         cfg.cornersWeightRecentOpp = 0.25
         cfg.cornersWeightLeague = 0.15
@@ -2470,6 +3108,8 @@ struct SelfTuningView: View {
       } label: {
         Label("Сбросить к дефолтам", systemImage: "arrow.clockwise")
       }
-    } header: { Text("Сброс") }
+    } header: {
+      Text("Сброс")
+    }
   }
 }

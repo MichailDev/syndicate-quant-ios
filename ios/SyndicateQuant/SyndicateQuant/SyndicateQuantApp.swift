@@ -14,6 +14,7 @@ import SwiftUI
       BacktestRun.self,
       BacktestSnapshot.self,
       TeamRating.self,
+      HistoricalMarketCache.self,   // [W0-#11] персистентный кэш котировок 45/80
       TuningConfig.self,
       TuningEvent.self,
     ])

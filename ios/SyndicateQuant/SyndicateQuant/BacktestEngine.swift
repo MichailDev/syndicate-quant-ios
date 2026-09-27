@@ -19,8 +19,6 @@ struct SegmentStats {
 }
 
 // MARK: - BetRecord
-// [posterior-corners] Добавлено поле `market` (опционально — для обратной совместимости
-// с уже сохранёнными в SwiftData posterior-бакетами).
 
 struct BetRecord: Codable, Hashable {
   var probability: Double
@@ -61,6 +59,10 @@ struct WalkForwardReport {
 
   var perLeague: [String: SegmentStats] = [:]
   var perMarket: [String: SegmentStats] = [:]
+  // [W2-#9] Настоящие league × market ячейки. Раньше heatmap собирался
+  // cartesian-произведением perLeague × perMarket, из-за чего все ячейки
+  // получали одно и то же значение.
+  var perLeagueMarket: [String: SegmentStats] = [:]
   var byEVBucket: [String: SegmentStats] = [:]
   var byClassification: [String: SegmentStats] = [:]
   var byOddsBand: [String: SegmentStats] = [:]
@@ -155,7 +157,6 @@ struct WalkForwardBacktester {
         r.brierSum += (predicted - actualVal) * (predicted - actualVal)
         r.logLossSum += QuantMath.logLoss(predicted: predicted, actual: actualVal)
 
-        // [posterior-corners] Записываем market
         r.betRecords.append(BetRecord(
           probability: predicted,
           probabilityLow: s.probabilityLow,
@@ -210,6 +211,9 @@ struct WalkForwardBacktester {
         accumulate(&r.perLeague, key: match.league,
                    outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.perMarket, key: s.market,
+                   outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
+        // [W2-#9] Реальная league × market ячейка.
+        accumulate(&r.perLeagueMarket, key: "\(match.league)|\(s.market)",
                    outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)
         accumulate(&r.byEVBucket, key: evBucket(s.ev),
                    outcome: outcome, stake: s.stake, odds: s.odds, pnl: pnl)

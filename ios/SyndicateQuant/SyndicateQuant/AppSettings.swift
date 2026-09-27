@@ -44,6 +44,21 @@ import Foundation
     didSet { UserDefaults.standard.set(liveMonitorIntervalSec, forKey: "live_monitor_interval") }
   }
 
+  // [W2b] Pre-match line history.
+  @Published var preMatchHistoryEnabled: Bool {
+    didSet { UserDefaults.standard.set(preMatchHistoryEnabled, forKey: "prematch_history_enabled") }
+  }
+  @Published var preMatchCaptureWindowMin: Int {
+    didSet {
+      let clamped = max(15, min(180, preMatchCaptureWindowMin))
+      if clamped != preMatchCaptureWindowMin {
+        preMatchCaptureWindowMin = clamped
+        return
+      }
+      UserDefaults.standard.set(preMatchCaptureWindowMin, forKey: "prematch_capture_window")
+    }
+  }
+
   let baseURL = "https://api.sstats.net"
   let engineVersion = "v5.6.0-iOS-INSTITUTIONAL"
 
@@ -64,6 +79,12 @@ import Foundation
     liveMonitorEnabled = UserDefaults.standard.object(forKey: "live_monitor_enabled") as? Bool ?? false
     let stored = UserDefaults.standard.object(forKey: "live_monitor_interval") as? Int ?? 60
     liveMonitorIntervalSec = max(30, min(300, stored))
+
+    // [W2b] Pre-match line history — по умолчанию выключено.
+    // Включение требует активного live-монитора.
+    preMatchHistoryEnabled = UserDefaults.standard.object(forKey: "prematch_history_enabled") as? Bool ?? false
+    let window = UserDefaults.standard.object(forKey: "prematch_capture_window") as? Int ?? 60
+    preMatchCaptureWindowMin = max(15, min(180, window))
   }
 
   var oddsFormat: OddsFormat {
