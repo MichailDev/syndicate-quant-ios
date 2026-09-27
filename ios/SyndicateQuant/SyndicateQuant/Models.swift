@@ -3587,7 +3587,7 @@ final class LiveMonitor: ObservableObject {
     return nil
   }
 
-  static func classifyRegime(snapshots: [OddsSnapshot],
+  static func classifyRegime(snapshots: [String: OddsSnapshot],
                              movements: [LineMovement]) -> MarketRegimeReport {
     guard !snapshots.isEmpty else {
       return MarketRegimeReport(
