@@ -964,9 +964,13 @@ struct ModelComparison: Codable, Hashable, Identifiable {
   var enrichmentProgress: Int = 0
   var enrichmentTotal: Int = 0
 
-  // [posterior-corners] отдельные наборы бакетов для углов и ЖК
   var posteriorCornersJSON: Data?
   var posteriorCardsJSON: Data?
+
+  // [Build checkpoint] Курсор сборки и число накопленных матчей.
+  // Позволяет продолжить после выхода приложения из фона.
+  var buildCursorTimestamp: Double = 0
+  var buildMatchesCount: Int = 0
 
   init(id: String = "current") {
     self.id = id; self.version = 1
@@ -1012,7 +1016,6 @@ extension BacktestSnapshot {
     guard let d = posteriorJSON else { return [] }
     return (try? JSONDecoder().decode([PosteriorBucket].self, from: d)) ?? []
   }
-  // [posterior-corners]
   func decodedPosteriorCornersBuckets() -> [PosteriorBucket] {
     guard let d = posteriorCornersJSON else { return [] }
     return (try? JSONDecoder().decode([PosteriorBucket].self, from: d)) ?? []
@@ -1472,6 +1475,57 @@ final class BacktestService {
 
   private var isBuilding = false
 
+  // MARK: - Build checkpoint
+
+  /// Структура чекпоинта. Сохраняется в Documents/build_checkpoint.json
+  /// после каждого обработанного месяца сбора.
+  struct Checkpoint: Codable {
+    var cursor: Double                 // TimeIntervalSince1970
+    var fromDate: Double               // TimeIntervalSince1970
+    var toDate: Double                 // TimeIntervalSince1970
+    var matches: [Match]
+    var histories: [String: [TeamRecord]]
+  }
+
+  static var checkpointURL: URL {
+    let fm = FileManager.default
+    let docs = (try? fm.url(for: .documentDirectory, in: .userDomainMask,
+                            appropriateFor: nil, create: true))
+      ?? URL(fileURLWithPath: NSTemporaryDirectory())
+    return docs.appendingPathComponent("build_checkpoint.json")
+  }
+
+  static func hasCheckpoint() -> Bool {
+    FileManager.default.fileExists(atPath: checkpointURL.path)
+  }
+
+  static func loadCheckpoint() -> Checkpoint? {
+    guard let data = try? Data(contentsOf: checkpointURL),
+          let cp = try? JSONDecoder().decode(Checkpoint.self, from: data)
+    else { return nil }
+    return cp
+  }
+
+  static func saveCheckpoint(cursor: Date, fromDate: Date, toDate: Date,
+                             matches: [Match],
+                             histories: [String: [TeamRecord]]) {
+    let cp = Checkpoint(
+      cursor: cursor.timeIntervalSince1970,
+      fromDate: fromDate.timeIntervalSince1970,
+      toDate: toDate.timeIntervalSince1970,
+      matches: matches,
+      histories: histories)
+    if let data = try? JSONEncoder().encode(cp) {
+      try? data.write(to: checkpointURL, options: .atomic)
+    }
+  }
+
+  static func clearCheckpoint() {
+    try? FileManager.default.removeItem(at: checkpointURL)
+  }
+
+  // MARK: - buildFullBase
+
   func buildFullBase(
     progress: @MainActor @escaping (Double, String) -> Void
   ) async -> Bool {
@@ -1495,18 +1549,6 @@ final class BacktestService {
       return false
     }
 
-    snapshot.buildStatus = "building"
-    snapshot.buildProgress = 0
-    snapshot.lastError = nil
-    snapshot.builtAt = nil
-    snapshot.fromDate = nil
-    snapshot.toDate = nil
-    snapshot.totalMatches = 0
-    snapshot.totalBets = 0
-    snapshot.enrichmentProgress = 0
-    snapshot.enrichmentTotal = 0
-    try? context.save()
-
     let client = SStatsClient(settings: settings)
     let engine = QuantEngine()
     let backtester = WalkForwardBacktester()
@@ -1520,14 +1562,59 @@ final class BacktestService {
       return false
     }
 
-    let totalMonths = Self.yearsBack * Self.monthsPerYear
+    // ── Определяем: свежий старт или продолжение
+    var cursor: Date = fromDate
     var allMatches: [Match] = []
     var allHistories: [String: [TeamRecord]] = [:]
-    var seenIDs = Set<String>()
-    var cursor = fromDate
-    var monthIndex = 0
+    var resumed = false
+
+    if let cp = Self.loadCheckpoint() {
+      let cpFrom = Date(timeIntervalSince1970: cp.fromDate)
+      let cpTo = Date(timeIntervalSince1970: cp.toDate)
+      let dayTolerance: TimeInterval = 60 * 60 * 24
+      let sameWindow =
+        abs(cpFrom.timeIntervalSince(fromDate)) < dayTolerance &&
+        abs(cpTo.timeIntervalSince(toDate)) < dayTolerance
+
+      if sameWindow {
+        cursor = Date(timeIntervalSince1970: cp.cursor)
+        allMatches = cp.matches
+        allHistories = cp.histories
+        resumed = true
+        snapshot.buildStatus = "building"
+        snapshot.buildMatchesCount = allMatches.count
+        snapshot.buildCursorTimestamp = cp.cursor
+        try? context.save()
+        progress(0, "Продолжаю сбор с \(Self.shortDay(cursor)) · матчей: \(allMatches.count)")
+      } else {
+        Self.clearCheckpoint()
+      }
+    }
+
+    if !resumed {
+      // Свежий старт
+      Self.clearCheckpoint()
+      snapshot.buildStatus = "building"
+      snapshot.buildProgress = 0
+      snapshot.lastError = nil
+      snapshot.builtAt = nil
+      snapshot.fromDate = fromDate
+      snapshot.toDate = toDate
+      snapshot.totalMatches = 0
+      snapshot.totalBets = 0
+      snapshot.enrichmentProgress = 0
+      snapshot.enrichmentTotal = 0
+      snapshot.buildCursorTimestamp = fromDate.timeIntervalSince1970
+      snapshot.buildMatchesCount = 0
+      try? context.save()
+    }
+
+    var seenIDs = Set(allMatches.map { $0.id })
+    var monthIndex = max(0, cal.dateComponents([.month], from: fromDate, to: cursor).month ?? 0)
+    let totalMonths = Self.yearsBack * Self.monthsPerYear
     var lastSaved = Date()
 
+    // ── Основной цикл
     while cursor < toDate {
       guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
       let periodEnd = min(nextMonth, toDate)
@@ -1572,13 +1659,18 @@ final class BacktestService {
         for (k, v) in records { allHistories[k, default: []].append(contentsOf: v) }
       }
 
+      // ── Перейти к следующему месяцу
       cursor = nextMonth
       monthIndex += 1
-      if Date().timeIntervalSince(lastSaved) > 25 {
-        snapshot.buildProgress = monthProgress
-        try? context.save()
-        lastSaved = Date()
-      }
+
+      // ── Чекпоинт после каждого месяца (важно — до sleep)
+      Self.saveCheckpoint(cursor: cursor, fromDate: fromDate, toDate: toDate,
+                          matches: allMatches, histories: allHistories)
+      snapshot.buildCursorTimestamp = cursor.timeIntervalSince1970
+      snapshot.buildMatchesCount = allMatches.count
+      snapshot.buildProgress = monthProgress
+      try? context.save()
+      lastSaved = Date()
     }
 
     for (k, v) in allHistories {
@@ -1686,7 +1778,6 @@ final class BacktestService {
       report.byClassification.mapValues { Self.toStored($0) })
     snapshot.posteriorJSON = try? encoder.encode(
       Self.buildPosteriorBuckets(from: report.betRecords))
-    // [posterior-corners] Отдельные наборы
     snapshot.posteriorCornersJSON = try? encoder.encode(
       Self.buildPosteriorBuckets(from: report.betRecords.filter {
         $0.market == "CORNERS"
@@ -1700,11 +1791,18 @@ final class BacktestService {
     snapshot.buildStatus = "ready"
     snapshot.buildProgress = 1.0
     snapshot.lastError = nil
+    snapshot.buildCursorTimestamp = 0
+    snapshot.buildMatchesCount = 0
     try? context.save()
+
+    // ── Убираем чекпоинт — сбор завершён
+    Self.clearCheckpoint()
 
     progress(1.0, "Готово: \(report.matches) матчей, \(report.bets) ставок")
     return true
   }
+
+  // MARK: - Enrichment
 
   func continueEnrichmentInBackground(
     chunkSize: Int = 30,
@@ -1772,6 +1870,8 @@ final class BacktestService {
     snapshot.builtAt = Date()
     try? context.save()
   }
+
+  // MARK: - Helpers
 
   private static func fillCornersCards(into mm: inout Match,
                                        from stats: [String: JSONValue]) {
@@ -1979,7 +2079,6 @@ final class BacktestService {
       delta: Self.buildPosteriorBuckets(from: delta.betRecords))
     snapshot.posteriorJSON = try? encoder.encode(newPosterior)
 
-    // [posterior-corners] Merge отдельных наборов
     let oldCornersP = snapshot.decodedPosteriorCornersBuckets()
     let newCornersP = Self.mergePosterior(
       old: oldCornersP,
@@ -2092,6 +2191,12 @@ final class BacktestService {
       league.localizedCaseInsensitiveContains(lg.name)
     }
   }
+
+  private static func shortDay(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    return f.string(from: d)
+  }
 }
 
 // MARK: - ScanCoordinator
@@ -2202,7 +2307,6 @@ final class ScanCoordinator {
 
       let posteriorBuckets: [PosteriorBucket] = tuning.posteriorEnabled
         ? Self.loadPosteriorBuckets() : []
-      // [posterior-corners] отдельные наборы
       let posteriorCornersBuckets: [PosteriorBucket] = tuning.posteriorEnabled
         ? Self.loadPosteriorCornersBuckets() : []
       let posteriorCardsBuckets: [PosteriorBucket] = tuning.posteriorEnabled
@@ -2376,7 +2480,6 @@ final class ScanCoordinator {
     return snap.decodedPosteriorBuckets()
   }
 
-  // [posterior-corners]
   private static func loadPosteriorCornersBuckets() -> [PosteriorBucket] {
     guard let container = AppDependencies.shared.container else { return [] }
     let context = ModelContext(container)
