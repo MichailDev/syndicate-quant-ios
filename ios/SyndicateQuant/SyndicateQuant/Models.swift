@@ -2186,6 +2186,7 @@ final class BacktestService {
     var resumed = false
     var jobID: String = snapshot.buildJobID ?? UUID().uuidString
 
+    // ── Resume
     if snapshot.buildStatus == "building",
        let cp = Self.loadCheckpoint(),
        let cpJobID = cp.jobID,
@@ -2225,10 +2226,11 @@ final class BacktestService {
     var monthIndex = max(0, cal.dateComponents([.month], from: fromDate, to: cursor).month ?? 0)
     let totalMonths = Self.yearsBack * Self.monthsPerYear
 
+    // ── Фаза 1: сбор матчей по месяцам
     while cursor < toDate {
       guard let nextMonth = cal.date(byAdding: .month, value: 1, to: cursor) else { break }
       let periodEnd = min(nextMonth, toDate)
-      let monthProgress = Double(monthIndex) / Double(totalMonths) * 0.60
+      let monthProgress = Double(monthIndex) / Double(totalMonths) * 0.55
       progress(monthProgress,
                "Сбор \(monthIndex + 1)/\(totalMonths) · матчей: \(allMatches.count)")
 
@@ -2285,6 +2287,7 @@ final class BacktestService {
       allHistories[k] = v.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
     }
 
+    // ── Сидируем кэш
     for m in allMatches {
       _ = HistoricalMarketCacheService.upsert(from: m, in: context)
     }
@@ -2295,40 +2298,65 @@ final class BacktestService {
     snapshot.enrichmentProgress = cacheSeed.enriched
     try? context.save()
 
-    progress(0.60, "Матчей собрано: \(allMatches.count). Дотягиваю odds и statistics…")
+    // ── Фаза 2: Odds+stats (resume-safe)
+    progress(0.55, "Матчей собрано: \(allMatches.count). Дотягиваю odds и statistics…")
 
-    var prepared: [Match] = allMatches.filter { ($0.oddsJSON?.array?.isEmpty == false) }
-    let needOdds = allMatches.filter { ($0.oddsJSON?.array?.isEmpty != false) }
-    let cap = min(needOdds.count, Self.oddsFetchCap)
+    var allMatchesMut = allMatches
+    let needOddsIdx: [Int] = allMatchesMut.enumerated()
+      .filter { $0.element.oddsJSON?.array?.isEmpty != false }
+      .map { $0.offset }
+    let cap = min(needOddsIdx.count, Self.oddsFetchCap)
 
-    for (i, m) in needOdds.prefix(cap).enumerated() {
-      var mm = m
+    for (i, idx) in needOddsIdx.prefix(cap).enumerated() {
+      var mm = allMatchesMut[idx]
       if let nid = mm.numericID {
         if let o = try? await client.odds(numericID: nid) {
           let data = o.object?["data"]?.object ?? o.object ?? [:]
           let game = data["game"]?.object ?? data
           let stats = data["statistics"]?.object ?? game["statistics"]?.object ?? [:]
-
           mm.oddsJSON = game["odds"] ?? data["odds"]
           Self.fillCornersCards(into: &mm, from: stats)
           Self.replaceHistoryRecords(&allHistories, engine: engine,
                                      payload: o, match: mm)
         }
-        if i % 20 == 0 {
-          let p = 0.60 + (Double(i) / Double(max(cap, 1))) * 0.10
-          progress(p, "Odds+stats \(i + 1)/\(cap)")
-        }
-        try? await Task.sleep(for: .milliseconds(400))
+        allMatchesMut[idx] = mm
       }
-      if mm.oddsJSON?.array?.isEmpty == false { prepared.append(mm) }
+      if i % 20 == 0 {
+        let p = 0.55 + (Double(i) / Double(max(cap, 1))) * 0.10
+        progress(p, "Odds+stats \(i + 1)/\(cap)")
+        // Чекпоинт каждые 20 матчей
+        Self.saveCheckpoint(jobID: jobID,
+                            cursor: cursor, fromDate: fromDate, toDate: toDate,
+                            matches: allMatchesMut, histories: allHistories)
+      }
+      try? await Task.sleep(for: .milliseconds(400))
     }
+    // Финальный чекпоинт фазы 2
+    Self.saveCheckpoint(jobID: jobID,
+                        cursor: cursor, fromDate: fromDate, toDate: toDate,
+                        matches: allMatchesMut, histories: allHistories)
 
-    prepared.sort { ($0.start ?? .distantPast) > ($1.start ?? .distantPast) }
-    let ccCount = min(prepared.count, Self.cornersCardsFetchCap)
-    progress(0.72, "Дотягиваю углы/ЖК (\(ccCount) матчей)…")
+    // ── Фаза 3: Corners/Cards (resume-safe через HistoricalMarketCache)
+    let needCC: [Int] = allMatchesMut.enumerated().compactMap { (idx, m) -> Int? in
+      guard let nid = m.numericID else { return nil }
+      let gid = m.id
+      let d = FetchDescriptor<HistoricalMarketCache>(
+        predicate: #Predicate { $0.gameID == gid })
+      guard let row = try? context.fetch(d).first else { return idx }
+      if row.enriched { return nil }
+      if row.failedAttempts >= 3 { return nil }
+      return idx
+    }.sorted { a, b in
+      let sa = allMatchesMut[a].start ?? .distantPast
+      let sb = allMatchesMut[b].start ?? .distantPast
+      return sa > sb
+    }
+    let ccCount = min(needCC.count, Self.cornersCardsFetchCap)
 
-    for i in 0..<ccCount {
-      var mm = prepared[i]
+    progress(0.65, "Дотягиваю углы/ЖК (\(ccCount) матчей)…")
+
+    for (i, idx) in needCC.prefix(ccCount).enumerated() {
+      var mm = allMatchesMut[idx]
       guard let nid = mm.numericID else { continue }
       if let books = try? await client.fullOdds(gameId: nid), !books.isEmpty {
         let extra = Self.oddsJSONFromBookmakers(books)
@@ -2336,7 +2364,7 @@ final class BacktestService {
           var merged: [JSONValue] = mm.oddsJSON?.array ?? []
           merged.append(contentsOf: extra)
           mm.oddsJSON = .array(merged)
-          prepared[i] = mm
+          allMatchesMut[idx] = mm
 
           if let encoded = try? JSONEncoder().encode(extra) {
             let hasC = extra.contains { $0.object?["marketId"]?.number == Double(MarketID.totalCorners) }
@@ -2353,28 +2381,126 @@ final class BacktestService {
         }
       }
       if i % 25 == 0 {
-        let p = 0.72 + (Double(i) / Double(max(ccCount, 1))) * 0.08
+        let p = 0.65 + (Double(i) / Double(max(ccCount, 1))) * 0.15
         progress(p, "Corners/Cards \(i + 1)/\(ccCount)")
+        // Чекпоинт каждые 25 матчей
+        try? context.save()
+        Self.saveCheckpoint(jobID: jobID,
+                            cursor: cursor, fromDate: fromDate, toDate: toDate,
+                            matches: allMatchesMut, histories: allHistories)
       }
       try? await Task.sleep(for: .milliseconds(400))
     }
 
     try? context.save()
+    Self.saveCheckpoint(jobID: jobID,
+                        cursor: cursor, fromDate: fromDate, toDate: toDate,
+                        matches: allMatchesMut, histories: allHistories)
+
     let cacheAfter = HistoricalMarketCacheService.progress(in: context)
     snapshot.historicalCacheCount = cacheAfter.total
     snapshot.enrichmentTotal = cacheAfter.total
     snapshot.enrichmentProgress = cacheAfter.enriched
     try? context.save()
 
+    // Собираем prepared для walk-forward
+    var prepared: [Match] = allMatchesMut.filter { ($0.oddsJSON?.array?.isEmpty == false) }
     prepared.sort { ($0.start ?? .distantPast) < ($1.start ?? .distantPast) }
 
     guard !prepared.isEmpty else {
       snapshot.buildStatus = "failed"
-      snapshot.lastError = "Нет матчей с odds (матчей: \(allMatches.count), историй: \(allHistories.count))"
+      snapshot.lastError = "Нет матчей с odds (матчей: \(allMatchesMut.count), историй: \(allHistories.count))"
       try? context.save()
-      progress(0, "Нет матчей с odds (собрано: \(allMatches.count))")
+      progress(0, "Нет матчей с odds (собрано: \(allMatchesMut.count))")
       return false
     }
+
+    // ── Walk-forward
+    let totalPrepared = prepared.count
+    let trainEnd = max(1, Int(Double(totalPrepared) * 0.60))
+    let valEnd = max(trainEnd + 1, Int(Double(totalPrepared) * 0.80))
+
+    let trainMatches = Array(prepared[0..<trainEnd])
+    let valMatches = Array(prepared[trainEnd..<min(valEnd, totalPrepared)])
+    let holdoutMatches = Array(prepared[min(valEnd, totalPrepared)..<totalPrepared])
+
+    progress(0.83, "Walk-forward train \(trainMatches.count) / val \(valMatches.count) / holdout \(holdoutMatches.count)…")
+    let trainReport = backtester.run(matches: trainMatches, histories: allHistories)
+    let valReport = backtester.run(matches: valMatches, histories: allHistories)
+    let holdoutReport = backtester.run(matches: holdoutMatches, histories: allHistories)
+    let report = backtester.run(matches: trainMatches + valMatches, histories: allHistories)
+
+    progress(0.90, "Сравнение моделей (E5)…")
+    let comparisons = MultiModelBacktester().run(
+      matches: trainMatches + valMatches, histories: allHistories)
+
+    progress(0.95, "Сохраняю снапшот…")
+
+    snapshot.builtAt = Date()
+    snapshot.fromDate = fromDate
+    snapshot.toDate = toDate
+    snapshot.totalMatches = report.matches
+    snapshot.totalBets = report.bets
+    snapshot.avgROI = report.roi
+    snapshot.avgCLV = report.avgCLV
+    snapshot.brier = report.brier
+    snapshot.logLoss = report.logLoss
+    snapshot.sharpe = report.sharpe
+    snapshot.sortino = report.sortino
+    snapshot.profitFactor = report.profitFactor
+
+    snapshot.enrichmentTotal = prepared.count
+    snapshot.enrichmentProgress = min(prepared.count, ccCount)
+
+    let encoder = JSONEncoder()
+    snapshot.trainReportJSON = try? encoder.encode(Self.walkForwardDelta(trainReport))
+    snapshot.validationReportJSON = try? encoder.encode(Self.walkForwardDelta(valReport))
+    snapshot.holdoutReportJSON = try? encoder.encode(Self.walkForwardDelta(holdoutReport))
+    snapshot.walkForwardMode = "602020"
+
+    snapshot.perLeagueJSON = try? encoder.encode(
+      report.perLeague.mapValues { Self.toStored($0) })
+    snapshot.perMarketJSON = try? encoder.encode(
+      report.perMarket.mapValues { Self.toStored($0) })
+    snapshot.perLeagueMarketJSON = try? encoder.encode(
+      Self.leagueMarketSegment(report: report, matches: prepared))
+    snapshot.evBucketsJSON = try? encoder.encode(
+      report.byEVBucket.mapValues { Self.toStored($0) })
+    snapshot.oddsBucketsJSON = try? encoder.encode(
+      report.byOddsBand.mapValues { Self.toStored($0) })
+    snapshot.classificationJSON = try? encoder.encode(
+      report.byClassification.mapValues { Self.toStored($0) })
+    snapshot.posteriorJSON = try? encoder.encode(
+      Self.buildPosteriorBuckets(from: report.betRecords))
+    snapshot.posteriorCornersJSON = try? encoder.encode(
+      Self.buildPosteriorBuckets(from: report.betRecords.filter {
+        $0.market == "CORNERS"
+      }))
+    snapshot.posteriorCardsJSON = try? encoder.encode(
+      Self.buildPosteriorBuckets(from: report.betRecords.filter {
+        $0.market == "CARDS"
+      }))
+    snapshot.modelComparisonJSON = try? encoder.encode(comparisons)
+
+    let journalDescriptor = FetchDescriptor<JournalEntry>()
+    let journal = (try? context.fetch(journalDescriptor)) ?? []
+    let cfg = TuningService.fetchOrCreate(in: context)
+    let oosReport = OOSBuilder.build(from: journal, windowDays: cfg.oosWindowDays)
+    snapshot.oosValidationJSON = try? encoder.encode(oosReport)
+
+    snapshot.buildStatus = "ready"
+    snapshot.buildProgress = 1.0
+    snapshot.lastError = nil
+    snapshot.buildCursorTimestamp = 0
+    snapshot.buildMatchesCount = 0
+    snapshot.buildJobID = nil
+    try? context.save()
+
+    Self.clearCheckpoint()
+
+    progress(1.0, "Готово: \(report.matches) матчей, \(report.bets) ставок")
+    return true
+  }
 
     // [W3b] Train 60% / Validation 20% / Holdout 20%.
     let totalPrepared = prepared.count
